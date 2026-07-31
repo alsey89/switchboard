@@ -1,13 +1,12 @@
 Switchboard
 Copyright 2026 Michael Chen
 
-This product includes software developed by the Caddy authors
-(https://github.com/caddyserver/caddy), licensed under the
-Apache License, Version 2.0.
+Licensed under the Apache License, Version 2.0. See LICENSE.
 
-This product includes software developed by Miek Gieben
-(https://github.com/miekg/dns), licensed under the BSD 3-Clause License.
+This product includes third-party software. Switchboard ships as a single
+statically-linked binary, so the full license text of every module linked
+into it is reproduced in THIRD_PARTY_NOTICES, which is generated from the
+build graph by `make notices` and distributed alongside every release.
 
-This product includes software developed by Dustin L. Howett
-(https://github.com/DHowett/go-plist), licensed under the BSD 2-Clause
-License.
+Most notably, Switchboard embeds Caddy (https://github.com/caddyserver/caddy),
+licensed under the Apache License, Version 2.0.

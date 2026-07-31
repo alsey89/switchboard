@@ -65,6 +65,7 @@ The product is the UX and integration, not the proxy.
 | 8 | Business model | **Open-core; tunnel relay is the only paid surface** | See §1 |
 | 9 | License | **Apache-2.0** | Matches Caddy (no compatibility analysis needed) and carries an explicit patent grant, which matters more for infrastructure than for a library |
 | 10 | Domain suffix policy | **Reserved single-label TLDs (`test`, `internal`, `localhost`) or any multi-label domain the user owns** | A bare non-reserved TLD is or could become real; hijacking it in the OS resolver breaks real sites machine-wide. Multi-label means the user owns it, so collision is impossible |
+| 11 | Distribution | **GoReleaser → GitHub releases + a Homebrew tap** (`alsey89/homebrew-tap`) | `brew install` is table stakes for a dev CLI. Notarization is deferred: it needs a paid Apple Developer account, and Homebrew formula installs aren't quarantined, so it only affects browser downloads |
 
 ### Why Go + Caddy (and the road not taken)
 
@@ -295,4 +296,3 @@ moat) before anyone loves the local loop.
 - **Name-constraints upstream**: propose to Caddy's PKI? (See §4.)
 - Upstream health indication in `ls` (connect-probe the port?) — nice
   `doctor` candidate.
-- Homebrew tap for distribution at v0.1, or just GitHub releases?

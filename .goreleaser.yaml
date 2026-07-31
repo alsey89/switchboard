@@ -1,0 +1,85 @@
+version: 2
+
+project_name: switchboard
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: switchboard
+    main: ./cmd/switchboard
+    binary: switchboard
+    env:
+      - CGO_ENABLED=0
+    goos: [darwin, linux]
+    goarch: [amd64, arm64]
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X github.com/alsey89/switchboard/internal/cli.Version={{ .Version }}
+
+archives:
+  - formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - README.md
+      - LICENSE
+      - NOTICE
+      - THIRD_PARTY_NOTICES
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+homebrew_casks:
+  - name: switchboard
+    binaries:
+      - switchboard
+    repository:
+      owner: alsey89
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Casks
+    homepage: "https://github.com/alsey89/switchboard"
+    description: "Local domains with real HTTPS for web development"
+    license: "Apache-2.0"
+    # The binary is not notarized (see README). Casks quarantine their payload
+    # by default, unlike formulae, so strip the attribute on install or
+    # Gatekeeper blocks the binary outright.
+    hooks:
+      post:
+        install: |
+          if system_command("/usr/bin/xattr", args: ["-h"]).exit_status == 0
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/switchboard"]
+          end
+    # `brew uninstall` should not leave the launchd agent from `switchboard
+    # daemon install` loaded and pointing at a deleted binary.
+    uninstall:
+      launchctl:
+        - io.github.alsey89.switchboard
+    caveats: |
+      Two one-time steps, then you're done:
+
+        switchboard setup            # resolver file + trust the local CA (asks for your password)
+        switchboard daemon install   # run in the background
+
+      Then:  switchboard add app 3000  &&  open https://app.test
+
+release:
+  draft: false
+  prerelease: auto
+  footer: |
+    ## Install
+
+    ```
+    brew install alsey89/tap/switchboard
+    ```

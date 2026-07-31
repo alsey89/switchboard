@@ -18,6 +18,24 @@ $ switchboard daemon install   # runs in the background from now on
 $ open https://app.test        # green padlock
 ```
 
+## Install
+
+**macOS:**
+
+```console
+$ brew install alsey89/tap/switchboard
+```
+
+**Linux:** grab the archive for your architecture from
+[releases](https://github.com/alsey89/switchboard/releases) — Homebrew
+casks are macOS-only, so there's no tap path here yet.
+
+> Release binaries are not yet notarized by Apple. The Homebrew cask
+> strips the quarantine attribute on install, so `brew install` works
+> fine — but a binary downloaded directly through a browser will still
+> be quarantined and needs `xattr -d com.apple.quarantine ./switchboard`
+> before it runs.
+
 ## Why
 
 - **Real subdomains locally** — cookies, CORS, OAuth redirects, and
@@ -117,3 +135,9 @@ $ go test ./...
 
 [Apache-2.0](LICENSE). Switchboard embeds
 [Caddy](https://github.com/caddyserver/caddy) (Apache-2.0) — see [NOTICE](NOTICE).
+
+The binary statically links its dependencies, so every linked third-party
+module's license text is reproduced in
+[THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES) (regenerate with `make notices`).
+The Go standard library is also statically compiled in; it is covered
+separately by the Go project's own BSD-3-Clause license.

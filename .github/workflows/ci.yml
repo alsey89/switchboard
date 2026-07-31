@@ -20,3 +20,8 @@ jobs:
       - run: go vet ./...
       - run: go build ./...
       - run: go test ./... -timeout 300s
+      - name: THIRD_PARTY_NOTICES is up to date
+        run: |
+          ./scripts/gen-notices.sh /tmp/notices.check
+          diff -q /tmp/notices.check THIRD_PARTY_NOTICES \
+            || { echo "THIRD_PARTY_NOTICES is stale — run: make notices"; exit 1; }
