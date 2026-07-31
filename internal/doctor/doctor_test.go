@@ -108,6 +108,7 @@ func TestDownDaemonAdviceNamesSomethingThatWorks(t *testing.T) {
 		{"high ports can", &config.Config{Suffix: "test", HTTPPort: 8080, HTTPSPort: 8443}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			isolateOSPaths(t)
 			origBind, origDial := bindProbe, dialProbe
 			bindProbe = func(string, string) error { return nil }
 			dialProbe = func(string) bool { return false } // nothing listening

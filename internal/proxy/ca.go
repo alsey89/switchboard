@@ -19,8 +19,9 @@ import (
 // Switchboard mints its own root CA rather than letting Caddy's internal PKI
 // generate one. The reason is X.509 name constraints.
 //
-// The root ends up in the system trust store, which means a browser will
-// accept anything it signs. An unconstrained root is therefore a
+// The root ends up trusted by the browser (in the user's login keychain on
+// macOS — see ADR 0003), which means it will accept anything the root signs.
+// An unconstrained root is therefore a
 // sign-anything-for-anyone capability sitting on the user's disk: whoever
 // gets the key can mint a certificate for their bank that the machine
 // believes. Caddy's PKI exposes no way to set nameConstraints, but it does
@@ -48,17 +49,19 @@ const rootLifetime = 10 * 365 * 24 * time.Hour
 // component is entitled to delete.
 func pkiDir(dataDir string) string { return filepath.Join(dataDir, "pki") }
 
-// RootCertPath is the local root CA certificate — the file `setup` installs
-// into the system trust store.
+// RootCertPath is the local root CA certificate — the file `setup` trusts in
+// the user's keychain.
 func RootCertPath(dataDir string) string { return filepath.Join(pkiDir(dataDir), "root.crt") }
 
 // rootKeyPath is the matching private key. Never leaves this machine.
 func rootKeyPath(dataDir string) string { return filepath.Join(pkiDir(dataDir), "root.key") }
 
 // ErrRootSuffixMismatch reports a root whose name constraints do not cover
-// the configured suffix. Recoverable only by removing trust in the old root
-// and generating a new one, which is `switchboard uninstall && switchboard
-// setup` — we do not perform trust-store surgery implicitly.
+// the configured suffix. Recovering means untrusting the old root and
+// generating a new one; `switchboard setup` does exactly that, in order (see
+// setup.rotateCA). It is a sentinel rather than a plain error because setup
+// keys that rotation off it — and because the daemon must *not* rotate, so
+// the two callers need to tell this apart from any other CA failure.
 var ErrRootSuffixMismatch = errors.New("the local root CA does not cover this domain suffix")
 
 // EnsureRoot creates the name-constrained root CA if it does not yet exist,
@@ -119,8 +122,8 @@ func RootCoversSuffix(certPath, suffix string) error {
 	}
 	if !cert.PermittedDNSDomainsCritical && len(cert.PermittedDNSDomains) == 0 {
 		return fmt.Errorf("%w: %s has no name constraints at all, so it can sign "+
-			"certificates for any domain. Remove it with `switchboard uninstall` "+
-			"and re-run `switchboard setup` to generate a constrained one",
+			"certificates for any domain. Run `switchboard setup` to replace it with "+
+			"a constrained one",
 			ErrRootSuffixMismatch, certPath)
 	}
 	for _, d := range cert.PermittedDNSDomains {

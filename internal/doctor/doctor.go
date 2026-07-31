@@ -72,8 +72,13 @@ func Run(cfg *config.Config, cfgPath, dataDir string, cfgErr error) []Check {
 		checks = append(checks, Check{"local CA", OK, rootPath, ""})
 
 		if err := proxy.RootCoversSuffix(rootPath, cfg.Suffix); err != nil {
+			// `setup` alone. It untrusts the old root, deletes it and
+			// everything issued under it, and re-issues — in that order (see
+			// setup.rotateCA). This used to say `uninstall && setup`, which
+			// was a dead end: uninstall deliberately keeps the CA files, so
+			// the setup that followed hit this same error again.
 			checks = append(checks, Check{"CA name constraints", Fail, err.Error(),
-				"run: switchboard uninstall && switchboard setup"})
+				"run: switchboard setup    (it re-issues the CA)"})
 		} else {
 			checks = append(checks, Check{"CA name constraints", OK,
 				"limited to ." + cfg.Suffix + " (cannot sign for other domains)", ""})

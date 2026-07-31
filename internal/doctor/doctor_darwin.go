@@ -13,13 +13,50 @@ import (
 	"github.com/alsey89/switchboard/internal/config"
 	"github.com/alsey89/switchboard/internal/proxy"
 	"github.com/alsey89/switchboard/internal/service"
+	"github.com/alsey89/switchboard/internal/setup"
 )
+
+// missingDirectives returns the lines of want that do not appear in got.
+//
+// Line containment rather than file equality: the question is whether macOS
+// will send this suffix to our DNS port, and a file carrying both directives
+// does that whatever else is in it. Equality would fail a hand-edited file
+// that works perfectly, which is a diagnostic reporting a problem it invented.
+//
+// Whole lines, though, not substrings: "port 5353" is a substring of
+// "port 53535", so a substring check reads a file routing DNS to the wrong
+// port as satisfying the config — on the exact stale-port mismatch this
+// check exists to catch.
+func missingDirectives(got, want string) []string {
+	have := make(map[string]bool)
+	for _, line := range strings.Split(got, "\n") {
+		have[strings.TrimSpace(line)] = true
+	}
+	var missing []string
+	for _, line := range strings.Split(want, "\n") {
+		if line = strings.TrimSpace(line); line == "" {
+			continue
+		}
+		if !have[line] {
+			missing = append(missing, line)
+		}
+	}
+	return missing
+}
 
 func osChecks(cfg *config.Config, rootCertPath string) []Check {
 	var checks []Check
 
 	// /etc/resolver/<suffix> present and pointing at our DNS port.
-	resolverPath := filepath.Join("/etc/resolver", cfg.Suffix)
+	//
+	// Both the directory and the expected contents come from the setup
+	// package that writes them. Restating either here would be two copies of
+	// one fact that only diverge silently: a doctor checking for a directive
+	// setup no longer writes reports a broken install on a working machine,
+	// and the reverse passes a machine that cannot resolve anything. It also
+	// left this check reading the real /etc/resolver during tests, since
+	// setup.ResolverDir exists precisely so that can be redirected.
+	resolverPath := filepath.Join(setup.ResolverDir, cfg.Suffix)
 	b, err := os.ReadFile(resolverPath)
 	switch {
 	case os.IsNotExist(err):
@@ -28,14 +65,15 @@ func osChecks(cfg *config.Config, rootCertPath string) []Check {
 	case err != nil:
 		checks = append(checks, Check{"resolver", Warn, err.Error(), ""})
 	default:
-		content := string(b)
-		wantPort := "port " + strconv.Itoa(cfg.EffDNSPort())
-		if strings.Contains(content, "nameserver 127.0.0.1") && strings.Contains(content, wantPort) {
-			checks = append(checks, Check{"resolver", OK, resolverPath + " → 127.0.0.1 " + wantPort, ""})
-		} else {
+		want := setup.ResolverFileContents(cfg.EffDNSPort())
+		if missing := missingDirectives(string(b), want); len(missing) > 0 {
 			checks = append(checks, Check{"resolver", Fail,
-				resolverPath + " exists but doesn't match the configured dns_port",
+				resolverPath + " does not match the configured dns_port (missing: " +
+					strings.Join(missing, ", ") + ")",
 				"re-run: switchboard setup"})
+		} else {
+			checks = append(checks, Check{"resolver", OK,
+				resolverPath + " → 127.0.0.1 port " + strconv.Itoa(cfg.EffDNSPort()), ""})
 		}
 	}
 

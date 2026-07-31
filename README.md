@@ -90,8 +90,8 @@ One unprivileged process does all the work (a single Go binary):
 - **Embedded [Caddy](https://caddyserver.com)** terminates TLS on
   `127.0.0.1:443` and reverse-proxies by hostname to your dev servers.
   WebSockets (Vite HMR etc.), HTTP/2, and streaming all just work.
-- A **local root CA**, minted once and installed into the system trust store
-  by `switchboard setup`. It carries X.509 **name constraints** pinning it to
+- A **local root CA**, minted once and trusted in your login keychain by
+  `switchboard setup`. It carries X.509 **name constraints** pinning it to
   your suffix, so even with the private key in hand nobody can use it to
   forge a certificate for `google.com` — your browser rejects the chain.
   Caddy's PKI issues the per-host certificates beneath it and rotates them.
@@ -128,24 +128,25 @@ your OS resolver at them would send `go.dev`, `web.dev` and `*.workers.dev`
 to `127.0.0.1` machine-wide. (HSTS preloading is *not* the problem —
 Switchboard serves real, trusted HTTPS. The namespace collision is.)
 
-Changing the suffix requires re-running `switchboard setup`, because the
-resolver file is named after it.
-
 ## Commands
 
 ```
-switchboard setup            one-time system setup (resolver + CA trust)
-switchboard start            run the daemon in the foreground
+switchboard setup            make it work: CA, resolver, CA trust, service
+                             (--no-service to run the daemon yourself)
+switchboard uninstall        undo all of that (keeps your config)
+
 switchboard add <name> <port>   route a domain (bare names get .test appended)
 switchboard add api --upstream 192.168.1.5:8080
 switchboard rm <name>        remove a route
 switchboard ls               list routes and status
+switchboard suffix <s>       switch domain suffix: routes, CA, resolver, restart
 switchboard doctor           diagnose setup/port/upstream problems
-switchboard uninstall        undo system setup: service + resolver + CA trust
-                             (keeps your config)
-switchboard daemon install   run in the background (launchd agent, no root)
+switchboard version          print the version
+
+switchboard start            run the daemon in this terminal instead
+switchboard daemon install   (re)install the background service, or restart it
 switchboard daemon status    is it installed and running?
-switchboard daemon logs      path to the service log
+switchboard daemon logs      show the service log (-f to follow, --path for it)
 switchboard daemon uninstall stop and remove the background service
 ```
 

@@ -127,22 +127,39 @@ func cmdSetup(flagConfig *string) *cobra.Command {
 			// gap was discoverable only by running `start`, failing on :443,
 			// and reading the remedy — which is a poor way to learn that a
 			// step exists.
+			//
+			// runHint is what still has to be done to get it serving; empty
+			// once the service is installed and running.
+			runHint := "switchboard daemon install   (or run it yourself: switchboard start)"
 			if !noService {
 				fmt.Fprintln(out, "\n→ installing the background service…")
-				if err := installService(cmd, cfg, *flagConfig, out); err != nil {
-					fmt.Fprintf(out, "  could not install it: %v\n", err)
-					fmt.Fprintln(out, "  system setup is done — install the service with: switchboard daemon install")
-					return nil
+				switch err := installService(cmd, cfg, *flagConfig, out); {
+				case errors.Is(err, service.ErrUnsupported):
+					// No service manager here yet (Linux, Windows). Not a
+					// failure of setup — everything setup owns is installed
+					// and there is simply nothing to automate with. Pointing
+					// at `daemon install` would send them to the command that
+					// returns this very error.
+					fmt.Fprintln(out, "  no service manager is automated on this platform yet")
+					runHint = "switchboard start   (under systemd, a supervisor, or your terminal)"
+				case err != nil:
+					// Exit non-zero. Printing the failure and returning nil
+					// left `switchboard setup` reporting success to any
+					// script that checked, on a machine serving nothing.
+					fmt.Fprintln(out, "\nthe resolver and CA are installed; the background service is not.")
+					fmt.Fprintln(out, "retry just that step with: switchboard daemon install")
+					return fmt.Errorf("installing the background service: %w", err)
+				default:
+					runHint = ""
 				}
 			}
 
 			fmt.Fprintln(out, "\nsetup complete ✓")
-			if noService {
-				fmt.Fprintf(out, "\nnext:\n  switchboard add app 3000\n  switchboard daemon install"+
-					"   (or run it yourself: switchboard start)\n  open https://app.%s\n", cfg.Suffix)
-			} else {
-				fmt.Fprintf(out, "\nnext:\n  switchboard add app 3000\n  open https://app.%s\n", cfg.Suffix)
+			fmt.Fprintln(out, "\nnext:\n  switchboard add app 3000")
+			if runHint != "" {
+				fmt.Fprintln(out, "  "+runHint)
 			}
+			fmt.Fprintf(out, "  open https://app.%s\n", cfg.Suffix)
 			return nil
 		},
 	}
@@ -799,7 +816,7 @@ func cmdDaemonStatus() *cobra.Command {
 				return nil
 			}
 			fmt.Fprintf(out, "service: %s\n  plist: %s\n", state, plistPath)
-			if logPath, err := service.LogPath(); err == nil {
+			if logPath := service.InstalledLogPath(); logPath != "" {
 				fmt.Fprintf(out, "  logs:  %s\n", logPath)
 			}
 			return nil
@@ -808,16 +825,64 @@ func cmdDaemonStatus() *cobra.Command {
 }
 
 func cmdDaemonLogs() *cobra.Command {
-	return &cobra.Command{
+	var (
+		follow   bool
+		lines    int
+		pathOnly bool
+	)
+	c := &cobra.Command{
 		Use:   "logs",
-		Short: "Print the path of the background service log file",
+		Short: "Show the background service log",
+		Long: "Show the background service log.\n\n" +
+			"Prints the last few lines by default, because the log is never rotated —\n" +
+			"a service that is crash-looping appends to it indefinitely, and the day\n" +
+			"you need it most is the day it is largest.\n\n" +
+			"Use --path to print the file's location instead, for piping elsewhere.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			logPath, err := service.LogPath()
-			if err != nil {
-				return err
+			if lines < 0 {
+				// Checked before anything else: a nonsense flag is a nonsense
+				// flag whether or not a service is installed, and this is not
+				// tail(1), where a leading minus is its own syntax.
+				return fmt.Errorf("-n %d selects nothing — pass how many trailing lines to show, e.g. -n 100", lines)
 			}
-			fmt.Fprintln(cmd.OutOrStdout(), logPath)
-			return nil
+			// The installed plist, not LogPath(): the launch daemon logs
+			// outside the user's home, and printing the path a *user agent*
+			// would have used sent people to a file that does not exist.
+			logPath := service.InstalledLogPath()
+			if logPath == "" {
+				return errors.New("no service is installed, so there is no log file yet — " +
+					"install it with `switchboard daemon install`")
+			}
+			out := cmd.OutOrStdout()
+			if pathOnly {
+				fmt.Fprintln(out, logPath)
+				return nil
+			}
+
+			offset, err := printTail(logPath, lines, out)
+			if err != nil {
+				if os.IsNotExist(err) && follow {
+					// Installed but nothing written yet. Waiting is the useful
+					// behaviour here — this is exactly the state someone is in
+					// when they run `daemon install` and then watch.
+					offset = 0
+				} else if os.IsNotExist(err) {
+					fmt.Fprintf(out, "%s does not exist yet — the service has not "+
+						"written anything.\n", logPath)
+					return nil
+				} else {
+					return err
+				}
+			}
+			if !follow {
+				return nil
+			}
+			fmt.Fprintf(cmd.ErrOrStderr(), "\n--- following %s (ctrl-c to stop) ---\n", logPath)
+			return followFile(cmd.Context(), logPath, offset, out)
 		},
 	}
+	c.Flags().BoolVarP(&follow, "follow", "f", false, "keep watching for new output")
+	c.Flags().IntVarP(&lines, "lines", "n", 50, "how many trailing lines to show")
+	c.Flags().BoolVar(&pathOnly, "path", false, "print the log file's path instead of its contents")
+	return c
 }

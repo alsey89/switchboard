@@ -357,6 +357,18 @@ func verifyRootOnlyWritable(path string) error {
 	}
 }
 
+// rootOwned reports whether path exists and belongs to root — i.e. whether
+// removing it needs the privilege the user would otherwise have to work out
+// for themselves.
+func rootOwned(path string) bool {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return false
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	return ok && st.Uid == 0
+}
+
 func installSystemDaemon(s Spec, plistPath string, out io.Writer) error {
 	fmt.Fprintf(out, "  installing a launch daemon; this needs your password:\n")
 
@@ -494,6 +506,9 @@ func Uninstall(out io.Writer) (removed bool, err error) {
 func uninstallOne(mode Mode, plistPath string, out io.Writer) error {
 	if mode == ModeDaemon {
 		fmt.Fprintln(out, "  removing the launch daemon; this needs your password:")
+		// Read the log path off the plist before removing it — afterwards
+		// there is nothing left that records where the job was writing.
+		logPath := InstalledLogPath()
 		_ = elevateQuiet("launchctl", "bootout", targetFor(mode))
 		if err := elevate(out, "rm", "-f", plistPath); err != nil {
 			return fmt.Errorf("removing %s: %w", plistPath, err)
@@ -507,6 +522,21 @@ func uninstallOne(mode Mode, plistPath string, out io.Writer) error {
 				return fmt.Errorf("removing %s: %w", StagedExecPath, err)
 			}
 			fmt.Fprintf(out, "  removed %s\n", StagedExecPath)
+		}
+		// launchd creates the log as root, so it is a file the user cannot
+		// delete themselves — the same argument as the staged binary, and the
+		// reason it lives outside the home directory in the first place. Only
+		// root-owned logs are removed: a ModeAgent log sits under
+		// ~/.config/switchboard, where `rm -rf` already covers it.
+		if logPath != "" && rootOwned(logPath) {
+			if err := elevate(out, "rm", "-f", logPath); err != nil {
+				// Not fatal. The service is gone either way; a leftover log is
+				// litter, not breakage, and failing here would make `uninstall`
+				// report an error for something already fully undone.
+				fmt.Fprintf(out, "  (could not remove %s: %v)\n", logPath, err)
+			} else {
+				fmt.Fprintf(out, "  removed %s\n", logPath)
+			}
 		}
 		return nil
 	}
@@ -583,13 +613,15 @@ func jobRunning(printOutput string) bool {
 	return false
 }
 
-// InstalledExec returns the binary path recorded in the installed plist, or
-// "" if no plist exists or it doesn't parse. Used by doctor to spot a stale
-// path after the binary moves (a Homebrew upgrade, say).
-// Both modes are inspected, system daemon first, matching Status's
-// precedence — otherwise a machine running the launch daemon would have
-// doctor reporting on a stale user agent, or on nothing at all.
-func InstalledExec() string {
+// installedPlist decodes whichever service definition is actually on disk,
+// system daemon first — matching Status's precedence, so that a machine
+// running the launch daemon is never described by a stale user agent left
+// over from a high-port configuration.
+//
+// Reading the installed plist, rather than recomputing what an install
+// *would* write, is the point: it is the only source that stays correct when
+// the config has changed since the service was installed.
+func installedPlist() (plistDoc, bool) {
 	agentPath, err := PlistPath()
 	if err != nil {
 		agentPath = ""
@@ -606,10 +638,36 @@ func InstalledExec() string {
 		if _, err := plist.Unmarshal(b, &doc); err != nil {
 			continue
 		}
-		if len(doc.ProgramArguments) == 0 {
-			continue
-		}
-		return doc.ProgramArguments[0]
+		return doc, true
 	}
-	return ""
+	return plistDoc{}, false
+}
+
+// InstalledExec returns the binary path recorded in the installed plist, or
+// "" if no plist exists or it doesn't parse. Used by doctor to spot a stale
+// path after the binary moves (a Homebrew upgrade, say).
+func InstalledExec() string {
+	doc, ok := installedPlist()
+	if !ok || len(doc.ProgramArguments) == 0 {
+		return ""
+	}
+	return doc.ProgramArguments[0]
+}
+
+// InstalledLogPath returns the file the installed service actually writes to,
+// or "" if nothing is installed.
+//
+// This cannot be derived from LogPath(). The two modes log to different
+// places — a launch daemon starts as root, so its log goes to
+// /Library/Logs rather than into the user's home (see DefaultSpec) — and
+// `daemon logs` and `daemon status` used to print LogPath() unconditionally.
+// On the default install, which is the launch daemon, that named a file under
+// ~/.config that nothing ever writes to: the one command whose entire job is
+// to find the log pointed at the wrong one.
+func InstalledLogPath() string {
+	doc, ok := installedPlist()
+	if !ok {
+		return ""
+	}
+	return doc.StandardOutPath
 }
