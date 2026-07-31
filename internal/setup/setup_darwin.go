@@ -197,7 +197,7 @@ func installTrust(rootPath string, out io.Writer) ([]string, error) {
 	notes := []string{"root CA trusted in your login keychain (no root required)"}
 	if firefoxPresent() {
 		notes = append(notes,
-			"Firefox: recent versions read the system trust store; if you run an older "+
+			"Firefox: recent versions read the platform trust store; if you run an older "+
 				"one, enable security.enterprise_roots.enabled in about:config")
 	}
 	return notes, nil

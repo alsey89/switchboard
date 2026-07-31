@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,29 @@ import (
 	"github.com/alsey89/switchboard/internal/service"
 	"github.com/alsey89/switchboard/internal/setup"
 )
+
+// TestDaemonLogsRejectsANegativeLineCount.
+//
+// The count is user-typed; `-n -1` has no meaning here (this is not tail(1),
+// where a leading minus is its own syntax). It must come back as an error
+// that names the flag — not the unrelated "no service is installed", and not
+// the panic it once was.
+func TestDaemonLogsRejectsANegativeLineCount(t *testing.T) {
+	t.Setenv("SWITCHBOARD_DIR", t.TempDir())
+	isolateSystemPathsForCLI(t)
+
+	root := Root()
+	root.SetArgs([]string{"daemon", "logs", "-n", "-1"})
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	err := root.Execute()
+	if err == nil {
+		t.Fatal("a negative -n must be an error")
+	}
+	if !strings.Contains(err.Error(), "-n") {
+		t.Errorf("the error must name the flag at fault, got: %v", err)
+	}
+}
 
 // TestUninstallSaysTheBinaryIsStillInstalled.
 //

@@ -174,10 +174,15 @@ func installingUser() (uid, gid int, home string, err error) {
 	return os.Getuid(), os.Getgid(), home, nil
 }
 
-// LogPath returns the daemon log file, under the config dir so that
-// `rm -rf ~/.config/switchboard` remains a full reset. Always absolute:
+// LogPath returns the log file for a ModeAgent job, under the config dir so
+// that `rm -rf ~/.config/switchboard` remains a full reset. Always absolute:
 // SWITCHBOARD_DIR is taken verbatim from the environment and may well be
 // relative, and this path is written into the plist (see Spec).
+//
+// This is where a service *would* log if installed as a user agent, which is
+// not where the default install logs — DefaultSpec redirects ModeDaemon to
+// SystemLogPath. To report the log of a service that is already installed,
+// use InstalledLogPath, which reads it from the plist that is actually there.
 func LogPath() (string, error) {
 	dir, err := config.Dir()
 	if err != nil {

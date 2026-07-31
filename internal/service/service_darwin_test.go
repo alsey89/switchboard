@@ -239,6 +239,62 @@ func TestInstalledExecRoundTrip(t *testing.T) {
 	}
 }
 
+// TestInstalledLogPathIsTheOneTheDaemonWritesTo.
+//
+// `daemon logs` and `daemon status` printed LogPath() — the *user agent's*
+// log, under ~/.config. On the default install, which is a launch daemon,
+// nothing writes there: launchd starts the job as root, so DefaultSpec sends
+// its output to /Library/Logs instead. Both commands therefore named a file
+// that does not exist, on precisely the configuration everyone gets.
+//
+// The fix has to read the plist rather than recompute a path, so the test
+// installs a daemon-shaped plist and asserts the answer comes back from it —
+// and, separately, that it is not the value LogPath() would have produced.
+func TestInstalledLogPathIsTheOneTheDaemonWritesTo(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	isolateSystemPaths(t)
+
+	spec := Spec{
+		Exec:       "/Library/PrivilegedHelperTools/" + Label,
+		Args:       []string{"__supervise", "--uid", "501"},
+		StdoutPath: SystemLogPath,
+		StderrPath: SystemLogPath,
+		Mode:       ModeDaemon,
+	}
+	if err := os.MkdirAll(filepath.Dir(SystemPlistPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(SystemPlistPath, []byte(renderPlist(spec)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := InstalledLogPath()
+	if got != SystemLogPath {
+		t.Errorf("InstalledLogPath() = %q, want %q — the path recorded in the "+
+			"installed plist", got, SystemLogPath)
+	}
+
+	agentLog, err := LogPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == agentLog {
+		t.Fatalf("the launch daemon's log must not be LogPath() (%q); that is where a "+
+			"user agent logs, and pointing people there is the bug this guards", agentLog)
+	}
+}
+
+func TestInstalledLogPathIsEmptyWithNoService(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	isolateSystemPaths(t)
+	if got := InstalledLogPath(); got != "" {
+		t.Errorf("InstalledLogPath() with nothing installed = %q, want empty — the "+
+			"caller has to be able to say `no service is installed` rather than print "+
+			"a path that no service writes to", got)
+	}
+}
+
 func TestInstalledExecNoPlist(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	isolateSystemPaths(t)

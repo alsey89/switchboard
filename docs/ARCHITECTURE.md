@@ -113,11 +113,30 @@ let anything running as you replace the binary and get root at the next boot.
 | Login keychain trust entry | **you, no root** | `setup` | `uninstall` |
 | `/Library/LaunchDaemons/io.github.alsey89.switchboard.plist` | `root:wheel 0644` | `daemon install` | `uninstall` |
 | `/Library/PrivilegedHelperTools/io.github.alsey89.switchboard` | `root:wheel 0755` | `daemon install` | `uninstall` |
-| `/Library/Logs/switchboard.log` | root | the daemon | left in place |
+| `/Library/Logs/switchboard.log` | root | the daemon | `uninstall` |
 
 The log is deliberately not under your home: launchd creates it as root, and
 a root-owned file inside `~/.config/switchboard` would make the documented
-`rm -rf` reset fail halfway.
+`rm -rf` reset fail halfway. Being root-owned is also why `uninstall` removes
+it rather than leaving it — you could not delete it yourself without
+working out that you needed `sudo`, in a directory you have no reason to
+look in.
+
+Because the two service shapes log to different places, `switchboard daemon
+logs` reads the path out of the installed plist rather than computing one. It
+used to print the *agent's* path unconditionally, which on the default
+install — a launch daemon — named a file nothing writes to.
+
+It shows the log rather than pointing at it: the last 50 lines by default,
+`-f` to follow, `--path` for the location alone. Printing the path was one
+step short of the reason anyone runs the command, and `/Library/Logs` is not
+a location people have memorized. It is a tail rather than a `cat` because
+nothing rotates this file — a service that crash-loops appends to it
+indefinitely, so the day you need it most is the day it is largest.
+
+`-f` is the practical way to watch a reboot: launchd starts the parent before
+FileVault has decrypted the home directory, and the child's non-zero exit and
+the parent's retry both land here (§5).
 
 ### Ports
 
@@ -159,10 +178,19 @@ themselves.
    login keychain as a trusted root. macOS shows its own dialog for this —
    that is the Security framework insisting a human authorize "trust a new
    certificate authority", which is un-scriptable by design.
+4. **sudo:** installs the background service — everything under `switchboard
+   daemon install` below. Skipped by `--no-service`.
 
-Run it *without* `sudo`. It elevates only step 2. Running the whole command
-as root would create the CA under `/var/root`, where nothing else would look
-for it — and would put the trust in root's keychain rather than yours.
+Run it *without* `sudo`. It elevates only steps 2 and 4. Running the whole
+command as root would create the CA under `/var/root`, where nothing else
+would look for it — and would put the trust in root's keychain rather than
+yours.
+
+If step 4 fails, `setup` exits non-zero and says so: the resolver and the CA
+are installed, but nothing is serving, and a script that treated that as
+success would be wrong about the only thing it was checking. On a platform
+with no service automation yet (Linux, Windows) it is not a failure — setup
+finishes and points at `switchboard start`.
 
 ### `switchboard add app 3000`
 
@@ -189,7 +217,7 @@ $ switchboard add app 3000        # https://app.test → 127.0.0.1:3000
 $ switchboard ls                  # routes and whether each upstream is up
 $ switchboard doctor              # every assumption above, checked
 $ switchboard daemon status
-$ switchboard daemon logs         # prints the log path
+$ switchboard daemon logs         # last 50 lines; -f to follow, --path for the path
 ```
 
 Editing `~/.config/switchboard/config.toml` by hand works identically — the

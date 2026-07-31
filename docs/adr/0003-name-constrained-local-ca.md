@@ -19,11 +19,13 @@ nothing else.
 
 ## Context
 
-`switchboard setup` installs a root certificate into the system trust store.
-That is the entire product — it is why the padlock is green and why there are
-no warnings — and it is also the most dangerous thing the tool does.
+`switchboard setup` installs a root certificate into a trust store the
+browser consults. That is the entire product — it is why the padlock is green
+and why there are no warnings — and it is also the most dangerous thing the
+tool does. (*Which* store was decided separately and later; see "Where the
+root is trusted" below. The argument here holds either way.)
 
-An unconstrained root in the system trust store is a **sign-anything
+An unconstrained root in that store is a **sign-anything
 capability sitting on the user's disk**. Whoever obtains the private key can
 mint a certificate for their bank, their employer's SSO, or any site at all,
 and that user's browser will accept it silently. The key is protected by
@@ -197,10 +199,18 @@ Known costs, accepted:
 
 - **Changing `suffix` now invalidates the root.** The constraint names one
   suffix, so switching from `.test` to `.internal` requires re-issuing and
-  re-trusting. `EnsureRoot` refuses rather than proceeding, and says to run
-  `switchboard uninstall && switchboard setup`.
+  re-trusting. `EnsureRoot` refuses rather than proceeding, returning
+  `ErrRootSuffixMismatch`; `switchboard suffix <s>` and `switchboard setup`
+  catch it and rotate (untrust → delete the old root and everything issued
+  under it → re-issue → re-trust), in that order.
 
-  This is a real cost, accepted because the alternative — permitting every
+  The first version of this shipped a dead end. `EnsureRoot` said to run
+  `switchboard uninstall && switchboard setup`, but `uninstall` deliberately
+  keeps the CA files — so the setup that followed hit the identical error,
+  with the identical advice. Refusing an operation obliges you to check that
+  the remedy you name actually reaches a working state.
+
+  The refusal is still a real cost, accepted because the alternative — permitting every
   suffix the tool allows, so the constraint covers whatever the user might
   later choose — grants standing authority over three reserved TLDs to
   protect against an infrequent operation. Trust-store surgery is also not

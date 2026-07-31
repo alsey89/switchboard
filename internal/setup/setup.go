@@ -1,6 +1,7 @@
-// Package setup performs the one-time, privileged system configuration:
-// pointing the OS resolver at Switchboard's DNS for the managed TLD, and
-// installing the local root CA into the system trust store.
+// Package setup performs the one-time system configuration: pointing the OS
+// resolver at Switchboard's DNS for the managed TLD, and trusting the local
+// root CA in the user's login keychain (not the system store — see
+// userKeychain and ADR 0003).
 //
 // Philosophy: the daemon itself always runs unprivileged. Only these
 // one-shot steps elevate, each as a separate, visible command (printed
@@ -86,7 +87,7 @@ func Run(ctx context.Context, cfg *config.Config, dataDir string, out io.Writer)
 	res.ResolverNotes = notes
 
 	// 3. Trust store: OS-specific.
-	fmt.Fprintln(out, "→ installing the root CA into the system trust store…")
+	fmt.Fprintln(out, "→ trusting the root CA in your login keychain…")
 	trustNotes, err := installTrust(rootPath, out)
 	if err != nil {
 		return nil, err
