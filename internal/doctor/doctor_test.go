@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -51,8 +52,16 @@ func TestPrivilegedPortIsNotReportedAsAConflict(t *testing.T) {
 		t.Errorf("permission denied is not a conflict; the hint should not send the "+
 			"user looking for a process. Got: %q", c.Hint)
 	}
-	if !strings.Contains(c.Hint, "daemon install") {
-		t.Errorf("the hint should name what actually fixes it. Got: %q", c.Hint)
+	// What "actually fixes it" depends on the platform: the launchd parent on
+	// macOS, setcap on Linux. The content of each branch is pinned in
+	// TestAdviceNamesOnlyCommandsThatExistOnThePlatform; here the live check
+	// must carry the branch for the platform the test is running on.
+	wantFix := "daemon install"
+	if runtime.GOOS == "linux" {
+		wantFix = "setcap"
+	}
+	if !strings.Contains(c.Hint, wantFix) {
+		t.Errorf("the hint should name what actually fixes it here (%q). Got: %q", wantFix, c.Hint)
 	}
 	if !strings.Contains(c.Detail, "reserved for root") {
 		t.Errorf("the detail should explain why it cannot bind. Got: %q", c.Detail)
@@ -98,6 +107,52 @@ func TestBindablePortsReportOK(t *testing.T) {
 // diagnostic's advice was a command that would not work, and the only way
 // forward was to read the resulting failure carefully enough to find the real
 // remedy buried in it. Someone hit this three times in a row before getting out.
+// TestAdviceNamesOnlyCommandsThatExistOnThePlatform.
+//
+// `daemon install` exists on macOS alone; everywhere else it returns
+// ErrUnsupported. Both pieces of doctor advice — the daemon-down remedy and
+// the privileged-port hint — used to name it regardless of platform, so a
+// Linux user was sent to a command whose only output is that it cannot work.
+// CI's first Linux run is what caught it. The helpers take goos as a
+// parameter precisely so every branch is exercised from every platform.
+func TestAdviceNamesOnlyCommandsThatExistOnThePlatform(t *testing.T) {
+	for _, goos := range []string{"linux", "windows"} {
+		for _, privileged := range []bool{true, false} {
+			remedy := daemonDownRemedy(goos, privileged)
+			if strings.Contains(remedy, "daemon install") {
+				t.Errorf("daemonDownRemedy(%q, %v) advises `daemon install`, which is "+
+					"unsupported there: %q", goos, privileged, remedy)
+			}
+			if !strings.Contains(remedy, "switchboard start") {
+				t.Errorf("daemonDownRemedy(%q, %v) must name the command that works: %q",
+					goos, privileged, remedy)
+			}
+		}
+	}
+	// Privileged ports on linux need privilege from somewhere; sudo is the
+	// one-session answer. Windows has no root-only ports at all.
+	if remedy := daemonDownRemedy("linux", true); !strings.Contains(remedy, "sudo switchboard start") {
+		t.Errorf("on linux with privileged ports the remedy must include sudo: %q", remedy)
+	}
+	if remedy := daemonDownRemedy("windows", true); strings.Contains(remedy, "sudo") {
+		t.Errorf("windows has no privileged ports, so sudo is noise: %q", remedy)
+	}
+
+	hint := privilegedPortHint("linux")
+	if strings.Contains(hint, "install the service") || strings.Contains(hint, "daemon install") {
+		t.Errorf("the linux privileged-port hint advises installing a service that "+
+			"cannot be installed there: %q", hint)
+	}
+	for _, want := range []string{"setcap", "sudo switchboard start"} {
+		if !strings.Contains(hint, want) {
+			t.Errorf("the linux privileged-port hint must offer %q: %q", want, hint)
+		}
+	}
+	if hint := privilegedPortHint("darwin"); !strings.Contains(hint, "daemon install") {
+		t.Errorf("the darwin privileged-port hint must name `daemon install`: %q", hint)
+	}
+}
+
 func TestDownDaemonAdviceNamesSomethingThatWorks(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -119,13 +174,24 @@ func TestDownDaemonAdviceNamesSomethingThatWorks(t *testing.T) {
 			if !ok {
 				t.Fatal("no daemon check")
 			}
-			if !strings.Contains(c.Hint, "daemon install") {
-				t.Errorf("the advice should name `daemon install`, which works in both "+
-					"cases. Got: %q", c.Hint)
-			}
-			if got := strings.Contains(c.Hint, "switchboard start"); got != tc.wantStart {
-				t.Errorf("mentions `switchboard start` = %v, want %v — on privileged "+
-					"ports it cannot bind and fails. Got: %q", got, tc.wantStart, c.Hint)
+			if runtime.GOOS == "darwin" {
+				if !strings.Contains(c.Hint, "daemon install") {
+					t.Errorf("the advice should name `daemon install`, which works in both "+
+						"cases. Got: %q", c.Hint)
+				}
+				if got := strings.Contains(c.Hint, "switchboard start"); got != tc.wantStart {
+					t.Errorf("mentions `switchboard start` = %v, want %v — on privileged "+
+						"ports it cannot bind and fails. Got: %q", got, tc.wantStart, c.Hint)
+				}
+			} else {
+				// No service automation off macOS: `switchboard start` (with
+				// sudo when the ports demand it) is the only advice that works.
+				if strings.Contains(c.Hint, "daemon install") {
+					t.Errorf("`daemon install` is unsupported on %s. Got: %q", runtime.GOOS, c.Hint)
+				}
+				if !strings.Contains(c.Hint, "switchboard start") {
+					t.Errorf("the advice must name `switchboard start`. Got: %q", c.Hint)
+				}
 			}
 		})
 	}

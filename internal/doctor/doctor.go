@@ -100,10 +100,8 @@ func Run(cfg *config.Config, cfgPath, dataDir string, cfgErr error) []Check {
 		// `switchboard start` cannot bind :443 and fails — this used to send
 		// people to it repeatedly, and the only way out was to read the
 		// failure carefully enough to find the real remedy inside it.
-		remedy := "run: switchboard daemon install"
-		if cfg.EffHTTPSPort() >= 1024 && cfg.EffHTTPPort() >= 1024 {
-			remedy = "run: switchboard daemon install    (or `switchboard start` to run it in this terminal)"
-		}
+		privileged := cfg.EffHTTPSPort() < 1024 || cfg.EffHTTPPort() < 1024
+		remedy := daemonDownRemedy(runtime.GOOS, privileged)
 		checks = append(checks, Check{"daemon", Fail, "nothing listening on " + httpsAddr, remedy})
 		// Only meaningful to test bindability when the daemon is down.
 		checks = append(checks, bindChecks(cfg)...)
@@ -128,6 +126,41 @@ func Run(cfg *config.Config, cfgPath, dataDir string, cfgErr error) []Check {
 // machine running them.
 var bindProbe = netprobe.Bindable
 
+// daemonDownRemedy names what brings the daemon up on this platform. `daemon
+// install` exists on macOS alone — everywhere else it returns ErrUnsupported,
+// and advice naming it sends the user to a command whose only output is that
+// it cannot work. goos is a parameter, not runtime.GOOS read inline, so every
+// branch is testable from every platform; CI's first Linux run caught the
+// inline version advising the impossible.
+func daemonDownRemedy(goos string, privilegedPorts bool) string {
+	if goos == "darwin" {
+		if privilegedPorts {
+			return "run: switchboard daemon install"
+		}
+		return "run: switchboard daemon install    (or `switchboard start` to run it in this terminal)"
+	}
+	// Windows has no root-only ports, so privilege never enters into it.
+	if privilegedPorts && goos != "windows" {
+		return "run: sudo switchboard start    (:443/:80 are root-only, and there is " +
+			"no service automation on this platform yet)"
+	}
+	return "run: switchboard start    (there is no service automation on this platform yet)"
+}
+
+// privilegedPortHint explains a permission-denied bind on a low port, per
+// platform. Same rule as daemonDownRemedy: only commands that exist here.
+func privilegedPortHint(goos string) string {
+	if goos == "linux" {
+		return "grant the capability:\n" +
+			"    sudo setcap cap_net_bind_service=+ep $(which switchboard)\n" +
+			"  or run one session privileged: sudo switchboard start\n" +
+			"  or serve on a high port instead — see `switchboard doctor` after editing the config"
+	}
+	return "this port needs the privileged parent:\n" +
+		"    switchboard daemon install    (or `sudo switchboard start` for one session)\n" +
+		"  or serve on a high port instead — see `switchboard doctor` after editing the config"
+}
+
 func bindChecks(cfg *config.Config) []Check {
 	var checks []Check
 	for _, p := range []struct {
@@ -146,16 +179,9 @@ func bindChecks(cfg *config.Config) []Check {
 			// a stock config with the service not yet installed. Nothing is
 			// holding :443 — an ordinary user simply may not bind it.
 			if errors.Is(err, os.ErrPermission) {
-				hint := "this port needs the privileged parent:\n" +
-					"    switchboard daemon install    (or `sudo switchboard start` for one session)\n" +
-					"  or serve on a high port instead — see `switchboard doctor` after editing the config"
-				if runtime.GOOS == "linux" {
-					hint = "grant the capability:\n" +
-						"    sudo setcap cap_net_bind_service=+ep $(which switchboard)\n" +
-						"  or use a high port, or install the service"
-				}
 				checks = append(checks, Check{p.name, Fail,
-					p.addr + " is reserved for root, and the daemon runs as you", hint})
+					p.addr + " is reserved for root, and the daemon runs as you",
+					privilegedPortHint(runtime.GOOS)})
 				continue
 			}
 			hint := "find the conflict: lsof -nP -i:" + portOf(p.addr)
