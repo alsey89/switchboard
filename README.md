@@ -11,7 +11,7 @@ You tell the operator which line a name connects to; every call gets patched
 through.
 
 ```console
-$ switchboard setup            # once, ever — two password prompts
+$ switchboard setup            # once, ever — one sudo, one keychain prompt
 $ switchboard add app 3000
 https://app.test → 127.0.0.1:3000
 $ switchboard daemon install   # one more prompt; runs in the background from now on
@@ -56,9 +56,11 @@ config, the local CA and its key, and the per-host certificates Caddy issues.
 `rm -rf` on that directory is a complete reset.
 
 System-wide, each installed with a `sudo` command printed before it runs:
-`/etc/resolver/<suffix>`, a trusted root in the System keychain, and — only
-if you serve `:443`/`:80` — a LaunchDaemon plus a root-owned copy of the
-binary in `/Library/PrivilegedHelperTools`. `switchboard uninstall` removes
+`/etc/resolver/<suffix>`, and — only if you serve `:443`/`:80` — a
+LaunchDaemon plus a root-owned copy of the binary in
+`/Library/PrivilegedHelperTools`. The local CA is trusted in your **login**
+keychain, which needs no root and grants trust to your user rather than the
+whole machine. `switchboard uninstall` removes
 all of it. Everything binds to `127.0.0.1`; nothing is reachable from the
 network.
 
@@ -112,6 +114,10 @@ to change it:
 | `internal` | Reserved by ICANN in 2024 for private use. Reads nicer, but check that your employer's VPN doesn't already hand out `*.internal` names. |
 | `localhost` | RFC 6761. Safe, but some libraries special-case it. |
 | `dev.example.com` | A subdomain of a domain **you own**. Zero collision risk and the URLs look real. |
+
+Changing it later is one command — `switchboard suffix internal` — which
+rewrites your routes, re-issues the CA, and swaps the resolver file in one
+step. Editing `suffix` by hand needs all three done together.
 
 Switchboard refuses anything else, and the error says why. `.dev` and `.app`
 are the common mistakes: they are real gTLDs that Google sells, so pointing

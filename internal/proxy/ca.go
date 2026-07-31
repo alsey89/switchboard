@@ -129,8 +129,78 @@ func RootCoversSuffix(certPath, suffix string) error {
 		}
 	}
 	return fmt.Errorf("%w: %s permits %v, but the configured suffix is %q. "+
-		"Run `switchboard uninstall` then `switchboard setup` to re-issue it",
+		"Run `switchboard setup` to re-issue it",
 		ErrRootSuffixMismatch, certPath, cert.PermittedDNSDomains, suffix)
+}
+
+// IsTrusted reports whether the platform trust store accepts the certificate
+// at path as a valid anchor.
+//
+// It verifies the certificate against the system roots with no name to check:
+// a self-signed CA only verifies if the platform verifier already trusts it,
+// which is the same question a TLS client asks. Caddy's own PKI uses this
+// exact test.
+//
+// Both `setup` and `doctor` need it, and for the same reason — the state that
+// matters is whether the certificate is trusted *now*, not whether some
+// command that was supposed to change that exited zero.
+func IsTrusted(certPath string) (bool, error) {
+	b, err := os.ReadFile(certPath)
+	if err != nil {
+		return false, err
+	}
+	block, _ := pem.Decode(b)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return false, fmt.Errorf("%s is not a PEM certificate", certPath)
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return false, err
+	}
+	chains, err := cert.Verify(x509.VerifyOptions{})
+	return len(chains) > 0 && err == nil, nil
+}
+
+// RootSuffixes returns the domain suffixes a root CA is constrained to.
+// Empty if the certificate cannot be read or carries no constraints.
+//
+// This is how `setup` learns which suffix was in use before: the constraint
+// is a record of it, written at the time and not dependent on any state we
+// would otherwise have to remember.
+func RootSuffixes(certPath string) []string {
+	b, err := os.ReadFile(certPath)
+	if err != nil {
+		return nil
+	}
+	block, _ := pem.Decode(b)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return nil
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil
+	}
+	return cert.PermittedDNSDomains
+}
+
+// RemoveCA deletes all certificate authority state: the root, its key, and
+// everything Caddy derived from it — the intermediate and every issued leaf.
+//
+// All of it has to go together. A new root with the old intermediate still on
+// disk would leave Caddy serving leaves that chain to an authority the
+// browser no longer trusts, and the failure would look like a TLS bug rather
+// than a stale file.
+//
+// The caller is responsible for having removed trust in the old root first.
+// This function only touches this data directory; it does not know about
+// keychains.
+func RemoveCA(dataDir string) error {
+	for _, dir := range []string{pkiDir(dataDir), caddyStorageDir(dataDir)} {
+		if err := os.RemoveAll(dir); err != nil {
+			return fmt.Errorf("removing %s: %w", dir, err)
+		}
+	}
+	return nil
 }
 
 // newConstrainedRoot builds the self-signed root. now is a parameter so the

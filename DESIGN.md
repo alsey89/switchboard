@@ -135,10 +135,10 @@ this from leaking into the daemon is ADR 0002.
                       │    unknown host → branded "no route" page   │
                       └─────────────────────────────────────────────┘
 
-  One-time `switchboard setup` (two admin prompts):
-    1. write /etc/resolver/test  (nameserver 127.0.0.1, port 53535)
-    2. install our name-constrained root CA into the System Keychain
-       (Smallstep truststore) — see ADR 0003
+  One-time `switchboard setup` (one sudo + one keychain authorization):
+    1. write /etc/resolver/test  (nameserver 127.0.0.1, port 53535)   [sudo]
+    2. trust our name-constrained root CA in the *login* keychain      [no root]
+       — see ADR 0003
 
   One-time `switchboard daemon install` (a third prompt, only when serving
   :443/:80 — see ADR 0001):

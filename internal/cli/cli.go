@@ -5,12 +5,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
 	"os/signal"
 	"sort"
 	"strconv"
+	"strings"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -66,6 +68,7 @@ func Root() *cobra.Command {
 		cmdStart(&flagConfig),
 		cmdSupervise(&flagConfig),
 		cmdServe(&flagConfig),
+		cmdSuffix(&flagConfig),
 		cmdAdd(&flagConfig),
 		cmdRemove(&flagConfig),
 		cmdList(&flagConfig),
@@ -230,6 +233,152 @@ func superviseAs(cmd *cobra.Command, target privileged.Target, flagConfig string
 		Env:  os.Environ(),
 		Log:  log,
 	})
+}
+
+// cmdSuffix changes the managed domain suffix.
+//
+// This is a command rather than a config edit because it is an operation, not
+// a setting: it rewrites every route, rotates a trusted certificate authority,
+// replaces a system resolver file, and invalidates every certificate issued so
+// far. Editing `suffix` by hand requires knowing all four, and getting the
+// first one wrong makes the config unloadable — which takes `add`, `ls` and
+// `doctor` down with it, exactly when they would be most useful.
+func cmdSuffix(flagConfig *string) *cobra.Command {
+	var yes bool
+	c := &cobra.Command{
+		Use:   "suffix <new-suffix>",
+		Short: "Change the managed domain suffix (rewrites routes, re-issues the CA)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			next := strings.TrimPrefix(args[0], ".")
+			p, err := resolvePaths(*flagConfig)
+			if err != nil {
+				return err
+			}
+			// Lenient: if the user already edited `suffix` by hand and broke
+			// the routes, this command is the repair and must still be able to
+			// read the file.
+			cfg, err := config.LoadLenient(p.configPath)
+			if err != nil {
+				return err
+			}
+			out := cmd.OutOrStdout()
+
+			old := cfg.Suffix
+			migrated := retargetRoutes(cfg, old, next)
+			cfg.Suffix = next
+			if err := cfg.Validate(); err != nil {
+				return err
+			}
+
+			if old == next && migrated == 0 {
+				fmt.Fprintf(out, "already using .%s — nothing to do\n", next)
+				return nil
+			}
+
+			fmt.Fprintf(out, "changing the suffix from .%s to .%s\n", old, next)
+			for _, r := range cfg.Routes {
+				fmt.Fprintf(out, "  %s → %s\n", r.Domain, r.UpstreamAddr())
+			}
+			fmt.Fprintln(out, "\nthis will:")
+			fmt.Fprintf(out, "  • re-issue the local CA, constrained to .%s\n", next)
+			fmt.Fprintf(out, "  • invalidate every certificate issued for .%s\n", old)
+			fmt.Fprintf(out, "  • replace /etc/resolver/%s with /etc/resolver/%s\n", old, next)
+			if !yes {
+				fmt.Fprint(out, "\ncontinue? [y/N] ")
+				var answer string
+				fmt.Fscanln(cmd.InOrStdin(), &answer) //nolint:errcheck
+				if a := strings.ToLower(strings.TrimSpace(answer)); a != "y" && a != "yes" {
+					fmt.Fprintln(out, "aborted; nothing was changed")
+					return nil
+				}
+			}
+
+			// Save first: setup reads the config to know which suffix to build
+			// the CA and resolver file for.
+			if err := cfg.Save(p.configPath); err != nil {
+				return err
+			}
+			fmt.Fprintf(out, "\nwrote %s\n", p.configPath)
+
+			if _, err := setup.Run(cmd.Context(), cfg, p.dataDir, out); err != nil {
+				return fmt.Errorf("%w\n  The config now says .%s; re-run `switchboard setup` "+
+					"once the problem above is resolved", err, next)
+			}
+
+			// Restart the service ourselves. Between the config change and the
+			// restart the machine is in a state that does not work at all —
+			// DNS now sends the new suffix to a daemon still serving the old
+			// zone, and the certificates for it no longer exist. Leaving that
+			// as a step the user has to remember is leaving them broken.
+			restartService(cmd, cfg, *flagConfig, out)
+
+			fmt.Fprintf(out, "\nsuffix is now .%s ✓\n", next)
+			return nil
+		},
+	}
+	c.Flags().BoolVar(&yes, "yes", false, "skip the confirmation prompt")
+	return c
+}
+
+// restartService restarts the background service if there is one, so the
+// daemon picks up a suffix change. Failures are reported, not returned: the
+// suffix change itself has already succeeded and been written to disk, and
+// turning "your suffix changed but the service did not restart" into a
+// non-zero exit would suggest the whole operation failed.
+func restartService(cmd *cobra.Command, cfg *config.Config, flagConfig string, out io.Writer) {
+	state, _, err := service.Status()
+	if err != nil || state == service.NotInstalled {
+		// No managed service. If something is nevertheless answering, it is a
+		// foreground `switchboard start` that we cannot restart for them.
+		if daemonIsListening(cfg) {
+			fmt.Fprintln(out, "\n  a daemon is running but was not installed as a service —")
+			fmt.Fprintln(out, "  restart it yourself so it serves the new zone")
+		} else {
+			fmt.Fprintln(out, "\n  no background service installed; start one with:")
+			fmt.Fprintln(out, "    switchboard daemon install")
+		}
+		return
+	}
+
+	fmt.Fprintln(out, "\n→ restarting the background service so it serves the new zone…")
+	spec, err := service.DefaultSpec(cfg, flagConfig)
+	if err == nil {
+		err = service.Install(spec, out)
+	}
+	if err != nil {
+		fmt.Fprintf(out, "  could not restart it: %v\n", err)
+		fmt.Fprintln(out, "  the suffix change is saved — restart it with: switchboard daemon install")
+	}
+}
+
+// daemonIsListening reports whether anything answers on the configured HTTPS
+// port, which is how a foreground daemon makes itself known.
+func daemonIsListening(cfg *config.Config) bool {
+	c, err := net.DialTimeout("tcp",
+		net.JoinHostPort("127.0.0.1", strconv.Itoa(cfg.EffHTTPSPort())), 400*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	c.Close() //nolint:errcheck
+	return true
+}
+
+// retargetRoutes rewrites route domains from one suffix to another, returning
+// how many changed. A domain that does not end in the old suffix is left
+// alone — it is not ours to reinterpret, and Validate will reject it with a
+// message naming the route.
+func retargetRoutes(cfg *config.Config, old, next string) int {
+	var n int
+	for i := range cfg.Routes {
+		d := cfg.Routes[i].Domain
+		if !strings.HasSuffix(d, "."+old) {
+			continue
+		}
+		cfg.Routes[i].Domain = strings.TrimSuffix(d, "."+old) + "." + next
+		n++
+	}
+	return n
 }
 
 func cmdAdd(flagConfig *string) *cobra.Command {
