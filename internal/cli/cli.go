@@ -19,6 +19,7 @@ import (
 	"github.com/alsey89/switchboard/internal/config"
 	"github.com/alsey89/switchboard/internal/daemon"
 	"github.com/alsey89/switchboard/internal/doctor"
+	"github.com/alsey89/switchboard/internal/service"
 	"github.com/alsey89/switchboard/internal/setup"
 )
 
@@ -66,6 +67,7 @@ func Root() *cobra.Command {
 		cmdList(&flagConfig),
 		cmdDoctor(&flagConfig),
 		cmdUninstall(&flagConfig),
+		cmdDaemon(&flagConfig),
 		cmdVersion(),
 	)
 	return root
@@ -355,4 +357,98 @@ func dialable(addr string) bool {
 
 func daemonRunning(cfg *config.Config) bool {
 	return dialable("127.0.0.1:" + strconv.Itoa(cfg.EffHTTPSPort()))
+}
+
+func cmdDaemon(flagConfig *string) *cobra.Command {
+	c := &cobra.Command{
+		Use:   "daemon",
+		Short: "Run Switchboard in the background (launchd agent)",
+		Long: "Install Switchboard as a background service so it survives closing your\n" +
+			"terminal. It runs as you — no root, no system daemon.",
+	}
+	c.AddCommand(
+		cmdDaemonInstall(flagConfig),
+		cmdDaemonUninstall(),
+		cmdDaemonStatus(),
+		cmdDaemonLogs(),
+	)
+	return c
+}
+
+func cmdDaemonInstall(flagConfig *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "install",
+		Short: "Install and start the background service (re-run to restart it)",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			spec, err := service.DefaultSpec(*flagConfig)
+			if err != nil {
+				return err
+			}
+			out := cmd.OutOrStdout()
+			fmt.Fprintf(out, "→ installing %s\n", service.Label)
+			if err := service.Install(spec, out); err != nil {
+				return err
+			}
+			fmt.Fprintf(out, "\nservice installed ✓\n  logs: %s\n  status: switchboard daemon status\n",
+				spec.StdoutPath)
+			return nil
+		},
+	}
+}
+
+func cmdDaemonUninstall() *cobra.Command {
+	return &cobra.Command{
+		Use:   "uninstall",
+		Short: "Stop and remove the background service (keeps config and CA)",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			out := cmd.OutOrStdout()
+			removed, err := service.Uninstall(out)
+			if err != nil {
+				return err
+			}
+			if removed {
+				fmt.Fprintln(out, "\nservice removed ✓")
+			}
+			return nil
+		},
+	}
+}
+
+func cmdDaemonStatus() *cobra.Command {
+	return &cobra.Command{
+		Use:   "status",
+		Short: "Show whether the background service is installed and running",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			state, plistPath, err := service.Status()
+			if err != nil {
+				return err
+			}
+			out := cmd.OutOrStdout()
+			if state == service.NotInstalled {
+				fmt.Fprintln(out, "service: not installed")
+				fmt.Fprintln(out, "  install it with: switchboard daemon install")
+				return nil
+			}
+			fmt.Fprintf(out, "service: %s\n  plist: %s\n", state, plistPath)
+			if logPath, err := service.LogPath(); err == nil {
+				fmt.Fprintf(out, "  logs:  %s\n", logPath)
+			}
+			return nil
+		},
+	}
+}
+
+func cmdDaemonLogs() *cobra.Command {
+	return &cobra.Command{
+		Use:   "logs",
+		Short: "Print the path of the background service log file",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			logPath, err := service.LogPath()
+			if err != nil {
+				return err
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), logPath)
+			return nil
+		},
+	}
 }

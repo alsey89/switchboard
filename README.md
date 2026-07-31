@@ -11,11 +11,11 @@ You tell the operator which line a name connects to; every call gets patched
 through.
 
 ```console
-$ switchboard setup          # once, ever — two password prompts
+$ switchboard setup            # once, ever — two password prompts
 $ switchboard add app 3000
 https://app.test → 127.0.0.1:3000
-$ switchboard start
-$ open https://app.test      # green padlock
+$ switchboard daemon install   # runs in the background from now on
+$ open https://app.test        # green padlock
 ```
 
 ## Why
@@ -81,6 +81,10 @@ switchboard rm <name>        remove a route
 switchboard ls               list routes and status
 switchboard doctor           diagnose setup/port/upstream problems
 switchboard uninstall        undo system setup (keeps your config)
+switchboard daemon install   run in the background (launchd agent, no root)
+switchboard daemon status    is it installed and running?
+switchboard daemon logs      path to the service log
+switchboard daemon uninstall stop and remove the background service
 ```
 
 Config lives at `~/.config/switchboard/config.toml`, is safe to edit by

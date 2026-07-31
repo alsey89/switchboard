@@ -61,7 +61,7 @@ The product is the UX and integration, not the proxy.
 | 4 | Default TLD | **`.test`** (configurable; `.localhost` also permitted) | RFC 6761 reserves it for exactly this. `.local` collides with mDNS (RFC 6762); `.dev` is a real Google gTLD and HSTS-preloaded |
 | 5 | Proxy & TLS | **Caddy's** — reverse proxy, internal PKI, trust-store install | The parts we shouldn't hand-roll; Caddy erases WS/h2/streaming edge cases and cross-platform CA install |
 | 6 | Inspector (v0.2) | **Custom Caddy handler module**, compiled into our binary | Caddy modules are plain Go registered at build time; ~300 lines to tee traffic into SQLite |
-| 7 | GUI | **Web dashboard served by the daemon first** (at `https://switchboard.test`); native shell (Wails) revisited at v0.3 | Zero framework cost to start; core is Go so Tauri would need a sidecar — Wails is the native-fit option if/when we want a tray app |
+| 7 | GUI | **Web dashboard served by the daemon** (at `https://switchboard.<suffix>`); a native *tray* item, not a native dashboard, if/when we want glanceability | Zero framework cost, and once the daemon runs under launchd there is no terminal for a TUI to draw in. The only thing the web dashboard genuinely can't do is be glanceable — that's a menu-bar item, not a Wails port |
 | 8 | Business model | **Open-core; tunnel relay is the only paid surface** | See §1 |
 | 9 | License | **Apache-2.0** | Matches Caddy (no compatibility analysis needed) and carries an explicit patent grant, which matters more for infrastructure than for a library |
 | 10 | Domain suffix policy | **Reserved single-label TLDs (`test`, `internal`, `localhost`) or any multi-label domain the user owns** | A bare non-reserved TLD is or could become real; hijacking it in the OS resolver breaks real sites machine-wide. Multi-label means the user owns it, so collision is impossible |
@@ -272,8 +272,8 @@ Total privileged surface: two one-shot admin prompts in `setup`
 | Version | Contents |
 |---|---|
 | **v0.1** | macOS. CLI + daemon: DNS, embedded Caddy (proxy + HTTPS + trust), `setup`/`add`/`rm`/`ls`/`doctor`, hot-reload config. **The whole point, shippable alone.** |
-| **v0.2** | Inspector: custom Caddy handler module captures method/URL/headers/bodies → SQLite ring buffer → live WS feed. Dashboard served **at `https://switchboard.test`** (dogfooding). Best demo material. |
-| **v0.3** | Dashboard matured (inspector split-pane, settings); evaluate Wails tray app vs staying web-only. launchd agent (`switchboard daemon install`). |
+| **v0.2** | Apache-2.0 license; `.internal` and user-owned domain suffixes; dashboard reachable on loopback; websocket/HMR integration test; **launchd agent (`switchboard daemon install`)**; Homebrew distribution. |
+| **v0.3** | Inspector: custom Caddy handler module captures method/URL/headers/bodies → SQLite ring buffer → live WS feed. Dashboard matured (inspector split-pane, route add/remove). Best demo material. |
 | **v0.4** | Windows (NRPT + hosts-block fallback). |
 | **v0.5** | Linux (resolved/dnsmasq + setcap). |
 | **v1.x** | Tunnels: OSS self-hostable relay first (candidates to embed or crib: `frp`, `chisel` — embeddable Go lib — or custom on `yamux`); hosted paid tier only on traction. mDNS/Bonjour LAN sharing (`myapp.local` to your phone) as a separate opt-in feature — note mDNS can't do wildcards and only `.local`. |
