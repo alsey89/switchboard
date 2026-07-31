@@ -10,7 +10,7 @@ import (
 // integration. Until then, setup prints exact manual steps instead of
 // failing opaquely.
 
-func installResolver(tld string, dnsPort int, out io.Writer) ([]string, error) {
+func installResolver(suffix string, dnsPort int, out io.Writer) ([]string, error) {
 	fmt.Fprintf(out, `  Linux DNS automation is planned for v0.5. Manual options until then:
 
   systemd-resolved (most desktop distros):
@@ -24,12 +24,12 @@ func installResolver(tld string, dnsPort int, out io.Writer) ([]string, error) {
     add to /etc/dnsmasq.d/switchboard.conf:
          server=/%s/127.0.0.1#%d
 
-`, dnsPort, tld, tld, dnsPort)
+`, dnsPort, suffix, suffix, dnsPort)
 	return []string{"resolver: manual configuration required on Linux (printed above)"}, nil
 }
 
-func removeResolver(tld string, out io.Writer) error {
-	fmt.Fprintf(out, "  remove your manual resolver config for .%s (see setup notes)\n", tld)
+func removeResolver(suffix string, out io.Writer) error {
+	fmt.Fprintf(out, "  remove your manual resolver config for .%s (see setup notes)\n", suffix)
 	return nil
 }
 

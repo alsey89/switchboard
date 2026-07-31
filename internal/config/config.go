@@ -22,8 +22,14 @@ const Reserved = "switchboard"
 
 // Config is the root of the TOML file.
 type Config struct {
-	// TLD is the managed top-level domain, without a leading dot.
-	TLD string `toml:"tld"`
+	// Suffix is the managed domain suffix, without a leading dot. Either a
+	// reserved TLD (see ReservedSuffixes) or a domain the user owns
+	// (e.g. "dev.example.com").
+	Suffix string `toml:"suffix"`
+
+	// TLD is the pre-v0.2 spelling of Suffix. Read on load so existing
+	// configs keep working; Save never writes it.
+	TLD string `toml:"tld,omitempty"`
 
 	// Ports. Zero values mean defaults. These exist mainly as escape
 	// hatches (port conflicts) and for tests; normal use never sets them.
@@ -46,7 +52,7 @@ type Route struct {
 
 // Defaults, exported for use in docs/tests.
 const (
-	DefaultTLD           = "test"
+	DefaultSuffix        = "test"
 	DefaultHTTPPort      = 80
 	DefaultHTTPSPort     = 443
 	DefaultDNSPort       = 53535
@@ -54,7 +60,7 @@ const (
 )
 
 func Default() *Config {
-	return &Config{TLD: DefaultTLD}
+	return &Config{Suffix: DefaultSuffix}
 }
 
 // Dir returns the Switchboard config directory (~/.config/switchboard),
@@ -103,8 +109,14 @@ func Load(path string) (*Config, error) {
 	if _, err := toml.Decode(string(b), &c); err != nil {
 		return nil, fmt.Errorf("parsing %s: %w", path, err)
 	}
-	if c.TLD == "" {
-		c.TLD = DefaultTLD
+	// Migrate the pre-v0.2 `tld` key. Save() only ever writes `suffix`, so a
+	// load+save cycle rewrites the file in the new spelling.
+	if c.Suffix == "" {
+		c.Suffix = c.TLD
+	}
+	c.TLD = ""
+	if c.Suffix == "" {
+		c.Suffix = DefaultSuffix
 	}
 	if err := c.Validate(); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
@@ -136,13 +148,13 @@ func (c *Config) Save(path string) error {
 
 // Validate checks the whole config for consistency.
 func (c *Config) Validate() error {
-	if err := validateTLD(c.TLD); err != nil {
+	if err := validateSuffix(c.Suffix); err != nil {
 		return err
 	}
 	seen := map[string]bool{}
 	for i := range c.Routes {
 		r := &c.Routes[i]
-		norm, err := NormalizeDomain(r.Domain, c.TLD)
+		norm, err := NormalizeDomain(r.Domain, c.Suffix)
 		if err != nil {
 			return fmt.Errorf("route %q: %w", r.Domain, err)
 		}
@@ -191,25 +203,26 @@ func (r *Route) UpstreamAddr() string {
 	return net.JoinHostPort("127.0.0.1", strconv.Itoa(r.Port))
 }
 
-// NormalizeDomain lowercases, strips any trailing dot, appends the TLD when
-// the name is bare (no dot), and validates the result: it must be a proper
-// subdomain of the managed TLD and must not be the reserved dashboard name.
-func NormalizeDomain(domain, tld string) (string, error) {
+// NormalizeDomain lowercases, strips any trailing dot, appends the suffix
+// when the name is bare (no dot), and validates the result: it must be a
+// proper subdomain of the managed suffix and must not be the reserved
+// dashboard name.
+func NormalizeDomain(domain, suffix string) (string, error) {
 	d := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), "."))
 	if d == "" {
 		return "", errors.New("empty domain")
 	}
 	if !strings.Contains(d, ".") {
-		d = d + "." + tld
+		d = d + "." + suffix
 	}
-	suffix := "." + tld
-	if !strings.HasSuffix(d, suffix) {
-		return "", fmt.Errorf("domain must end in %s", suffix)
+	dotSuffix := "." + suffix
+	if !strings.HasSuffix(d, dotSuffix) {
+		return "", fmt.Errorf("domain must end in %s", dotSuffix)
 	}
-	if d == suffix[1:] || strings.TrimSuffix(d, suffix) == "" {
-		return "", fmt.Errorf("domain needs a label before %s", suffix)
+	if d == dotSuffix[1:] || strings.TrimSuffix(d, dotSuffix) == "" {
+		return "", fmt.Errorf("domain needs a label before %s", dotSuffix)
 	}
-	if d == Reserved+suffix {
+	if d == Reserved+dotSuffix {
 		return "", fmt.Errorf("%s is reserved for the Switchboard dashboard", d)
 	}
 	for _, label := range strings.Split(d, ".") {
@@ -220,17 +233,51 @@ func NormalizeDomain(domain, tld string) (string, error) {
 	return d, nil
 }
 
-func validateTLD(tld string) error {
-	if tld == "" || strings.Contains(tld, ".") || !validLabel(tld) {
-		return fmt.Errorf("invalid tld %q", tld)
+// ReservedSuffixes are the single-label suffixes that are guaranteed never
+// to be delegated to a real registry: RFC 6761 special-use names, plus
+// .internal, which ICANN reserved for private use in 2024. Any other bare
+// TLD is — or could become — a real one, and pointing the OS resolver at it
+// would hijack real sites machine-wide.
+var ReservedSuffixes = []string{"test", "internal", "localhost"}
+
+// footguns explains the suffixes people reach for first and shouldn't.
+var footguns = map[string]string{
+	"dev": "is a real gTLD that Google sells: pointing the OS resolver at it would send " +
+		"go.dev, web.dev and *.workers.dev to 127.0.0.1 machine-wide. " +
+		"HSTS is not the problem — Switchboard serves real HTTPS — the namespace collision is",
+	"app":   "is a real gTLD that Google sells",
+	"local": "collides with mDNS/Bonjour (RFC 6762)",
+	"home":  "is not reserved; RFC 8375 reserves \"home.arpa\" instead, which Switchboard accepts",
+}
+
+func validateSuffix(s string) error {
+	if s == "" {
+		return errors.New("missing suffix (e.g. suffix = \"test\")")
 	}
-	if tld == "local" {
-		return errors.New("tld \"local\" collides with mDNS (RFC 6762); use \"test\"")
+	labels := strings.Split(s, ".")
+	for _, l := range labels {
+		if !validLabel(l) {
+			return fmt.Errorf("invalid suffix %q: bad label %q", s, l)
+		}
 	}
-	if tld == "dev" {
-		return errors.New("tld \"dev\" is a real, HSTS-preloaded gTLD; use \"test\"")
+	// A multi-label suffix is a domain the user is asserting they own.
+	// Scoping the resolver to it cannot collide with anyone else's names.
+	if len(labels) > 1 {
+		return nil
 	}
-	return nil
+	for _, r := range ReservedSuffixes {
+		if s == r {
+			return nil
+		}
+	}
+	suggestion := fmt.Sprintf("use one of: %s — or a subdomain of a domain you own, "+
+		"e.g. \"dev.example.com\"", strings.Join(ReservedSuffixes, ", "))
+	if why, ok := footguns[s]; ok {
+		return fmt.Errorf("suffix %q %s; %s", s, why, suggestion)
+	}
+	return fmt.Errorf("suffix %q is not a reserved name: it is, or could become, a real "+
+		"top-level domain, and pointing the OS resolver at it would hijack real sites "+
+		"machine-wide; %s", s, suggestion)
 }
 
 func validLabel(s string) bool {
@@ -261,7 +308,7 @@ func orDefault(v, d int) int {
 }
 
 // DashboardDomain returns the reserved dashboard host for this config.
-func (c *Config) DashboardDomain() string { return Reserved + "." + c.TLD }
+func (c *Config) DashboardDomain() string { return Reserved + "." + c.Suffix }
 
 // Domains returns all explicitly-routed domains plus the dashboard domain,
 // sorted, for use as eager TLS subjects.

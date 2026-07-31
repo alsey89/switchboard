@@ -8,6 +8,7 @@ require (
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/miekg/dns v1.1.72
 	github.com/spf13/cobra v1.10.2
+	golang.org/x/net v0.55.0
 	golang.org/x/sys v0.45.0
 )
 
@@ -137,7 +138,6 @@ require (
 	golang.org/x/crypto/x509roots/fallback v0.0.0-20260213171211-a408498e5541 // indirect
 	golang.org/x/exp v0.0.0-20251023183803-a4bb9ffd2546 // indirect
 	golang.org/x/mod v0.35.0 // indirect
-	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/term v0.43.0 // indirect

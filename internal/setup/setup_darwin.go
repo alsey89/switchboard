@@ -8,19 +8,21 @@ import (
 	"path/filepath"
 )
 
-// macOS: /etc/resolver/<tld> tells mDNSResponder to send queries for that
-// TLD to our DNS server — including on a custom port, which is why the
+// macOS: /etc/resolver/<suffix> tells mDNSResponder to send queries for that
+// suffix to our DNS server — including on a custom port, which is why the
 // daemon never needs to fight over :53. (puma-dev ships the same pattern.)
+// A multi-label suffix works the same way: /etc/resolver/dev.example.com
+// matches that domain and all its subdomains.
 
-func resolverFilePath(tld string) string { return filepath.Join("/etc/resolver", tld) }
+func resolverFilePath(suffix string) string { return filepath.Join("/etc/resolver", suffix) }
 
 // ResolverFileContents is exported for doctor to compare against.
 func ResolverFileContents(dnsPort int) string {
 	return fmt.Sprintf("nameserver 127.0.0.1\nport %d\n", dnsPort)
 }
 
-func installResolver(tld string, dnsPort int, out io.Writer) ([]string, error) {
-	path := resolverFilePath(tld)
+func installResolver(suffix string, dnsPort int, out io.Writer) ([]string, error) {
+	path := resolverFilePath(suffix)
 	contents := ResolverFileContents(dnsPort)
 
 	// Write via a temp file + sudo install: keeps the elevated step to a
@@ -48,13 +50,13 @@ func installResolver(tld string, dnsPort int, out io.Writer) ([]string, error) {
 
 	return []string{
 		fmt.Sprintf("resolver file: %s", path),
-		"verify with: scutil --dns | grep -A2 " + tld,
+		"verify with: scutil --dns | grep -A2 " + suffix,
 		"note: dig/nslookup bypass /etc/resolver — test with a browser or curl",
 	}, nil
 }
 
-func removeResolver(tld string, out io.Writer) error {
-	path := resolverFilePath(tld)
+func removeResolver(suffix string, out io.Writer) error {
+	path := resolverFilePath(suffix)
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		return nil
 	}

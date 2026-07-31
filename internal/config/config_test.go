@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -21,6 +22,8 @@ func TestNormalizeDomain(t *testing.T) {
 		{"bad_label.test", "test", "", "invalid domain label"},
 		{"-app.test", "test", "", "invalid domain label"},
 		{"", "test", "", "empty"},
+		{"app", "dev.example.com", "app.dev.example.com", ""},
+		{"api.app.dev.example.com", "dev.example.com", "api.app.dev.example.com", ""},
 	}
 	for _, c := range cases {
 		got, err := NormalizeDomain(c.in, c.tld)
@@ -38,17 +41,83 @@ func TestNormalizeDomain(t *testing.T) {
 	}
 }
 
-func TestValidateRejectsFootgunTLDs(t *testing.T) {
-	for _, tld := range []string{"local", "dev"} {
-		c := &Config{TLD: tld}
-		if err := c.Validate(); err == nil {
-			t.Errorf("tld %q should be rejected", tld)
+func TestValidateSuffix(t *testing.T) {
+	cases := []struct {
+		suffix  string
+		wantErr string // substring; "" means valid
+	}{
+		{"test", ""},
+		{"internal", ""},
+		{"localhost", ""},
+		{"dev.example.com", ""}, // a domain the user owns
+		{"home.arpa", ""},       // RFC 8375, multi-label so allowed by the ownership rule
+		{"dev", "real gTLD"},
+		{"local", "mDNS"},
+		{"app", "real gTLD"},
+		{"com", "not a reserved name"},
+		{"lab", "not a reserved name"},
+		{"", "missing suffix"},
+		{"bad_label", "bad label"},
+		{"-nope", "bad label"},
+		{"ok.bad_label", "bad label"},
+	}
+	for _, c := range cases {
+		err := (&Config{Suffix: c.suffix}).Validate()
+		switch {
+		case c.wantErr == "" && err != nil:
+			t.Errorf("suffix %q: unexpected error %v", c.suffix, err)
+		case c.wantErr != "" && err == nil:
+			t.Errorf("suffix %q: expected error containing %q, got nil", c.suffix, c.wantErr)
+		case c.wantErr != "" && !strings.Contains(err.Error(), c.wantErr):
+			t.Errorf("suffix %q: error %q does not contain %q", c.suffix, err, c.wantErr)
 		}
 	}
 }
 
+func TestValidateSuffixErrorsAreActionable(t *testing.T) {
+	// A rejection must always name a way forward, or the user is stuck.
+	for _, s := range []string{"dev", "local", "com"} {
+		err := (&Config{Suffix: s}).Validate()
+		if err == nil {
+			t.Fatalf("suffix %q should be rejected", s)
+		}
+		if !strings.Contains(err.Error(), "internal") || !strings.Contains(err.Error(), "dev.example.com") {
+			t.Errorf("suffix %q: error should suggest alternatives, got: %v", s, err)
+		}
+	}
+}
+
+func TestLegacyTLDKeyStillLoads(t *testing.T) {
+	// Configs written before v0.2 spell the field `tld`.
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("tld = \"test\"\n\n[[routes]]\ndomain = \"app.test\"\nport = 3000\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Suffix != "test" {
+		t.Errorf("legacy tld key should populate Suffix, got %q", got.Suffix)
+	}
+	// Re-saving must migrate the file to the new spelling.
+	if err := got.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `suffix = "test"`) {
+		t.Errorf("Save should write the `suffix` key, got:\n%s", b)
+	}
+	if strings.Contains(string(b), "tld =") {
+		t.Errorf("Save should not write the legacy `tld` key, got:\n%s", b)
+	}
+}
+
 func TestValidateRoutes(t *testing.T) {
-	c := &Config{TLD: "test", Routes: []Route{
+	c := &Config{Suffix: "test", Routes: []Route{
 		{Domain: "app.test", Port: 3000},
 		{Domain: "api.test", Upstream: "127.0.0.1:8080"},
 	}}
@@ -56,7 +125,7 @@ func TestValidateRoutes(t *testing.T) {
 		t.Fatalf("valid config rejected: %v", err)
 	}
 
-	dup := &Config{TLD: "test", Routes: []Route{
+	dup := &Config{Suffix: "test", Routes: []Route{
 		{Domain: "app.test", Port: 3000},
 		{Domain: "APP.test", Port: 3001},
 	}}
@@ -64,12 +133,12 @@ func TestValidateRoutes(t *testing.T) {
 		t.Errorf("duplicate domains should be rejected, got %v", err)
 	}
 
-	both := &Config{TLD: "test", Routes: []Route{{Domain: "a.test", Port: 1, Upstream: "x:1"}}}
+	both := &Config{Suffix: "test", Routes: []Route{{Domain: "a.test", Port: 1, Upstream: "x:1"}}}
 	if err := both.Validate(); err == nil {
 		t.Error("port+upstream together should be rejected")
 	}
 
-	neither := &Config{TLD: "test", Routes: []Route{{Domain: "a.test"}}}
+	neither := &Config{Suffix: "test", Routes: []Route{{Domain: "a.test"}}}
 	if err := neither.Validate(); err == nil {
 		t.Error("missing port and upstream should be rejected")
 	}
@@ -77,7 +146,7 @@ func TestValidateRoutes(t *testing.T) {
 
 func TestSaveLoadRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
-	c := &Config{TLD: "test", Routes: []Route{
+	c := &Config{Suffix: "test", Routes: []Route{
 		{Domain: "app.test", Port: 3000},
 		{Domain: "api.test", Upstream: "127.0.0.1:9999"},
 	}}
@@ -98,7 +167,7 @@ func TestLoadMissingFileYieldsDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.TLD != DefaultTLD || len(got.Routes) != 0 {
+	if got.Suffix != DefaultSuffix || len(got.Routes) != 0 {
 		t.Errorf("expected default config, got %+v", got)
 	}
 }

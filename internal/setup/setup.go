@@ -46,8 +46,8 @@ func Run(ctx context.Context, cfg *config.Config, dataDir string, out io.Writer)
 
 	// 2. Resolver: OS-specific (may print manual instructions on
 	//    not-yet-automated platforms).
-	fmt.Fprintf(out, "→ pointing the OS resolver for .%s at 127.0.0.1:%d…\n", cfg.TLD, cfg.EffDNSPort())
-	notes, err := installResolver(cfg.TLD, cfg.EffDNSPort(), out)
+	fmt.Fprintf(out, "→ pointing the OS resolver for .%s at 127.0.0.1:%d…\n", cfg.Suffix, cfg.EffDNSPort())
+	notes, err := installResolver(cfg.Suffix, cfg.EffDNSPort(), out)
 	if err != nil {
 		return nil, err
 	}
@@ -66,7 +66,7 @@ func Run(ctx context.Context, cfg *config.Config, dataDir string, out io.Writer)
 
 // Remove undoes Run (leaves config and CA files on disk).
 func Remove(cfg *config.Config, dataDir string, out io.Writer) error {
-	if err := removeResolver(cfg.TLD, out); err != nil {
+	if err := removeResolver(cfg.Suffix, out); err != nil {
 		return err
 	}
 	return removeTrust(proxy.RootCertPath(dataDir), out)

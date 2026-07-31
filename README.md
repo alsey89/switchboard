@@ -48,6 +48,28 @@ One unprivileged process (a single Go binary):
 The only privileged actions are the two one-time steps in `setup` (write the
 resolver file, trust the CA), each run as a visible `sudo` command.
 
+## Choosing a domain suffix
+
+The default is `.test` — RFC 6761 reserves it for exactly this, and nothing
+else can ever claim it. Set `suffix` in `~/.config/switchboard/config.toml`
+to change it:
+
+| Suffix | Notes |
+|---|---|
+| `test` | **Default.** RFC 6761. Always safe. |
+| `internal` | Reserved by ICANN in 2024 for private use. Reads nicer, but check that your employer's VPN doesn't already hand out `*.internal` names. |
+| `localhost` | RFC 6761. Safe, but some libraries special-case it. |
+| `dev.example.com` | A subdomain of a domain **you own**. Zero collision risk and the URLs look real. |
+
+Switchboard refuses anything else, and the error says why. `.dev` and `.app`
+are the common mistakes: they are real gTLDs that Google sells, so pointing
+your OS resolver at them would send `go.dev`, `web.dev` and `*.workers.dev`
+to `127.0.0.1` machine-wide. (HSTS preloading is *not* the problem —
+Switchboard serves real, trusted HTTPS. The namespace collision is.)
+
+Changing the suffix requires re-running `switchboard setup`, because the
+resolver file is named after it.
+
 ## Commands
 
 ```
@@ -89,5 +111,5 @@ $ go test ./...
 
 ## License
 
-[Apache-2.0](LICENSE) — the same license as
-[Caddy](https://github.com/caddyserver/caddy), which Switchboard embeds.
+[Apache-2.0](LICENSE). Switchboard embeds
+[Caddy](https://github.com/caddyserver/caddy) (Apache-2.0) — see [NOTICE](NOTICE).

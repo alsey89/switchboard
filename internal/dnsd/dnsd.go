@@ -1,17 +1,17 @@
 // Package dnsd implements the tiny authoritative DNS responder that makes
-// *.test resolve to 127.0.0.1. The OS is pointed at it via /etc/resolver
-// on macOS (with a `port` directive, so no fight over :53), NRPT on
-// Windows, and split-DNS on Linux.
+// names under the managed suffix resolve to 127.0.0.1 (e.g. *.test). The OS
+// is pointed at it via /etc/resolver on macOS (with a `port` directive, so
+// no fight over :53), NRPT on Windows, and split-DNS on Linux.
 //
 // Behavioral notes, learned from prior art (see DESIGN.md §4):
 //
-//   - Every name under a managed TLD gets an A record, even unrouted ones —
-//     the proxy serves a friendly "no route" page instead of the browser
-//     showing a resolver error.
+//   - Every name under the managed suffix gets an A record, even unrouted
+//     ones — the proxy serves a friendly "no route" page instead of the
+//     browser showing a resolver error.
 //   - AAAA (and other types) for managed names answer NOERROR with an empty
 //     answer section (NODATA) and an SOA in AUTHORITY. Answering NXDOMAIN
 //     would negative-cache the *name* and kill the A record too.
-//   - Queries outside the managed TLDs are REFUSED: this server is
+//   - Queries outside the managed suffixes are REFUSED: this server is
 //     authoritative-only and must never be mistaken for a recursor.
 package dnsd
 
@@ -30,9 +30,9 @@ const (
 	soaTTL    = 60
 )
 
-// Server answers A/AAAA queries for the managed TLDs.
+// Server answers A/AAAA queries for the managed suffixes.
 type Server struct {
-	tlds []string // without leading dot, lowercase
+	suffixes []string // without leading dot, lowercase
 
 	udp *dns.Server
 	tcp *dns.Server
@@ -41,13 +41,13 @@ type Server struct {
 	addr net.Addr
 }
 
-// New creates a server for the given TLDs (e.g. ["test"]).
-func New(tlds []string) *Server {
-	lowered := make([]string, len(tlds))
-	for i, t := range tlds {
+// New creates a server for the given suffixes (e.g. ["test"]).
+func New(suffixes []string) *Server {
+	lowered := make([]string, len(suffixes))
+	for i, t := range suffixes {
 		lowered[i] = strings.ToLower(strings.TrimSuffix(strings.TrimPrefix(t, "."), "."))
 	}
-	return &Server{tlds: lowered}
+	return &Server{suffixes: lowered}
 }
 
 // Start binds UDP and TCP listeners on bind (e.g. "127.0.0.1:53535") and
@@ -109,7 +109,7 @@ func (s *Server) handle(w dns.ResponseWriter, req *dns.Msg) {
 	q := req.Question[0]
 	name := strings.ToLower(q.Name) // FQDN with trailing dot
 
-	tld, ok := s.managedTLD(name)
+	suffix, ok := s.managedSuffix(name)
 	if !ok {
 		// Not ours: refuse, never recurse.
 		m.Rcode = dns.RcodeRefused
@@ -125,34 +125,34 @@ func (s *Server) handle(w dns.ResponseWriter, req *dns.Msg) {
 			A:   net.IPv4(127, 0, 0, 1),
 		})
 	case dns.TypeSOA:
-		m.Answer = append(m.Answer, s.soa(tld))
+		m.Answer = append(m.Answer, s.soa(suffix))
 	case dns.TypeNS:
 		m.Answer = append(m.Answer, &dns.NS{
-			Hdr: dns.RR_Header{Name: tld + ".", Rrtype: dns.TypeNS, Class: dns.ClassINET, Ttl: soaTTL},
-			Ns:  "ns.switchboard." + tld + ".",
+			Hdr: dns.RR_Header{Name: suffix + ".", Rrtype: dns.TypeNS, Class: dns.ClassINET, Ttl: soaTTL},
+			Ns:  "ns.switchboard." + suffix + ".",
 		})
 	default:
 		// NODATA: NOERROR + empty answer + SOA in authority so resolvers
 		// negative-cache only this type, not the name.
-		m.Ns = append(m.Ns, s.soa(tld))
+		m.Ns = append(m.Ns, s.soa(suffix))
 	}
 	w.WriteMsg(m) //nolint:errcheck
 }
 
-// managedTLD reports whether fqdn (with trailing dot) falls under one of the
-// managed TLDs, returning the matching TLD.
-func (s *Server) managedTLD(fqdn string) (string, bool) {
+// managedSuffix reports whether fqdn (with trailing dot) falls under one of
+// the managed suffixes, returning the matching suffix.
+func (s *Server) managedSuffix(fqdn string) (string, bool) {
 	trimmed := strings.TrimSuffix(fqdn, ".")
-	for _, tld := range s.tlds {
-		if trimmed == tld || strings.HasSuffix(trimmed, "."+tld) {
-			return tld, true
+	for _, suffix := range s.suffixes {
+		if trimmed == suffix || strings.HasSuffix(trimmed, "."+suffix) {
+			return suffix, true
 		}
 	}
 	return "", false
 }
 
-func (s *Server) soa(tld string) dns.RR {
-	zone := tld + "."
+func (s *Server) soa(suffix string) dns.RR {
+	zone := suffix + "."
 	return &dns.SOA{
 		Hdr:     dns.RR_Header{Name: zone, Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: soaTTL},
 		Ns:      "ns.switchboard." + zone,

@@ -2,6 +2,9 @@
 /switchboard
 /dist/
 
+# agent scratch (plan ledgers, review packages)
+/.superpowers/
+
 # editor/OS noise
 .DS_Store
 *.swp

@@ -13,8 +13,8 @@ import (
 func osChecks(cfg *config.Config, rootCertPath string) []Check {
 	var checks []Check
 
-	// /etc/resolver/<tld> present and pointing at our DNS port.
-	resolverPath := filepath.Join("/etc/resolver", cfg.TLD)
+	// /etc/resolver/<suffix> present and pointing at our DNS port.
+	resolverPath := filepath.Join("/etc/resolver", cfg.Suffix)
 	b, err := os.ReadFile(resolverPath)
 	switch {
 	case os.IsNotExist(err):
