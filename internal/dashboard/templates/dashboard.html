@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Switchboard</title>
+<style>
+  :root { color-scheme: light dark;
+    --fg: #1a1a1a; --bg: #ffffff; --muted: #6b7280; --line: #e5e7eb;
+    --ok: #16a34a; --bad: #dc2626; --accent: #4f46e5; }
+  @media (prefers-color-scheme: dark) { :root {
+    --fg: #e5e7eb; --bg: #111318; --muted: #9ca3af; --line: #2a2e37; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.6 ui-sans-serif, system-ui, -apple-system, sans-serif; }
+  main { max-width: 720px; margin: 0 auto; padding: 3rem 1.25rem; }
+  h1 { font-size: 1.35rem; margin: 0 0 .25rem; }
+  h1 .tld { color: var(--accent); }
+  .sub { color: var(--muted); margin: 0 0 2rem; font-size: .9rem; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: .55rem .5rem; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; font-size: .8rem;
+    text-transform: uppercase; letter-spacing: .05em; }
+  td a { color: var(--accent); text-decoration: none; }
+  td a:hover { text-decoration: underline; }
+  .dot { display: inline-block; width: .55rem; height: .55rem; border-radius: 50%;
+    margin-right: .4rem; vertical-align: baseline; }
+  .up .dot { background: var(--ok); } .down .dot { background: var(--bad); }
+  .status { font-size: .85rem; color: var(--muted); }
+  .empty { color: var(--muted); padding: 2rem 0; }
+  code { background: color-mix(in srgb, var(--line) 50%, transparent);
+    padding: .1rem .35rem; border-radius: 4px; font-size: .85em; }
+  footer { margin-top: 2.5rem; color: var(--muted); font-size: .8rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Switchboard <span class="tld">.{{.TLD}}</span></h1>
+  <p class="sub">Local domains, patched through.</p>
+
+  {{if .Routes}}
+  <table>
+    <tr><th>Domain</th><th>Upstream</th><th>Status</th></tr>
+    {{range .Routes}}
+    <tr class="{{if .Up}}up{{else}}down{{end}}">
+      <td><a href="https://{{.Domain}}">{{.Domain}}</a></td>
+      <td><code>{{.Upstream}}</code></td>
+      <td class="status"><span class="dot"></span>{{if .Up}}up{{else}}down{{end}}</td>
+    </tr>
+    {{end}}
+  </table>
+  {{else}}
+  <p class="empty">No routes yet. Add one:<br><code>switchboard add app 3000</code></p>
+  {{end}}
+
+  <footer>switchboard {{.Version}} · <a href="/api/routes">api</a></footer>
+</main>
+</body>
+</html>
