@@ -61,8 +61,8 @@ homebrew_casks:
           if system_command("/usr/bin/xattr", args: ["-h"]).exit_status == 0
             system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/switchboard"]
           end
-    # `brew uninstall` should not leave the launchd job from `switchboard
-    # daemon install` loaded and pointing at a deleted binary. The same label
+    # `brew uninstall` should not leave the launchd job that `switchboard
+    # setup` installs loaded and pointing at a deleted binary. The same label
     # covers both shapes — the user agent and the privileged launch daemon —
     # but Homebrew runs uninstall unprivileged, so it can only boot out the
     # agent. `switchboard uninstall` is what removes the system daemon, and
@@ -77,25 +77,29 @@ homebrew_casks:
     caveats: |
       Set up once:
 
-        switchboard setup            # resolver file + trust the local CA (two prompts)
-        switchboard daemon install   # run in the background (one more prompt)
+        switchboard setup
+
+      That creates the local CA, points the OS resolver at Switchboard,
+      trusts the CA in your login keychain, and installs the background
+      service. Every step that needs your password prints the exact command
+      first.
 
       Then:
 
         switchboard add app 3000  &&  open https://app.test
 
-      `daemon install` asks for your password because :443 and :80 are
-      reserved for root on macOS. It installs a small parent process that
-      binds those two sockets and immediately drops to your user — the proxy,
-      the TLS stack and the local CA all run as you, never as root.
+      It asks for a password because :443 and :80 are reserved for root on
+      macOS. Switchboard installs a small parent process that binds those two
+      sockets and immediately drops to your user. The proxy, the TLS stack
+      and the local CA all run as you, never as root.
 
       Prefer nothing privileged at all? Put this in
-      ~/.config/switchboard/config.toml before `daemon install`:
+      ~/.config/switchboard/config.toml before running setup:
 
         http_port  = 8080
         https_port = 8443
 
-      and it installs a plain user agent instead. Everything works the same;
+      You get a plain user agent instead. Everything works the same, and
       URLs carry the port (https://app.test:8443).
 
       To remove everything, including the privileged launch daemon:
