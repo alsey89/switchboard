@@ -13,6 +13,7 @@ import (
 	"golang.org/x/net/websocket"
 
 	"github.com/alsey89/switchboard/internal/config"
+	"github.com/alsey89/switchboard/internal/listen"
 	"github.com/alsey89/switchboard/internal/proxy"
 )
 
@@ -42,7 +43,7 @@ func TestWebSocketUpgradeThroughProxy(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := proxy.Load(cfg, dataDir); err != nil {
+	if err := proxy.Load(cfg, dataDir, &listen.Set{}); err != nil {
 		t.Fatalf("loading caddy config: %v", err)
 	}
 	t.Cleanup(func() { proxy.Stop() }) //nolint:errcheck

@@ -20,9 +20,12 @@ import (
 	"github.com/alsey89/switchboard/internal/netprobe"
 )
 
-// PlistPath is where the launch agent definition lives. A *user* agent
-// (~/Library/LaunchAgents), never /Library/LaunchDaemons — the daemon must
-// not run as root.
+// SystemPlistPath is where a ModeDaemon definition lives. Root-owned, in the
+// system domain: the job starts as root to bind :443 and :80, then drops.
+const SystemPlistPath = "/Library/LaunchDaemons/" + Label + ".plist"
+
+// PlistPath is where a ModeAgent definition lives — a *user* agent that runs
+// as you and needs no privilege.
 func PlistPath() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -30,6 +33,24 @@ func PlistPath() (string, error) {
 	}
 	return filepath.Join(home, "Library", "LaunchAgents", Label+".plist"), nil
 }
+
+// PlistPathFor returns the definition path for a mode.
+func PlistPathFor(m Mode) (string, error) {
+	if m == ModeDaemon {
+		return SystemPlistPath, nil
+	}
+	return PlistPath()
+}
+
+func domainFor(m Mode) string {
+	if m == ModeDaemon {
+		// The system domain, not gui/<uid>: a LaunchDaemon has no session.
+		return "system"
+	}
+	return domainTarget()
+}
+
+func targetFor(m Mode) string { return domainFor(m) + "/" + Label }
 
 func renderPlist(s Spec) string {
 	var b strings.Builder
@@ -134,6 +155,13 @@ func checkPrivilegedPorts(s Spec) error {
 		if err != nil || port >= 1024 {
 			continue
 		}
+		// In ModeDaemon the privileged parent binds these two as root and
+		// hands them over, so a probe failing as the unprivileged installing
+		// user says nothing about whether the job will work. Probing anyway
+		// would refuse exactly the configuration this mode exists to serve.
+		if s.Mode == ModeDaemon && (p.Name == "https" || p.Name == "http") {
+			continue
+		}
 		if err := bindProbe(p.Network, p.Addr); err == nil || !errors.Is(err, os.ErrPermission) {
 			continue
 		}
@@ -194,17 +222,22 @@ func Install(s Spec, out io.Writer) error {
 		return err
 	}
 
-	plistPath, err := PlistPath()
+	plistPath, err := PlistPathFor(s.Mode)
 	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(plistPath), 0o755); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(s.StdoutPath), 0o755); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(s.StderrPath), 0o755); err != nil {
+		return err
+	}
+
+	if s.Mode == ModeDaemon {
+		return installSystemDaemon(s, plistPath, out)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(plistPath), 0o755); err != nil {
 		return err
 	}
 	if err := os.WriteFile(plistPath, []byte(renderPlist(s)), 0o644); err != nil {
@@ -230,6 +263,68 @@ func Install(s Spec, out io.Writer) error {
 	}
 	fmt.Fprintf(out, "  bootstrapped %s\n", serviceTarget())
 	return nil
+}
+
+// installSystemDaemon writes a root-owned plist and bootstraps it into the
+// system domain. Only these two steps elevate, and each is printed before it
+// runs — the same contract `switchboard setup` follows, so that a user can
+// see exactly what they are consenting to rather than handing the whole
+// command root and hoping.
+//
+// The plist is staged in the user's own directory and installed with
+// `install -o root -g wheel -m 0644`. Writing it directly under sudo would
+// mean a root-owned file whose contents were produced by a shell redirect,
+// and getting the ownership wrong here matters: launchd refuses to load a
+// LaunchDaemon that is writable by anyone but root, which is precisely the
+// protection that stops a user-writable file from steering a root job.
+func installSystemDaemon(s Spec, plistPath string, out io.Writer) error {
+	staged, err := os.CreateTemp("", "switchboard-*.plist")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(staged.Name()) //nolint:errcheck
+	if _, err := staged.WriteString(renderPlist(s)); err != nil {
+		staged.Close() //nolint:errcheck
+		return err
+	}
+	if err := staged.Close(); err != nil {
+		return err
+	}
+
+	fmt.Fprintf(out, "  installing a launch daemon; this needs your password:\n")
+	if err := elevate(out, "install", "-o", "root", "-g", "wheel", "-m", "0644",
+		staged.Name(), plistPath); err != nil {
+		return fmt.Errorf("installing %s: %w", plistPath, err)
+	}
+	fmt.Fprintf(out, "  wrote %s (root-owned)\n", plistPath)
+
+	// Booting out a job that isn't loaded is not an error worth reporting.
+	_ = elevateQuiet("launchctl", "bootout", targetFor(ModeDaemon))
+
+	err = bootstrapWithRetry(out, func() ([]byte, error) {
+		return exec.Command("sudo", "launchctl", "bootstrap", domainFor(ModeDaemon), plistPath).CombinedOutput()
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "  bootstrapped %s\n", targetFor(ModeDaemon))
+	fmt.Fprintf(out, "  the proxy runs as uid %d; only the socket-binding parent is root\n", s.UID)
+	return nil
+}
+
+// elevate runs a command under sudo, printing it first, attached to the
+// user's terminal so sudo can prompt.
+func elevate(out io.Writer, name string, args ...string) error {
+	fmt.Fprintf(out, "  $ sudo %s %s\n", name, strings.Join(args, " "))
+	cmd := exec.Command("sudo", append([]string{name}, args...)...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = out
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func elevateQuiet(name string, args ...string) error {
+	return exec.Command("sudo", append([]string{name}, args...)...).Run()
 }
 
 // bootstrapWithRetry retries fn — a `launchctl bootstrap` invocation, or a
@@ -265,51 +360,88 @@ func bootstrapWithRetry(out io.Writer, fn func() ([]byte, error)) error {
 // Uninstall boots the agent out and removes the plist. removed reports
 // whether there was anything to remove, so callers don't claim success for
 // a service that was never installed.
+// Both modes are always attempted, regardless of what the current config
+// would install. Someone who used high ports, then switched to :443, has a
+// stale user agent on disk that would fight the new launch daemon for the
+// dashboard and DNS ports; uninstall has to clear whatever is actually
+// there, not whatever the config implies should be.
 func Uninstall(out io.Writer) (removed bool, err error) {
-	plistPath, err := PlistPath()
-	if err != nil {
-		return false, err
+	for _, mode := range []Mode{ModeAgent, ModeDaemon} {
+		plistPath, pathErr := PlistPathFor(mode)
+		if pathErr != nil {
+			err = errors.Join(err, pathErr)
+			continue
+		}
+		if _, statErr := os.Stat(plistPath); os.IsNotExist(statErr) {
+			continue
+		}
+		if rmErr := uninstallOne(mode, plistPath, out); rmErr != nil {
+			err = errors.Join(err, rmErr)
+			continue
+		}
+		removed = true
 	}
-	if _, statErr := os.Stat(plistPath); os.IsNotExist(statErr) {
+	if !removed && err == nil {
 		fmt.Fprintln(out, "  no service was installed")
-		return false, nil
+	}
+	return removed, err
+}
+
+func uninstallOne(mode Mode, plistPath string, out io.Writer) error {
+	if mode == ModeDaemon {
+		fmt.Fprintln(out, "  removing the launch daemon; this needs your password:")
+		_ = elevateQuiet("launchctl", "bootout", targetFor(mode))
+		if err := elevate(out, "rm", "-f", plistPath); err != nil {
+			return fmt.Errorf("removing %s: %w", plistPath, err)
+		}
+		fmt.Fprintf(out, "  removed %s\n", plistPath)
+		return nil
 	}
 
-	if b, err := exec.Command("launchctl", "bootout", serviceTarget()).CombinedOutput(); err != nil {
+	if b, err := exec.Command("launchctl", "bootout", targetFor(mode)).CombinedOutput(); err != nil {
 		// "No such process" just means it wasn't running.
 		if !strings.Contains(string(b), "No such process") {
 			fmt.Fprintf(out, "  (launchctl bootout: %s)\n", strings.TrimSpace(string(b)))
 		}
 	}
 	if err := os.Remove(plistPath); err != nil && !os.IsNotExist(err) {
-		return false, err
+		return err
 	}
 	fmt.Fprintf(out, "  removed %s\n", plistPath)
-	return true, nil
+	return nil
 }
 
 // Status reports the launch agent's state by combining two independent
 // facts: whether the plist exists on disk, and what launchd itself says via
 // `launchctl print`. See State's doc for why those two facts don't collapse
 // into a single bool.
+// The system daemon is checked first: if both exist, it is the one holding
+// :443, and reporting the agent instead would describe a job that cannot
+// even start.
 func Status() (state State, plistPath string, err error) {
-	plistPath, err = PlistPath()
+	agentPath, err := PlistPath()
 	if err != nil {
 		return NotInstalled, "", err
 	}
-	if _, statErr := os.Stat(plistPath); statErr != nil {
-		return NotInstalled, plistPath, nil
+	for _, c := range []struct {
+		mode Mode
+		path string
+	}{{ModeDaemon, SystemPlistPath}, {ModeAgent, agentPath}} {
+		if _, statErr := os.Stat(c.path); statErr != nil {
+			continue
+		}
+		out, printErr := exec.Command("launchctl", "print", targetFor(c.mode)).CombinedOutput()
+		if printErr != nil {
+			// launchd doesn't know about this label: the plist exists but was
+			// never bootstrapped (or was booted out and not reinstalled).
+			return NotLoaded, c.path, nil
+		}
+		if jobRunning(string(out)) {
+			return Running, c.path, nil
+		}
+		return Loaded, c.path, nil
 	}
-	out, printErr := exec.Command("launchctl", "print", serviceTarget()).CombinedOutput()
-	if printErr != nil {
-		// launchd doesn't know about this label: the plist exists but was
-		// never bootstrapped (or was booted out and not reinstalled).
-		return NotLoaded, plistPath, nil
-	}
-	if jobRunning(string(out)) {
-		return Running, plistPath, nil
-	}
-	return Loaded, plistPath, nil
+	return NotInstalled, agentPath, nil
 }
 
 // jobRunning inspects `launchctl print <target>` output for evidence of a
@@ -341,21 +473,30 @@ func jobRunning(printOutput string) bool {
 // InstalledExec returns the binary path recorded in the installed plist, or
 // "" if no plist exists or it doesn't parse. Used by doctor to spot a stale
 // path after the binary moves (a Homebrew upgrade, say).
+// Both modes are inspected, system daemon first, matching Status's
+// precedence — otherwise a machine running the launch daemon would have
+// doctor reporting on a stale user agent, or on nothing at all.
 func InstalledExec() string {
-	plistPath, err := PlistPath()
+	agentPath, err := PlistPath()
 	if err != nil {
-		return ""
+		agentPath = ""
 	}
-	b, err := os.ReadFile(plistPath)
-	if err != nil {
-		return ""
+	for _, p := range []string{SystemPlistPath, agentPath} {
+		if p == "" {
+			continue
+		}
+		b, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		var doc plistDoc
+		if _, err := plist.Unmarshal(b, &doc); err != nil {
+			continue
+		}
+		if len(doc.ProgramArguments) == 0 {
+			continue
+		}
+		return doc.ProgramArguments[0]
 	}
-	var doc plistDoc
-	if _, err := plist.Unmarshal(b, &doc); err != nil {
-		return ""
-	}
-	if len(doc.ProgramArguments) == 0 {
-		return ""
-	}
-	return doc.ProgramArguments[0]
+	return ""
 }

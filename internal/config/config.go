@@ -27,12 +27,17 @@ type Config struct {
 	// (e.g. "dev.example.com").
 	Suffix string `toml:"suffix"`
 
-	// TLD is the pre-v0.2 spelling of Suffix. Read on load so existing
-	// configs keep working; Save never writes it.
-	TLD string `toml:"tld,omitempty"`
-
-	// Ports. Zero values mean defaults. These exist mainly as escape
-	// hatches (port conflicts) and for tests; normal use never sets them.
+	// Ports. Zero values mean defaults. These are escape hatches for port
+	// conflicts; normal use never sets them.
+	//
+	// http_port and https_port apply only when the daemon binds its own
+	// sockets. Started by the privileged parent, it is handed :443 and :80
+	// already bound and these two settings do nothing — the daemon logs a
+	// warning saying so. This is deliberate and is the security boundary of
+	// the whole design: root must never learn a port number from a file any
+	// local process can rewrite, or a hostile config makes it bind an
+	// unclaimed privileged port (631, 88, 548) and hand the descriptor over.
+	// See internal/privileged and docs/adr/0001.
 	// (BurntSushi/toml omits numeric zeros via omitzero, not omitempty.)
 	HTTPPort      int `toml:"http_port,omitzero"`
 	HTTPSPort     int `toml:"https_port,omitzero"`
@@ -109,12 +114,6 @@ func Load(path string) (*Config, error) {
 	if _, err := toml.Decode(string(b), &c); err != nil {
 		return nil, fmt.Errorf("parsing %s: %w", path, err)
 	}
-	// Migrate the pre-v0.2 `tld` key. Save() only ever writes `suffix`, so a
-	// load+save cycle rewrites the file in the new spelling.
-	if c.Suffix == "" {
-		c.Suffix = c.TLD
-	}
-	c.TLD = ""
 	if c.Suffix == "" {
 		c.Suffix = DefaultSuffix
 	}

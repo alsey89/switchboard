@@ -20,6 +20,7 @@ import (
 	"github.com/alsey89/switchboard/internal/config"
 	"github.com/alsey89/switchboard/internal/dashboard"
 	"github.com/alsey89/switchboard/internal/dnsd"
+	"github.com/alsey89/switchboard/internal/listen"
 	"github.com/alsey89/switchboard/internal/proxy"
 )
 
@@ -45,6 +46,24 @@ func Run(ctx context.Context, opts Options) error {
 		return err
 	}
 
+	// Sockets a privileged parent bound for us, if we were started by one.
+	// Empty otherwise, in which case everything below binds normally.
+	set, err := listen.FromEnv()
+	if err != nil {
+		return err
+	}
+	if set.Any() {
+		log.Info("running under a privileged parent",
+			"https", set.Addr(listen.HTTPS), "http", set.Addr(listen.HTTP))
+		// The config's port settings did not choose these sockets and cannot
+		// change them. Saying so is not pedantry: a user who edits
+		// https_port here would otherwise watch it take effect on nothing,
+		// with no error and no clue why.
+		for _, w := range ignoredPortSettings(cfg, set) {
+			log.Warn("config setting has no effect under a privileged parent", "setting", w)
+		}
+	}
+
 	// DNS.
 	dns := dnsd.New([]string{cfg.Suffix})
 	dnsBind := net.JoinHostPort("127.0.0.1", strconv.Itoa(cfg.EffDNSPort()))
@@ -63,12 +82,13 @@ func Run(ctx context.Context, opts Options) error {
 	defer dash.Shutdown(context.Background()) //nolint:errcheck
 
 	// Embedded Caddy: proxy + TLS + PKI.
-	if err := proxy.Load(cfg, opts.DataDir); err != nil {
-		return friendlyBindError(err, "proxy", "127.0.0.1:"+strconv.Itoa(cfg.EffHTTPSPort()), opts.ConfigPath)
+	httpsAddr, _ := proxy.Addrs(cfg, set)
+	if err := proxy.Load(cfg, opts.DataDir, set); err != nil {
+		return friendlyBindError(err, "proxy", httpsAddr, opts.ConfigPath)
 	}
 	defer proxy.Stop() //nolint:errcheck
 	log.Info("proxy up",
-		"https", "127.0.0.1:"+strconv.Itoa(cfg.EffHTTPSPort()),
+		"https", httpsAddr,
 		"routes", len(cfg.Routes),
 		"dashboard", "https://"+cfg.DashboardDomain(),
 		"dashboard_direct", "http://"+dashBind)
@@ -126,7 +146,7 @@ func Run(ctx context.Context, opts Options) error {
 					"old", cfg.Suffix, "new", next.Suffix)
 				continue
 			}
-			if err := proxy.Load(next, opts.DataDir); err != nil {
+			if err := proxy.Load(next, opts.DataDir, set); err != nil {
 				log.Error("proxy reload failed; keeping previous config", "err", err)
 				continue
 			}
@@ -141,6 +161,21 @@ func Run(ctx context.Context, opts Options) error {
 			log.Warn("config watcher error", "err", err)
 		}
 	}
+}
+
+// ignoredPortSettings names the config keys the user has set that cannot
+// take effect because the corresponding socket was inherited rather than
+// bound. Only keys explicitly set are reported — an unset key defaulting to
+// 443 is not the user asking for anything.
+func ignoredPortSettings(cfg *config.Config, set *listen.Set) []string {
+	var out []string
+	if cfg.HTTPSPort != 0 && set.Inherited(listen.HTTPS) {
+		out = append(out, "https_port")
+	}
+	if cfg.HTTPPort != 0 && set.Inherited(listen.HTTP) {
+		out = append(out, "http_port")
+	}
+	return out
 }
 
 // listenerRemedy is the config snippet a given listener's permission-denied

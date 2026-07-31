@@ -2,6 +2,7 @@ package service
 
 import (
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -172,6 +173,65 @@ func TestDefaultSpecGuardsEveryConfigurableListener(t *testing.T) {
 	if len(spec.Ports) != len(want) {
 		t.Errorf("got %d guarded ports, want %d — a listener was added or removed "+
 			"without updating this test", len(spec.Ports), len(want))
+	}
+}
+
+// TestDefaultSpecPicksModeFromPorts is the behaviour that replaced the old
+// hard refusal. `daemon install` on a stock config used to be an error
+// telling the user to edit their ports; it now installs the launch daemon,
+// because :443 is reachable — it just needs the privileged parent to bind it.
+func TestDefaultSpecPicksModeFromPorts(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  *config.Config
+		want Mode
+	}{
+		{"stock config wants :443", config.Default(), ModeDaemon},
+		{"high ports need no privilege",
+			&config.Config{Suffix: "test", HTTPPort: 8080, HTTPSPort: 8443}, ModeAgent},
+		{"https high but http still :80",
+			&config.Config{Suffix: "test", HTTPPort: 80, HTTPSPort: 8443}, ModeDaemon},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("SWITCHBOARD_DIR", t.TempDir())
+
+			spec, err := DefaultSpec(tc.cfg, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if spec.Mode != tc.want {
+				t.Fatalf("Mode = %v, want %v", spec.Mode, tc.want)
+			}
+
+			if tc.want == ModeAgent {
+				if spec.Args[0] != "start" {
+					t.Errorf("an agent should run `start`, got %v", spec.Args)
+				}
+				return
+			}
+
+			// The identity has to be in the plist. launchd sets no SUDO_UID,
+			// so a parent that inferred it at runtime would have nothing to
+			// infer from and would fall back to root's home.
+			if spec.Args[0] != "__supervise" {
+				t.Errorf("a launch daemon should run `__supervise`, got %v", spec.Args)
+			}
+			for _, flag := range []string{"--uid", "--gid", "--home"} {
+				if !slices.Contains(spec.Args, flag) {
+					t.Errorf("args %v must carry %s — nothing else tells the parent who to become",
+						spec.Args, flag)
+				}
+			}
+			if spec.UID == 0 || spec.GID == 0 {
+				t.Errorf("Spec records uid %d/gid %d; the daemon must never run as root",
+					spec.UID, spec.GID)
+			}
+			if spec.StdoutPath != SystemLogPath {
+				t.Errorf("StdoutPath = %q, want %q: launchd creates this file as root, and "+
+					"a root-owned file inside ~/.config/switchboard would break the documented "+
+					"`rm -rf` reset", spec.StdoutPath, SystemLogPath)
+			}
+		})
 	}
 }
 

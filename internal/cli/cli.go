@@ -20,6 +20,7 @@ import (
 	"github.com/alsey89/switchboard/internal/config"
 	"github.com/alsey89/switchboard/internal/daemon"
 	"github.com/alsey89/switchboard/internal/doctor"
+	"github.com/alsey89/switchboard/internal/privileged"
 	"github.com/alsey89/switchboard/internal/service"
 	"github.com/alsey89/switchboard/internal/setup"
 )
@@ -63,6 +64,8 @@ func Root() *cobra.Command {
 	root.AddCommand(
 		cmdSetup(&flagConfig),
 		cmdStart(&flagConfig),
+		cmdSupervise(&flagConfig),
+		cmdServe(&flagConfig),
 		cmdAdd(&flagConfig),
 		cmdRemove(&flagConfig),
 		cmdList(&flagConfig),
@@ -117,22 +120,116 @@ func cmdStart(flagConfig *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "start",
 		Short: "Run the daemon in the foreground (DNS + HTTPS proxy)",
+		Long: "Run the daemon in the foreground.\n\n" +
+			"Run as yourself, it serves on the ports in your config.\n" +
+			"Run as `sudo switchboard start`, it binds :443 and :80 first, drops to your\n" +
+			"user, and runs the daemon unprivileged with those sockets already open — so\n" +
+			"URLs carry no port. Only the socket-binding parent is ever root; see\n" +
+			"docs/adr/0001-binding-privileged-ports-on-macos.md.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			p, err := resolvePaths(*flagConfig)
+			if os.Geteuid() == 0 {
+				target, err := privileged.FromSudo()
+				if err != nil {
+					return err
+				}
+				return superviseAs(cmd, target, *flagConfig)
+			}
+			return serve(cmd, *flagConfig)
+		},
+	}
+}
+
+// cmdSupervise is the launchd entry point. It is hidden because it is not a
+// thing to run by hand: the identity has to be passed explicitly, and
+// `daemon install` is what knows it. Under launchd there is no SUDO_UID to
+// derive it from, which is exactly why this exists separately from `start`.
+func cmdSupervise(flagConfig *string) *cobra.Command {
+	var uid, gid int
+	var home string
+	c := &cobra.Command{
+		Use:    "__supervise",
+		Short:  "Internal: bind privileged ports, drop privileges, run the daemon",
+		Hidden: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			target, err := privileged.FromFlags(uid, gid, home)
 			if err != nil {
 				return err
 			}
-			log := slog.New(slog.NewTextHandler(cmd.ErrOrStderr(), nil))
-			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-			defer stop()
-			return daemon.Run(ctx, daemon.Options{
-				ConfigPath: p.configPath,
-				DataDir:    p.dataDir,
-				Version:    Version,
-				Log:        log,
-			})
+			return superviseAs(cmd, target, *flagConfig)
 		},
 	}
+	c.Flags().IntVar(&uid, "uid", 0, "uid to run the daemon as")
+	c.Flags().IntVar(&gid, "gid", 0, "gid to run the daemon as")
+	c.Flags().StringVar(&home, "home", "", "home directory of the target user")
+	return c
+}
+
+// cmdServe is the unprivileged child. Hidden: `start` is the command people
+// run, and this one exists so the parent has something to exec that will not
+// re-enter the privileged branch.
+func cmdServe(flagConfig *string) *cobra.Command {
+	return &cobra.Command{
+		Use:    "__serve",
+		Short:  "Internal: run the daemon, adopting any inherited sockets",
+		Hidden: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return serve(cmd, *flagConfig)
+		},
+	}
+}
+
+// serve runs the daemon in this process.
+func serve(cmd *cobra.Command, flagConfig string) error {
+	p, err := resolvePaths(flagConfig)
+	if err != nil {
+		return err
+	}
+	log := slog.New(slog.NewTextHandler(cmd.ErrOrStderr(), nil))
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return daemon.Run(ctx, daemon.Options{
+		ConfigPath: p.configPath,
+		DataDir:    p.dataDir,
+		Version:    Version,
+		Log:        log,
+	})
+}
+
+// superviseAs runs the privileged parent, which execs this same binary as
+// the target user.
+//
+// Note what is *not* resolved here: the config path is passed through
+// verbatim rather than expanded. The parent must not read the user's config
+// — see the privileged package comment — and resolving a default path would
+// mean resolving it against root's home anyway. The child works it out from
+// the HOME the parent gives it.
+func superviseAs(cmd *cobra.Command, target privileged.Target, flagConfig string) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	args := []string{"__serve"}
+	if flagConfig != "" {
+		args = append(args, "--config", flagConfig)
+	}
+
+	log := slog.New(slog.NewTextHandler(cmd.ErrOrStderr(), nil))
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	fmt.Fprintf(cmd.OutOrStdout(),
+		"binding :443 and :80 as root, then dropping to %s (uid %d)\n",
+		target.Name, target.UID)
+
+	return privileged.Run(ctx, privileged.Spec{
+		Exe:  exe,
+		Args: args,
+		UID:  target.UID,
+		GID:  target.GID,
+		Home: target.Home,
+		Env:  os.Environ(),
+		Log:  log,
+	})
 }
 
 func cmdAdd(flagConfig *string) *cobra.Command {

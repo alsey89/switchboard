@@ -1,7 +1,6 @@
 package config
 
 import (
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -84,35 +83,6 @@ func TestValidateSuffixErrorsAreActionable(t *testing.T) {
 		if !strings.Contains(err.Error(), "internal") || !strings.Contains(err.Error(), "dev.example.com") {
 			t.Errorf("suffix %q: error should suggest alternatives, got: %v", s, err)
 		}
-	}
-}
-
-func TestLegacyTLDKeyStillLoads(t *testing.T) {
-	// Configs written before v0.2 spell the field `tld`.
-	path := filepath.Join(t.TempDir(), "config.toml")
-	if err := os.WriteFile(path, []byte("tld = \"test\"\n\n[[routes]]\ndomain = \"app.test\"\nport = 3000\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	got, err := Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.Suffix != "test" {
-		t.Errorf("legacy tld key should populate Suffix, got %q", got.Suffix)
-	}
-	// Re-saving must migrate the file to the new spelling.
-	if err := got.Save(path); err != nil {
-		t.Fatal(err)
-	}
-	b, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(b), `suffix = "test"`) {
-		t.Errorf("Save should write the `suffix` key, got:\n%s", b)
-	}
-	if strings.Contains(string(b), "tld =") {
-		t.Errorf("Save should not write the legacy `tld` key, got:\n%s", b)
 	}
 }
 
