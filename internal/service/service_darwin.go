@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"howett.net/plist"
@@ -22,7 +23,13 @@ import (
 
 // SystemPlistPath is where a ModeDaemon definition lives. Root-owned, in the
 // system domain: the job starts as root to bind :443 and :80, then drops.
-const SystemPlistPath = "/Library/LaunchDaemons/" + Label + ".plist"
+//
+// A var, not a const, so tests can redirect it. As a const it silently broke
+// test isolation: the agent path moves with HOME, but an absolute system path
+// does not, so every test touching Status, InstalledExec or Uninstall read the
+// developer's real installation — and the uninstall test would have run
+// `sudo rm` against it.
+var SystemPlistPath = "/Library/LaunchDaemons/" + Label + ".plist"
 
 // PlistPath is where a ModeAgent definition lives — a *user* agent that runs
 // as you and needs no privilege.
@@ -213,7 +220,8 @@ func Install(s Spec, out io.Writer) error {
 	if geteuid() == 0 {
 		return errors.New("run `switchboard daemon install` without sudo — a launch agent " +
 			"installed as root loads into a different launchd domain (gui/0) than your own " +
-			"session, so you'd never see it running. The daemon always runs as you, never as root")
+			"session, so you'd never see it running. For :443 it also needs to record your " +
+			"uid and home directory, which under sudo would resolve to root's")
 	}
 
 	// Refuse before writing anything: an agent that can't bind its ports
@@ -277,23 +285,106 @@ func Install(s Spec, out io.Writer) error {
 // and getting the ownership wrong here matters: launchd refuses to load a
 // LaunchDaemon that is writable by anyone but root, which is precisely the
 // protection that stops a user-writable file from steering a root job.
+// StagedExecPath is where the launch daemon's copy of the binary lives.
+//
+// launchd runs a LaunchDaemon's program as root but only validates the
+// *plist's* ownership, never the program's. So a root job whose binary sits
+// in a directory the user can write to is a user-to-root escalation: replace
+// the file, wait for the next boot. Homebrew's prefix is exactly that —
+// /opt/homebrew/bin is drwxrwxr-x owned by the installing user — so shipping
+// a cask that points a LaunchDaemon at the installed binary would hand every
+// user a password-free path to root on their own machine.
+//
+// `daemon install` therefore copies the binary somewhere only root can
+// modify and points the plist at the copy. /Library/PrivilegedHelperTools is
+// Apple's own location for privileged helpers and is root:wheel drwxr-xr-t
+// on a stock system.
+//
+// The cost is that a `brew upgrade` updates the binary on PATH but not this
+// copy. doctor compares them and says to re-run `daemon install`; that is a
+// visible, recoverable staleness, which is a better failure than a silent
+// escalation.
+// A var for the same reason as SystemPlistPath.
+var StagedExecPath = "/Library/PrivilegedHelperTools/" + Label
+
+// stagePrivilegedBinary copies exe to StagedExecPath as root and verifies
+// that nothing but root can modify it — including through any directory
+// above it, since a writable parent means the file can simply be replaced.
+func stagePrivilegedBinary(exe string, out io.Writer) error {
+	dir := filepath.Dir(StagedExecPath)
+	if err := elevate(out, "install", "-d", "-o", "root", "-g", "wheel", "-m", "0755", dir); err != nil {
+		return fmt.Errorf("creating %s: %w", dir, err)
+	}
+	if err := elevate(out, "install", "-o", "root", "-g", "wheel", "-m", "0755",
+		exe, StagedExecPath); err != nil {
+		return fmt.Errorf("staging the daemon binary at %s: %w", StagedExecPath, err)
+	}
+	return verifyOwnership(StagedExecPath)
+}
+
+// verifyOwnership is verifyRootOnlyWritable, indirected like geteuid and
+// bindProbe so tests can exercise the staging sequence without needing a
+// genuinely root-owned directory to stage into.
+var verifyOwnership = verifyRootOnlyWritable
+
+// verifyRootOnlyWritable checks path and every directory above it are owned
+// by root and not writable by group or other. Verifying rather than assuming,
+// because the safe answer differs by machine: /usr/local is root-owned on
+// Apple Silicon but is Homebrew's own prefix on Intel.
+func verifyRootOnlyWritable(path string) error {
+	for p := path; ; p = filepath.Dir(p) {
+		fi, err := os.Lstat(p)
+		if err != nil {
+			return err
+		}
+		st, ok := fi.Sys().(*syscall.Stat_t)
+		if !ok {
+			return fmt.Errorf("cannot determine the owner of %s", p)
+		}
+		if st.Uid != 0 {
+			return fmt.Errorf("%s is owned by uid %d, not root. launchd would run it as "+
+				"root, so anyone who can write there could take over the machine at the "+
+				"next boot", p, st.Uid)
+		}
+		if perm := fi.Mode().Perm(); perm&0o022 != 0 {
+			return fmt.Errorf("%s is writable by group or other (%04o). launchd would run "+
+				"it as root, so that is a path to root for any process that can write "+
+				"there", p, perm)
+		}
+		if p == "/" {
+			return nil
+		}
+	}
+}
+
 func installSystemDaemon(s Spec, plistPath string, out io.Writer) error {
-	staged, err := os.CreateTemp("", "switchboard-*.plist")
+	fmt.Fprintf(out, "  installing a launch daemon; this needs your password:\n")
+
+	// The plist must point at a binary only root can modify — see
+	// StagedExecPath. Do this before writing the plist, so a failure here
+	// leaves nothing installed rather than a plist naming a binary that was
+	// never staged.
+	if err := stagePrivilegedBinary(s.Exec, out); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "  staged %s (root-owned, not writable by you)\n", StagedExecPath)
+	s.Exec = StagedExecPath
+
+	plistTmp, err := os.CreateTemp("", "switchboard-*.plist")
 	if err != nil {
 		return err
 	}
-	defer os.Remove(staged.Name()) //nolint:errcheck
-	if _, err := staged.WriteString(renderPlist(s)); err != nil {
-		staged.Close() //nolint:errcheck
+	defer os.Remove(plistTmp.Name()) //nolint:errcheck
+	if _, err := plistTmp.WriteString(renderPlist(s)); err != nil {
+		plistTmp.Close() //nolint:errcheck
 		return err
 	}
-	if err := staged.Close(); err != nil {
+	if err := plistTmp.Close(); err != nil {
 		return err
 	}
 
-	fmt.Fprintf(out, "  installing a launch daemon; this needs your password:\n")
 	if err := elevate(out, "install", "-o", "root", "-g", "wheel", "-m", "0644",
-		staged.Name(), plistPath); err != nil {
+		plistTmp.Name(), plistPath); err != nil {
 		return fmt.Errorf("installing %s: %w", plistPath, err)
 	}
 	fmt.Fprintf(out, "  wrote %s (root-owned)\n", plistPath)
@@ -302,7 +393,7 @@ func installSystemDaemon(s Spec, plistPath string, out io.Writer) error {
 	_ = elevateQuiet("launchctl", "bootout", targetFor(ModeDaemon))
 
 	err = bootstrapWithRetry(out, func() ([]byte, error) {
-		return exec.Command("sudo", "launchctl", "bootstrap", domainFor(ModeDaemon), plistPath).CombinedOutput()
+		return elevateOutput("launchctl", "bootstrap", domainFor(ModeDaemon), plistPath)
 	})
 	if err != nil {
 		return err
@@ -314,7 +405,11 @@ func installSystemDaemon(s Spec, plistPath string, out io.Writer) error {
 
 // elevate runs a command under sudo, printing it first, attached to the
 // user's terminal so sudo can prompt.
-func elevate(out io.Writer, name string, args ...string) error {
+//
+// A package var so tests can record the privileged sequence rather than run
+// it. Everything this package does as root goes through here or
+// elevateQuiet, which makes them the two places a test can observe.
+var elevate = func(out io.Writer, name string, args ...string) error {
 	fmt.Fprintf(out, "  $ sudo %s %s\n", name, strings.Join(args, " "))
 	cmd := exec.Command("sudo", append([]string{name}, args...)...)
 	cmd.Stdin = os.Stdin
@@ -323,8 +418,17 @@ func elevate(out io.Writer, name string, args ...string) error {
 	return cmd.Run()
 }
 
-func elevateQuiet(name string, args ...string) error {
+var elevateQuiet = func(name string, args ...string) error {
 	return exec.Command("sudo", append([]string{name}, args...)...).Run()
+}
+
+// elevateOutput is the third privileged entry point: same as elevateQuiet but
+// returning combined output, which bootstrapWithRetry needs in order to
+// report why launchd refused. A var for the same reason as the other two —
+// without it, a unit test of the install sequence really does run
+// `sudo launchctl bootstrap` against the machine running the tests.
+var elevateOutput = func(name string, args ...string) ([]byte, error) {
+	return exec.Command("sudo", append([]string{name}, args...)...).CombinedOutput()
 }
 
 // bootstrapWithRetry retries fn — a `launchctl bootstrap` invocation, or a
@@ -395,6 +499,15 @@ func uninstallOne(mode Mode, plistPath string, out io.Writer) error {
 			return fmt.Errorf("removing %s: %w", plistPath, err)
 		}
 		fmt.Fprintf(out, "  removed %s\n", plistPath)
+		// The staged copy is a root-owned binary the user cannot delete
+		// themselves; leaving it behind would be litter they'd need sudo to
+		// clean up, in a directory they have no reason to look in.
+		if _, err := os.Stat(StagedExecPath); err == nil {
+			if err := elevate(out, "rm", "-f", StagedExecPath); err != nil {
+				return fmt.Errorf("removing %s: %w", StagedExecPath, err)
+			}
+			fmt.Fprintf(out, "  removed %s\n", StagedExecPath)
+		}
 		return nil
 	}
 

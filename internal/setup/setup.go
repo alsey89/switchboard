@@ -5,9 +5,10 @@
 // Philosophy: the daemon itself always runs unprivileged. Only these
 // one-shot steps elevate, each as a separate, visible command (printed
 // before it runs), so the user can see exactly what they are consenting to.
-// On macOS that is two `sudo` prompts today — and only because the daemon is
-// confined to high ports. Binding :80/:443 needs privilege from somewhere,
-// and resolving that (ADR 0001) is expected to add a third one-time step.
+// On macOS that is two `sudo` prompts here. Serving :80/:443 adds a third,
+// in `daemon install`, which sets up the privileged parent that binds those
+// sockets and immediately drops to the user (ADR 0001). On high ports there
+// is no third prompt and nothing privileged runs at all.
 package setup
 
 import (
@@ -80,7 +81,12 @@ func Remove(cfg *config.Config, dataDir string, out io.Writer) error {
 
 // runVisible prints a command, then runs it attached to the user's terminal
 // (so sudo can prompt). Commands are elevated with sudo unless already root.
-func runVisible(out io.Writer, name string, args ...string) error {
+//
+// A package var, not a plain func, so tests can record the elevated commands
+// this package issues without running them. Everything privileged Switchboard
+// does on macOS goes through here, which makes it the one place a test can
+// assert on the sequence.
+var runVisible = func(out io.Writer, name string, args ...string) error {
 	if os.Geteuid() != 0 && name != "sudo" {
 		args = append([]string{name}, args...)
 		name = "sudo"

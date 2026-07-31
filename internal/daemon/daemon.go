@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -41,17 +42,40 @@ func Run(ctx context.Context, opts Options) error {
 		log = slog.Default()
 	}
 
-	cfg, err := config.Load(opts.ConfigPath)
-	if err != nil {
-		return err
-	}
-
 	// Sockets a privileged parent bound for us, if we were started by one.
 	// Empty otherwise, in which case everything below binds normally.
 	set, err := listen.FromEnv()
 	if err != nil {
 		return err
 	}
+
+	// Under a privileged parent, a missing config file is fatal rather than
+	// "use the defaults".
+	//
+	// A launch daemon starts at boot, before anyone logs in — and on a
+	// FileVault Mac the user's home directory does not exist yet at that
+	// point. config.Load treats a missing file as "use defaults", so the
+	// daemon would come up perfectly healthy serving zero routes, watching a
+	// directory that is not there. Nothing would ever recover it: the user
+	// logs in, their config appears, and the running daemon never notices.
+	//
+	// Exiting non-zero instead puts the problem where the retry logic already
+	// lives. The parent backs off and respawns, and the daemon comes up
+	// properly within thirty seconds of the home directory appearing.
+	if set.Any() {
+		if _, statErr := os.Stat(opts.ConfigPath); statErr != nil {
+			return fmt.Errorf("config file %s is not readable yet: %w\n"+
+				"  Started by launchd at boot, this is expected until the user's home "+
+				"directory is available (FileVault decrypts it at login).\n"+
+				"  The supervising parent will retry.", opts.ConfigPath, statErr)
+		}
+	}
+
+	cfg, err := config.Load(opts.ConfigPath)
+	if err != nil {
+		return err
+	}
+
 	if set.Any() {
 		log.Info("running under a privileged parent",
 			"https", set.Addr(listen.HTTPS), "http", set.Addr(listen.HTTP))
@@ -186,7 +210,6 @@ func ignoredPortSettings(cfg *config.Config, set *listen.Set) []string {
 // a user told to set https_port after the DNS responder failed to bind would
 // change a setting unrelated to the error they were reading.
 var listenerRemedy = map[string]string{
-	"proxy":     "    http_port  = 8080\n    https_port = 8443\n\n  URLs then carry the port (https://app.test:8443).",
 	"DNS":       "    dns_port = 53535\n\n  The /etc/resolver file must name the same port — re-run `switchboard setup`.",
 	"dashboard": "    dashboard_port = 8484",
 }
@@ -211,24 +234,47 @@ func friendlyBindError(err error, what, addr, cfgPath string) error {
 		// Do not claim macOS exempts unprivileged processes from the <1024
 		// restriction. It does not — that claim used to be printed directly
 		// beneath this very error, which made the message self-refuting.
-		hint := "  Ports below 1024 are reserved for root, and Switchboard runs as you.\n"
-		if runtime.GOOS == "linux" {
-			hint += "  Either grant the capability:\n" +
-				"    sudo setcap cap_net_bind_service=+ep $(which switchboard)\n" +
-				"  or use high ports"
-		} else {
-			hint += "  Use high ports"
-		}
-		remedy, ok := listenerRemedy[what]
-		if !ok {
-			remedy = "    (raise the port for this listener above 1024)"
-		}
 		return fmt.Errorf("%s cannot bind %s: permission denied.\n"+
-			"%s in %s:\n\n"+
+			"  Ports below 1024 are reserved for root, and the daemon runs as you.\n\n"+
 			"%s\n  (%w)",
-			what, addr, hint, configPathOr(cfgPath), remedy, err)
+			what, addr, privilegeAdvice(what, cfgPath), err)
 	}
 	return err
+}
+
+// privilegeAdvice is what to do about a port below 1024, which differs by
+// listener because only two of them can be handed over by the privileged
+// parent.
+//
+// The proxy's advice used to offer high ports and nothing else. That was
+// right when high ports were the only working configuration, and became
+// wrong the moment the privileged parent shipped — it answered "how do I
+// serve :443?" with "don't", while the supported way to do exactly that went
+// unmentioned. The first person to hit this after the parent landed was told
+// to reconfigure rather than to run one command.
+func privilegeAdvice(what, cfgPath string) string {
+	if what == "proxy" {
+		advice := "  Either let the privileged parent bind them for you — it drops to your\n" +
+			"  user immediately, so the proxy still does not run as root:\n\n" +
+			"    sudo switchboard start        (this session)\n" +
+			"    switchboard daemon install    (every session, started by launchd)\n"
+		if runtime.GOOS == "linux" {
+			advice += "\n  or grant the capability to the binary:\n\n" +
+				"    sudo setcap cap_net_bind_service=+ep $(which switchboard)\n"
+		}
+		return advice + "\n  or serve on high ports instead, in " + configPathOr(cfgPath) + ":\n\n" +
+			"    http_port  = 8080\n    https_port = 8443\n\n" +
+			"  URLs then carry the port (https://app.test:8443)."
+	}
+
+	// DNS and the dashboard are never inherited: the resolver file names a
+	// port, so DNS has no reason to want :53, and the dashboard is loopback
+	// only. For these the port really is the whole answer.
+	remedy, ok := listenerRemedy[what]
+	if !ok {
+		remedy = "    (raise the port for this listener above 1024)"
+	}
+	return "  Use a high port in " + configPathOr(cfgPath) + ":\n\n" + remedy
 }
 
 // configPathOr names the config file for an error message, falling back to

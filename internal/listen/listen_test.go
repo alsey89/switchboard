@@ -1,11 +1,14 @@
 package listen
 
 import (
+	"io"
 	"net"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // handover binds a socket, hands the descriptor over the way a privileged
@@ -170,6 +173,92 @@ func TestKeepOpenSurvivesClose(t *testing.T) {
 	}
 	c.Close() //nolint:errcheck
 	<-done
+}
+
+// TestCrossProcessHandover is the mechanism the privileged parent depends
+// on, exercised for real: a socket bound in this process is served by a
+// *different* process that never called Listen.
+//
+// The in-process tests above can pass even if descriptor inheritance across
+// exec were broken, because nothing crosses a process boundary. This one
+// cannot: the parent closes its own copy before the child ever answers, so
+// if ExtraFiles and the fd numbering did not line up, the dial below fails.
+func TestCrossProcessHandover(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	f, err := ln.(*net.TCPListener).File()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close() //nolint:errcheck
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestHelperServesInheritedSocket") //nolint:gosec
+	cmd.Env = append(os.Environ(), helperEnv+"=1", EnvFDs+"="+HTTPS+":3")
+	cmd.ExtraFiles = []*os.File{f} // becomes fd 3 in the child
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer cmd.Process.Kill() //nolint:errcheck
+
+	// Close our own listener: from here the socket lives only in the child.
+	ln.Close() //nolint:errcheck
+
+	var conn net.Conn
+	for i := 0; i < 100; i++ { // the child has to start a whole test binary
+		conn, err = net.DialTimeout("tcp", addr, time.Second)
+		if err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("nothing is serving %s: the child did not adopt the descriptor: %v", addr, err)
+	}
+	defer conn.Close() //nolint:errcheck
+
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck
+	buf := make([]byte, len(helperReply))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("reading from the inherited socket: %v", err)
+	}
+	if string(buf) != helperReply {
+		t.Errorf("got %q from the child, want %q", buf, helperReply)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Errorf("child exited badly: %v", err)
+	}
+}
+
+const (
+	helperEnv   = "SWITCHBOARD_LISTEN_TEST_HELPER"
+	helperReply = "inherited-ok"
+)
+
+// TestHelperServesInheritedSocket is not a test. It is the child half of
+// TestCrossProcessHandover, run by re-executing this test binary — the
+// standard way to get a second process without shipping a second program.
+func TestHelperServesInheritedSocket(t *testing.T) {
+	if os.Getenv(helperEnv) != "1" {
+		t.Skip("helper process for TestCrossProcessHandover")
+	}
+	set, err := FromEnv()
+	if err != nil {
+		t.Fatalf("child could not adopt the descriptor: %v", err)
+	}
+	ln, err := set.Listen(HTTPS, "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := ln.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Write([]byte(helperReply)) //nolint:errcheck
+	conn.Close()                    //nolint:errcheck
 }
 
 // TestNamesAreTheCompleteParentContract pins the list of sockets a

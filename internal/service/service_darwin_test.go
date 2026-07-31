@@ -14,6 +14,28 @@ import (
 	"howett.net/plist"
 )
 
+// isolateSystemPaths redirects the absolute /Library paths at temp locations.
+//
+// Without this the suite reads the developer's own installation: HOME moves
+// the launch-agent path, but a hardcoded system path does not move at all. It
+// was found the hard way — TestUninstallReportsNothingToRemove, which exists
+// to check the "nothing was installed" message, was issuing `sudo rm` against
+// the real /Library/LaunchDaemons plist on a machine that had one. It failed
+// only because non-interactive sudo refused.
+//
+// Any test that reaches Status, InstalledExec, Install or Uninstall must call
+// this.
+func isolateSystemPaths(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	origPlist, origStaged := SystemPlistPath, StagedExecPath
+	SystemPlistPath = filepath.Join(dir, "LaunchDaemons", Label+".plist")
+	StagedExecPath = filepath.Join(dir, "PrivilegedHelperTools", Label)
+	t.Cleanup(func() {
+		SystemPlistPath, StagedExecPath = origPlist, origStaged
+	})
+}
+
 // parsePlist decodes a rendered plist through the same library InstalledExec
 // uses. Round-tripping through a real plist parser — rather than substring
 // matching the rendered string — is what actually pins well-formedness and
@@ -174,6 +196,7 @@ func TestRenderPlistEscapesPaths(t *testing.T) {
 // it.
 func TestPlistPathStemMatchesLabel(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
+	isolateSystemPaths(t)
 	p, err := PlistPath()
 	if err != nil {
 		t.Fatal(err)
@@ -190,7 +213,8 @@ func TestPlistPathStemMatchesLabel(t *testing.T) {
 // $HOME — never the real ~/Library/LaunchAgents — and asserts InstalledExec
 // recovers the exact, unescaped original.
 func TestInstalledExecRoundTrip(t *testing.T) {
-	t.Setenv("HOME", t.TempDir()) // redirect PlistPath(); never touches the real home dir
+	t.Setenv("HOME", t.TempDir())
+	isolateSystemPaths(t) // redirect PlistPath(); never touches the real home dir
 
 	spec := Spec{
 		Exec:       `/Users/a&b/<weird "path">/bin/switchboard`,
@@ -217,6 +241,7 @@ func TestInstalledExecRoundTrip(t *testing.T) {
 
 func TestInstalledExecNoPlist(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
+	isolateSystemPaths(t)
 	if got := InstalledExec(); got != "" {
 		t.Errorf("InstalledExec() with no plist installed = %q, want empty", got)
 	}
@@ -273,6 +298,7 @@ func TestJobRunningFromPrintOutput(t *testing.T) {
 // filesystem or launchctl interaction — this test relies on that ordering
 // implicitly, since it never provides a real plist path or launchctl.
 func TestInstallRefusesRoot(t *testing.T) {
+	isolateSystemPaths(t) // the guard fires first, but do not rely on ordering for safety
 	orig := geteuid
 	geteuid = func() int { return 0 }
 	defer func() { geteuid = orig }()
@@ -305,7 +331,8 @@ func TestInstallRefusesUnbindablePrivilegedPort(t *testing.T) {
 	}
 	defer func() { bindProbe = orig }()
 
-	t.Setenv("HOME", t.TempDir()) // nothing may be written to the real home
+	t.Setenv("HOME", t.TempDir())
+	isolateSystemPaths(t) // nothing may be written to the real home
 	err := Install(Spec{
 		Exec:       "/bin/x",
 		Args:       []string{"start"},
@@ -432,7 +459,8 @@ func TestBootstrapWithRetryReturnsActionableErrorAfterExhausted(t *testing.T) {
 // TestUninstallReportsNothingToRemove pins the minor fix: uninstalling on a
 // machine where nothing was ever installed must say so, not "removed".
 func TestUninstallReportsNothingToRemove(t *testing.T) {
-	t.Setenv("HOME", t.TempDir()) // no plist exists here
+	t.Setenv("HOME", t.TempDir())
+	isolateSystemPaths(t) // no plist exists here
 
 	var buf strings.Builder
 	removed, err := Uninstall(&buf)
@@ -444,5 +472,137 @@ func TestUninstallReportsNothingToRemove(t *testing.T) {
 	}
 	if strings.Contains(buf.String(), "removed ") {
 		t.Errorf("output should not claim anything was removed, got: %s", buf.String())
+	}
+}
+
+// recordElevated swaps the two privileged entry points for recorders,
+// returning the slice the issued commands land in. Nothing runs.
+func recordElevated(t *testing.T) *[][]string {
+	t.Helper()
+	var got [][]string
+	origE, origQ, origO := elevate, elevateQuiet, elevateOutput
+	elevate = func(_ io.Writer, name string, args ...string) error {
+		got = append(got, append([]string{name}, args...))
+		return nil
+	}
+	elevateQuiet = func(name string, args ...string) error {
+		got = append(got, append([]string{name}, args...))
+		return nil
+	}
+	elevateOutput = func(name string, args ...string) ([]byte, error) {
+		got = append(got, append([]string{name}, args...))
+		return nil, nil
+	}
+	t.Cleanup(func() { elevate, elevateQuiet, elevateOutput = origE, origQ, origO })
+	return &got
+}
+
+// TestSystemDaemonRunsARootOwnedCopy is the regression test for a
+// user-to-root escalation.
+//
+// launchd runs a LaunchDaemon's program as root but validates only the
+// plist's ownership, never the program's. Homebrew's prefix is user-writable
+// by design — /opt/homebrew/bin is drwxrwxr-x owned by the installing user —
+// so a plist pointing at the installed binary would let anything running as
+// that user replace it and own the machine at the next boot, with no password
+// prompt anywhere in the sequence.
+//
+// The plist must therefore name the staged copy, never the original.
+func TestSystemDaemonRunsARootOwnedCopy(t *testing.T) {
+	isolateSystemPaths(t)
+	got := recordElevated(t)
+
+	// The staged path lives under a temp dir here, which can never be
+	// root-owned; verifyRootOnlyWritable has its own test.
+	origVerify := verifyOwnership
+	verifyOwnership = func(string) error { return nil }
+	t.Cleanup(func() { verifyOwnership = origVerify })
+
+	const brewPath = "/opt/homebrew/bin/switchboard"
+	// installSystemDaemon writes a plist through elevate; capture what it says.
+	var written string
+	origE := elevate
+	elevate = func(w io.Writer, name string, args ...string) error {
+		if name == "install" && len(args) > 0 && strings.HasSuffix(args[len(args)-1], ".plist") {
+			if b, err := os.ReadFile(args[len(args)-2]); err == nil {
+				written = string(b)
+			}
+		}
+		return origE(w, name, args...)
+	}
+
+	err := installSystemDaemon(Spec{
+		Exec:       brewPath,
+		Args:       []string{"__supervise", "--uid", "501"},
+		StdoutPath: "/tmp/out.log",
+		StderrPath: "/tmp/err.log",
+		UID:        501,
+	}, SystemPlistPath, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if strings.Contains(written, brewPath) {
+		t.Errorf("the plist names %s, a path the user can overwrite. launchd runs it "+
+			"as root, so that is a password-free path to root.\nplist:\n%s", brewPath, written)
+	}
+	if !strings.Contains(written, StagedExecPath) {
+		t.Errorf("the plist should name the staged copy %s, got:\n%s", StagedExecPath, written)
+	}
+
+	// And the copy has to be made before the plist that references it.
+	stageAt, plistAt := -1, -1
+	for i, cmd := range *got {
+		last := cmd[len(cmd)-1]
+		switch {
+		case cmd[0] == "install" && last == StagedExecPath:
+			stageAt = i
+		case cmd[0] == "install" && last == SystemPlistPath:
+			plistAt = i
+		}
+	}
+	if stageAt < 0 {
+		t.Fatalf("the binary was never staged. Commands: %v", *got)
+	}
+	if plistAt >= 0 && stageAt > plistAt {
+		t.Error("the plist is installed before the binary it names is staged; a failure " +
+			"in between leaves a root job pointing at nothing")
+	}
+	// The copy must be root-owned and not writable by anyone else.
+	for _, cmd := range *got {
+		if cmd[0] == "install" && cmd[len(cmd)-1] == StagedExecPath {
+			joined := strings.Join(cmd, " ")
+			for _, want := range []string{"-o root", "-g wheel", "-m 0755"} {
+				if !strings.Contains(joined, want) {
+					t.Errorf("staging command %q must carry %q", joined, want)
+				}
+			}
+		}
+	}
+}
+
+// TestVerifyRootOnlyWritableRejectsWhatLaunchdWouldAccept: launchd itself
+// performs no such check, so this is the only thing standing between a
+// user-writable directory and a root job started from it.
+func TestVerifyRootOnlyWritableRejectsWhatLaunchdWouldAccept(t *testing.T) {
+	// A path under the test's own temp dir is user-owned by construction.
+	dir := t.TempDir()
+	f := filepath.Join(dir, "switchboard")
+	if err := os.WriteFile(f, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	err := verifyRootOnlyWritable(f)
+	if err == nil {
+		t.Fatal("a user-owned binary was accepted for a root launch daemon")
+	}
+	if !strings.Contains(err.Error(), "root") {
+		t.Errorf("the error should explain the privilege consequence, got: %v", err)
+	}
+
+	// And a genuinely root-only path passes, so the check is not simply
+	// refusing everything.
+	if err := verifyRootOnlyWritable("/usr/bin/true"); err != nil {
+		t.Errorf("/usr/bin/true should pass a root-only check, got: %v", err)
 	}
 }

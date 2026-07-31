@@ -6,26 +6,30 @@ Local domains with real HTTPS for web development:
 https://app.test  →  localhost:3000
 ```
 
-No `/etc/hosts` editing. No root daemon. No self-signed-certificate warnings.
+No `/etc/hosts` editing. No root proxy. No self-signed-certificate warnings.
 You tell the operator which line a name connects to; every call gets patched
 through.
 
 ```console
 $ switchboard setup            # once, ever — two password prompts
-$ $EDITOR ~/.config/switchboard/config.toml   # http_port = 8080, https_port = 8443
 $ switchboard add app 3000
 https://app.test → 127.0.0.1:3000
-$ switchboard daemon install   # runs in the background from now on
-$ open https://app.test:8443   # green padlock
+$ switchboard daemon install   # one more prompt; runs in the background from now on
+$ open https://app.test        # green padlock
 ```
 
-> **Why the port, and why that edit.** `:80` and `:443` are reserved for root
-> on macOS, and Switchboard's daemon deliberately runs as you. On a stock
-> config the daemon cannot bind them, so `switchboard daemon install` refuses
-> outright rather than installing a service that crash-loops. High ports work
-> completely — real subdomains, real certificates, no warnings — at the cost of
-> the port in the URL. Removing that cost is
+> **Where the password prompts go.** `:80` and `:443` are reserved for root on
+> macOS, so something has to be privileged. That something is a ~150-line
+> parent process that binds the two sockets, drops to your user, and starts
+> the daemon with them already open. The proxy, the TLS stack, Caddy and its
+> whole dependency tree, and the certificate authority all run as you — the
+> root part reads no configuration, parses no traffic, and listens on no IPC.
+> The full reasoning, including the three options that lost, is in
 > [ADR 0001](docs/adr/0001-binding-privileged-ports-on-macos.md).
+>
+> Prefer nothing privileged at all? Set `https_port = 8443` and `http_port =
+> 8080` in the config and `daemon install` will set up a plain user agent
+> instead. Everything works identically; URLs carry the port.
 
 ## Install
 
@@ -45,6 +49,22 @@ casks are macOS-only, so there's no tap path here yet.
 > be quarantined and needs `xattr -d com.apple.quarantine ./switchboard`
 > before it runs.
 
+## What it puts on your machine
+
+Yours, no privilege, safe to delete: `~/.config/switchboard/` holds your
+config, the local CA and its key, and the per-host certificates Caddy issues.
+`rm -rf` on that directory is a complete reset.
+
+System-wide, each installed with a `sudo` command printed before it runs:
+`/etc/resolver/<suffix>`, a trusted root in the System keychain, and — only
+if you serve `:443`/`:80` — a LaunchDaemon plus a root-owned copy of the
+binary in `/Library/PrivilegedHelperTools`. `switchboard uninstall` removes
+all of it. Everything binds to `127.0.0.1`; nothing is reachable from the
+network.
+
+The full inventory, the process model, and what each command actually does
+are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 ## Why
 
 - **Real subdomains locally** — cookies, CORS, OAuth redirects, and
@@ -57,7 +77,7 @@ casks are macOS-only, so there's no tap path here yet.
 
 ## How it works
 
-One unprivileged process (a single Go binary):
+One unprivileged process does all the work (a single Go binary):
 
 - A tiny **DNS responder** answers `*.test → 127.0.0.1`. macOS is pointed at
   it via a file in `/etc/resolver/` — with a custom port, so nothing fights
@@ -65,15 +85,20 @@ One unprivileged process (a single Go binary):
 - **Embedded [Caddy](https://caddyserver.com)** terminates TLS on
   `127.0.0.1:443` and reverse-proxies by hostname to your dev servers.
   WebSockets (Vite HMR etc.), HTTP/2, and streaming all just work.
-- Caddy's **internal PKI** mints a local root CA once; `switchboard setup`
-  installs it into the system trust store. Per-host certificates are issued
-  on demand and rotated automatically. Issuance is hard-limited to the
-  managed TLD — the CA will refuse to mint a certificate for `google.com`.
+- A **local root CA**, minted once and installed into the system trust store
+  by `switchboard setup`. It carries X.509 **name constraints** pinning it to
+  your suffix, so even with the private key in hand nobody can use it to
+  forge a certificate for `google.com` — your browser rejects the chain.
+  Caddy's PKI issues the per-host certificates beneath it and rotates them.
 - The **dashboard** lives at `https://switchboard.test`; unrouted `*.test`
   hosts get a friendly page telling you the exact command to route them.
 
-The only privileged actions are the two one-time steps in `setup` (write the
-resolver file, trust the CA), each run as a visible `sudo` command.
+Privilege is confined to three things, each a visible `sudo` command you can
+read before it runs: the two one-time steps in `setup` (write the resolver
+file, trust the CA), and installing the launch daemon. That daemon is a small
+parent that binds `:443` and `:80` and immediately drops to your user — see
+[ADR 0001](docs/adr/0001-binding-privileged-ports-on-macos.md). Everything in
+the list above runs as you.
 
 ## Choosing a domain suffix
 
