@@ -17,6 +17,10 @@ import (
 // Label is the launchd job label and the plist filename stem.
 const Label = "io.github.alsey89.switchboard"
 
+// SystemLogPath is where a ModeDaemon job logs. See DefaultSpec for why it
+// is not under the user's home.
+const SystemLogPath = "/Library/Logs/switchboard.log"
+
 // ErrUnsupported is returned by every entry point on platforms without
 // service automation yet — Windows (v0.4) and Linux (v0.5); see DESIGN.md §6.
 // Exported so callers doing a best-effort teardown (`switchboard uninstall`)
@@ -59,6 +63,36 @@ func (s State) String() string {
 	}
 }
 
+// Mode is which of the two launchd shapes to install.
+//
+// The choice is not a preference, it is forced by the ports. A job that must
+// bind :443 has to start as root — so it is a LaunchDaemon running the
+// privileged parent, which binds and immediately drops to the user. A job
+// whose ports are all above 1024 needs no privilege at all and is a plain
+// user agent.
+//
+// This is why `daemon install` no longer refuses a stock config. The
+// privileged-port check used to be a wall; now it is the thing that picks
+// the mode.
+type Mode int
+
+const (
+	// ModeAgent is a user agent in ~/Library/LaunchAgents. No privilege, at
+	// the cost of ports in URLs.
+	ModeAgent Mode = iota
+	// ModeDaemon is a LaunchDaemon in /Library/LaunchDaemons running
+	// `__supervise`. Installing it needs sudo; the proxy itself still runs
+	// as the user. See docs/adr/0001.
+	ModeDaemon
+)
+
+func (m Mode) String() string {
+	if m == ModeDaemon {
+		return "launch daemon (privileged parent, unprivileged proxy)"
+	}
+	return "launch agent (unprivileged)"
+}
+
 // Spec describes the service to install.
 //
 // Every path in a Spec must be absolute. launchd runs jobs with a working
@@ -82,6 +116,15 @@ type Spec struct {
 	// Ports are the listeners the daemon will need to open. Install probes
 	// the privileged ones before writing a plist — see checkPrivilegedPorts.
 	Ports []GuardedPort
+
+	// Mode is which launchd shape to install; see Mode.
+	Mode Mode
+	// UID, GID and Home are the identity the daemon runs as. Only meaningful
+	// for ModeDaemon, where they are written into the plist rather than
+	// inferred at runtime: launchd sets no SUDO_UID, so a parent that tried
+	// to work it out at startup would have nothing to work from.
+	UID, GID int
+	Home     string
 }
 
 // GuardedPort is one listener Install checks before installing an agent that
@@ -97,6 +140,33 @@ type GuardedPort struct {
 	// Per-port because the advice differs: telling a user whose dns_port
 	// failed to set https_port sends them to an unrelated setting.
 	Remedy string
+}
+
+// installingUser is the identity to bake into a ModeDaemon plist: whoever is
+// running `daemon install`.
+//
+// It refuses to run as root, which also settles where every path in the Spec
+// comes from. `daemon install` is run as the user, not under sudo, so
+// config.Dir(), config.Path() and os.UserHomeDir() all resolve against the
+// real user's home. Only the two steps that genuinely need privilege —
+// writing into /Library/LaunchDaemons and bootstrapping the system domain —
+// elevate, each printed before it runs, the same way `setup` does.
+//
+// Running the whole command under sudo would resolve HOME to /var/root and
+// bake a config path, a log path and a home directory that belong to root
+// into a plist describing a job meant to run as you.
+func installingUser() (uid, gid int, home string, err error) {
+	if os.Geteuid() == 0 {
+		return 0, 0, "", errors.New("run `switchboard daemon install` without sudo — it " +
+			"will ask for your password only for the steps that need it. Run as root, every " +
+			"path it records (config, logs, CA) would be resolved under /var/root instead of " +
+			"your home directory")
+	}
+	home, err = os.UserHomeDir()
+	if err != nil {
+		return 0, 0, "", err
+	}
+	return os.Getuid(), os.Getgid(), home, nil
 }
 
 // LogPath returns the daemon log file, under the config dir so that
@@ -145,20 +215,55 @@ func DefaultSpec(cfg *config.Config, configPath string) (Spec, error) {
 		return Spec{}, err
 	}
 
-	args := []string{"start"}
+	if cfg == nil {
+		cfg = config.Default()
+	}
+
+	// The mode follows from the ports. Anything below 1024 needs the
+	// privileged parent; otherwise a plain user agent will do.
+	mode := ModeAgent
+	if cfg.EffHTTPSPort() < 1024 || cfg.EffHTTPPort() < 1024 {
+		mode = ModeDaemon
+		// A launch daemon is started by launchd as root, so it would create
+		// the log file as root. Under the user's home that leaves a
+		// root-owned file inside a directory the user is told they can delete
+		// to reset everything — `rm -rf ~/.config/switchboard` would fail
+		// halfway. /Library/Logs is the system-wide place for exactly this,
+		// and stays readable in Console.app.
+		logPath = SystemLogPath
+	}
+
+	var args []string
+	uid, gid, home := os.Getuid(), os.Getgid(), ""
+	if mode == ModeDaemon {
+		// Resolve the identity now, as the invoking user, and bake it in.
+		// Under sudo, os.Getuid() is root, so the real user comes from
+		// SUDO_UID; `daemon install` for this mode is run with sudo.
+		uid, gid, home, err = installingUser()
+		if err != nil {
+			return Spec{}, err
+		}
+		args = []string{"__supervise",
+			"--uid", strconv.Itoa(uid),
+			"--gid", strconv.Itoa(gid),
+			"--home", home}
+	} else {
+		args = []string{"start"}
+	}
 	if configPath != "" {
 		args = append(args, "--config", resolved)
 	}
 
-	if cfg == nil {
-		cfg = config.Default()
-	}
 	return Spec{
 		Exec:       exe,
 		Args:       args,
 		StdoutPath: logPath,
 		StderrPath: logPath,
 		ConfigPath: resolved,
+		Mode:       mode,
+		UID:        uid,
+		GID:        gid,
+		Home:       home,
 		// Every configurable listener is guarded, not just the two that are
 		// below 1024 by default. dns_port and dashboard_port default high
 		// (53535, 8484) but are user-settable, and `dns_port = 53` installs

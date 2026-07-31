@@ -27,15 +27,49 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy"
 
 	"github.com/alsey89/switchboard/internal/config"
+	"github.com/alsey89/switchboard/internal/listen"
 )
+
+// mustPort extracts the port from a host:port we built ourselves.
+func mustPort(addr string) int {
+	_, p, err := net.SplitHostPort(addr)
+	if err != nil {
+		return 0
+	}
+	n, _ := strconv.Atoi(p)
+	return n
+}
 
 const caName = "Switchboard Local CA"
 
+// Addrs reports the addresses the proxy will actually serve on. When the
+// daemon was started by a privileged parent the inherited socket wins over
+// the configured port: the daemon did not choose that port, it was handed a
+// descriptor already bound to it. Callers use this rather than the config so
+// that what they log and link to is what is really true.
+func Addrs(cfg *config.Config, set *listen.Set) (httpsAddr, httpAddr string) {
+	httpsAddr = net.JoinHostPort("127.0.0.1", strconv.Itoa(cfg.EffHTTPSPort()))
+	httpAddr = net.JoinHostPort("127.0.0.1", strconv.Itoa(cfg.EffHTTPPort()))
+	if a := set.Addr(listen.HTTPS); a != "" {
+		httpsAddr = a
+	}
+	if a := set.Addr(listen.HTTP); a != "" {
+		httpAddr = a
+	}
+	return httpsAddr, httpAddr
+}
+
 // Generate builds the full Caddy config for the given Switchboard config.
 // dataDir is where Caddy keeps state (PKI, certs); it must be writable.
-func Generate(cfg *config.Config, dataDir string) (*caddy.Config, error) {
-	httpsPort := cfg.EffHTTPSPort()
-	httpPort := cfg.EffHTTPPort()
+// set carries any listening sockets inherited from a privileged parent.
+func Generate(cfg *config.Config, dataDir string, set *listen.Set) (*caddy.Config, error) {
+	httpsAddr, httpAddr := Addrs(cfg, set)
+	httpsPort := mustPort(httpsAddr)
+	httpPort := mustPort(httpAddr)
+	listenAddrs := registerInherited(set, map[string]string{
+		listen.HTTPS: httpsAddr,
+		listen.HTTP:  httpAddr,
+	})
 	dashAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(cfg.EffDashboardPort()))
 	domains := cfg.Domains()
 
@@ -54,11 +88,17 @@ func Generate(cfg *config.Config, dataDir string) (*caddy.Config, error) {
 	})
 
 	httpsServer := &caddyhttp.Server{
-		Listen:          []string{"127.0.0.1:" + strconv.Itoa(httpsPort)},
+		Listen:          []string{listenAddrs[listen.HTTPS]},
 		Routes:          routes,
 		TLSConnPolicies: caddytls.ConnectionPolicies{&caddytls.ConnectionPolicy{}},
 		// We manage cert automation and redirects explicitly.
 		AutoHTTPS: &caddyhttp.AutoHTTPSConfig{Disabled: true},
+		// h1 and h2 only. HTTP/3 would make Caddy bind a UDP socket on the
+		// same port, which for :443 is a second privileged bind that the
+		// privileged parent would have to hold and hand over. Local browsers
+		// negotiate h2 over TLS anyway, so the whole of what h3 buys here is
+		// an extra descriptor in the root-owned path.
+		Protocols: []string{"h1", "h2"},
 	}
 
 	// --- HTTP server: permanent redirect to HTTPS.
@@ -68,7 +108,7 @@ func Generate(cfg *config.Config, dataDir string) (*caddy.Config, error) {
 	}
 	location += "{http.request.uri}"
 	httpServer := &caddyhttp.Server{
-		Listen:    []string{"127.0.0.1:" + strconv.Itoa(httpPort)},
+		Listen:    []string{listenAddrs[listen.HTTP]},
 		AutoHTTPS: &caddyhttp.AutoHTTPSConfig{Disabled: true},
 		Protocols: []string{"h1"}, // plain-HTTP redirector; silences h2/h3-need-TLS warnings
 		Routes: caddyhttp.RouteList{{
@@ -167,8 +207,8 @@ func reverseProxyTo(dial string) json.RawMessage {
 
 // Load generates and (re)loads the Caddy config in-process. Safe to call
 // again for hot reloads; Caddy swaps configs gracefully.
-func Load(cfg *config.Config, dataDir string) error {
-	cc, err := Generate(cfg, dataDir)
+func Load(cfg *config.Config, dataDir string, set *listen.Set) error {
+	cc, err := Generate(cfg, dataDir, set)
 	if err != nil {
 		return err
 	}
