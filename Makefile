@@ -1,7 +1,7 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -X github.com/alsey89/switchboard/internal/cli.Version=$(VERSION)
 
-.PHONY: build test vet fmt clean
+.PHONY: build test vet fmt clean notices
 
 build:
 	go build -trimpath -ldflags "$(LDFLAGS)" -o switchboard ./cmd/switchboard
@@ -17,3 +17,6 @@ fmt:
 
 clean:
 	rm -f switchboard
+
+notices:
+	./scripts/gen-notices.sh THIRD_PARTY_NOTICES
