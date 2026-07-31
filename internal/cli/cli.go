@@ -104,7 +104,7 @@ func cmdSetup(flagConfig *string) *cobra.Command {
 				fmt.Fprintln(out, "  •", n)
 			}
 			fmt.Fprintf(out, "\nnext:\n  switchboard add app %s\n  switchboard start\n  open https://app.%s\n",
-				"3000", cfg.TLD)
+				"3000", cfg.Suffix)
 			return nil
 		},
 	}
@@ -164,7 +164,7 @@ func cmdAdd(flagConfig *string) *cobra.Command {
 				return fmt.Errorf("missing port: switchboard add %s <port>", args[0])
 			}
 
-			domain, err := config.NormalizeDomain(args[0], cfg.TLD)
+			domain, err := config.NormalizeDomain(args[0], cfg.Suffix)
 			if err != nil {
 				return err
 			}
@@ -208,7 +208,7 @@ func cmdRemove(flagConfig *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			domain, err := config.NormalizeDomain(args[0], cfg.TLD)
+			domain, err := config.NormalizeDomain(args[0], cfg.Suffix)
 			if err != nil {
 				return err
 			}
@@ -301,6 +301,8 @@ func cmdDoctor(flagConfig *string) *cobra.Command {
 					failed = true
 				}
 			}
+			fmt.Fprintf(out, "\ndashboard (no DNS or TLS needed): http://127.0.0.1:%d\n",
+				cfg.EffDashboardPort())
 			fmt.Fprintln(out, "\nnote: dig/nslookup bypass the OS resolver — verify with a browser or curl instead")
 			if failed {
 				return fmt.Errorf("doctor found problems")

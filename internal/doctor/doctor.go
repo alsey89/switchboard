@@ -57,7 +57,7 @@ func Run(cfg *config.Config, cfgPath, dataDir string, cfgErr error) []Check {
 		cfg = config.Default()
 	} else {
 		checks = append(checks, Check{"config", OK,
-			fmt.Sprintf("%s (%d routes, tld .%s)", cfgPath, len(cfg.Routes), cfg.TLD), ""})
+			fmt.Sprintf("%s (%d routes, suffix .%s)", cfgPath, len(cfg.Routes), cfg.Suffix), ""})
 	}
 
 	// CA existence.

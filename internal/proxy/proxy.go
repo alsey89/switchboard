@@ -95,7 +95,7 @@ func Generate(cfg *config.Config, dataDir string) (*caddy.Config, error) {
 	// --- TLS app: internal issuer for everything.
 	//  policy 1: eager certs for configured domains (+ dashboard)
 	//  policy 2: catch-all on-demand issuance for anything else under the
-	//            managed TLDs, gated by our permission module
+	//            managed suffixes, gated by our permission module
 	internal := caddyconfig.JSONModuleObject(caddytls.InternalIssuer{}, "module", "internal", nil)
 	tlsApp := caddytls.TLS{
 		CertificatesRaw: caddy.ModuleMap{
@@ -108,7 +108,7 @@ func Generate(cfg *config.Config, dataDir string) (*caddy.Config, error) {
 			},
 			OnDemand: &caddytls.OnDemandConfig{
 				PermissionRaw: caddyconfig.JSONModuleObject(
-					OnDemandPermission{TLDs: []string{cfg.TLD}},
+					OnDemandPermission{Suffixes: []string{cfg.Suffix}},
 					"module", "switchboard", nil),
 			},
 		},

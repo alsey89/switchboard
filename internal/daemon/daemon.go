@@ -45,13 +45,13 @@ func Run(ctx context.Context, opts Options) error {
 	}
 
 	// DNS.
-	dns := dnsd.New([]string{cfg.TLD})
+	dns := dnsd.New([]string{cfg.Suffix})
 	dnsBind := net.JoinHostPort("127.0.0.1", strconv.Itoa(cfg.EffDNSPort()))
 	if err := dns.Start(dnsBind); err != nil {
 		return friendlyBindError(err, "DNS", dnsBind)
 	}
 	defer dns.Shutdown(context.Background()) //nolint:errcheck
-	log.Info("dns responder up", "addr", dnsBind, "tld", "."+cfg.TLD)
+	log.Info("dns responder up", "addr", dnsBind, "suffix", "."+cfg.Suffix)
 
 	// Dashboard.
 	dash := dashboard.New(cfg, opts.Version)
@@ -69,7 +69,8 @@ func Run(ctx context.Context, opts Options) error {
 	log.Info("proxy up",
 		"https", "127.0.0.1:"+strconv.Itoa(cfg.EffHTTPSPort()),
 		"routes", len(cfg.Routes),
-		"dashboard", "https://"+cfg.DashboardDomain())
+		"dashboard", "https://"+cfg.DashboardDomain(),
+		"dashboard_direct", "http://"+dashBind)
 
 	// Watch the config file for changes. Watch the directory, not the file:
 	// editors and our own atomic Save replace the file by rename.
@@ -117,11 +118,11 @@ func Run(ctx context.Context, opts Options) error {
 				log.Error("config reload failed; keeping previous config", "err", err)
 				continue
 			}
-			if next.TLD != cfg.TLD {
-				// The DNS zone and resolver file are tied to the TLD; a live
+			if next.Suffix != cfg.Suffix {
+				// The DNS zone and resolver file are tied to the suffix; a live
 				// switch would silently break resolution. Require a restart.
-				log.Error("tld changed; restart the daemon (and re-run setup) to apply",
-					"old", cfg.TLD, "new", next.TLD)
+				log.Error("suffix changed; restart the daemon (and re-run setup) to apply",
+					"old", cfg.Suffix, "new", next.Suffix)
 				continue
 			}
 			if err := proxy.Load(next, opts.DataDir); err != nil {

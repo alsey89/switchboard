@@ -63,7 +63,8 @@ The product is the UX and integration, not the proxy.
 | 6 | Inspector (v0.2) | **Custom Caddy handler module**, compiled into our binary | Caddy modules are plain Go registered at build time; ~300 lines to tee traffic into SQLite |
 | 7 | GUI | **Web dashboard served by the daemon first** (at `https://switchboard.test`); native shell (Wails) revisited at v0.3 | Zero framework cost to start; core is Go so Tauri would need a sidecar — Wails is the native-fit option if/when we want a tray app |
 | 8 | Business model | **Open-core; tunnel relay is the only paid surface** | See §1 |
-| 9 | License | **Apache-2.0** | Match embedded Caddy; zero license-compatibility thought required, patent grant included |
+| 9 | License | **Apache-2.0** | Matches Caddy (no compatibility analysis needed) and carries an explicit patent grant, which matters more for infrastructure than for a library |
+| 10 | Domain suffix policy | **Reserved single-label TLDs (`test`, `internal`, `localhost`) or any multi-label domain the user owns** | A bare non-reserved TLD is or could become real; hijacking it in the OS resolver breaks real sites machine-wide. Multi-label means the user owns it, so collision is impossible |
 
 ### Why Go + Caddy (and the road not taken)
 
@@ -156,7 +157,7 @@ regenerates + reloads Caddy config in-process.
 
 ```toml
 # ~/.config/switchboard/config.toml
-tld = "test"
+suffix = "test"
 
 [[routes]]
 domain = "app.test"
@@ -210,8 +211,9 @@ switchboard doctor             # port conflicts, resolver state, CA trust state
 - Port 443/80 conflict (Docker, another Caddy/nginx) → detect
   `EADDRINUSE`, name the offending PID in `doctor`; escape hatch:
   alternate ports in config (URLs grow `:port`, acceptable).
-- Vite/Next HMR (websocket upgrade) must be covered by an integration
-  test even though Caddy handles it — it's the #1 breakage users notice.
+- Vite/Next HMR (websocket upgrade) is covered by an integration test
+  (`internal/proxy/websocket_test.go`) that drives a real upgrade through
+  embedded Caddy — it's the #1 breakage users notice.
 
 ### DNS gotchas (learned from prior art; ours in every architecture)
 

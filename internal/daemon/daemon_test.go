@@ -47,7 +47,7 @@ func startEnv(t *testing.T, routes []config.Route) *testEnv {
 	dataDir := filepath.Join(dir, "data")
 
 	cfg := &config.Config{
-		TLD:           "test",
+		Suffix:        "test",
 		HTTPPort:      tHTTPPort,
 		HTTPSPort:     tHTTPSPort,
 		DNSPort:       tDNSPort,

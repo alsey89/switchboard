@@ -97,3 +97,18 @@ func TestTCPWorksToo(t *testing.T) {
 		t.Fatalf("tcp query failed: %+v", resp)
 	}
 }
+
+func TestMultiLabelSuffix(t *testing.T) {
+	s := New([]string{"dev.example.com"})
+	for _, name := range []string{"app.dev.example.com.", "api.app.dev.example.com.", "dev.example.com."} {
+		if _, ok := s.managedSuffix(name); !ok {
+			t.Errorf("%s should be managed", name)
+		}
+	}
+	// The parent domain and unrelated names must not be captured.
+	for _, name := range []string{"example.com.", "www.example.com.", "notdev.example.com."} {
+		if _, ok := s.managedSuffix(name); ok {
+			t.Errorf("%s should NOT be managed", name)
+		}
+	}
+}
