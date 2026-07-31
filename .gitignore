@@ -1,0 +1,9 @@
+# binaries
+/switchboard
+/dist/
+
+# editor/OS noise
+.DS_Store
+*.swp
+.idea/
+.vscode/

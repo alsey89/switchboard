@@ -1,7 +1,7 @@
 # Switchboard — Design Document
 
-> Status: brainstorm capture, pre-code. Revision 2 — supersedes the pure-Rust
-> plan (preserved in git history at fe3533d if ever needed).
+> Status: revision 3 — v0.1 (§3, §6) is implemented in this repo. Supersedes
+> the pure-Rust plan (preserved in git history at fe3533d if ever needed).
 
 **Switchboard** is an open-source tool for local web development with real
 domains: `app.test` → `localhost:3000`, with automatic locally-trusted HTTPS,
@@ -63,6 +63,7 @@ The product is the UX and integration, not the proxy.
 | 6 | Inspector (v0.2) | **Custom Caddy handler module**, compiled into our binary | Caddy modules are plain Go registered at build time; ~300 lines to tee traffic into SQLite |
 | 7 | GUI | **Web dashboard served by the daemon first** (at `https://switchboard.test`); native shell (Wails) revisited at v0.3 | Zero framework cost to start; core is Go so Tauri would need a sidecar — Wails is the native-fit option if/when we want a tray app |
 | 8 | Business model | **Open-core; tunnel relay is the only paid surface** | See §1 |
+| 9 | License | **Apache-2.0** | Match embedded Caddy; zero license-compatibility thought required, patent grant included |
 
 ### Why Go + Caddy (and the road not taken)
 
@@ -282,14 +283,13 @@ moat) before anyone loves the local loop.
 
 ## 7. Open questions
 
-- **License**: MIT or Apache-2.0? (Caddy is Apache-2.0 either way; embedding
-  is fine with attribution.)
 - **Config location**: `~/.config/switchboard/` everywhere vs platform dirs.
   Leaning `~/.config` — dev-tool convention.
 - **Multiple TLDs** at once (`.test` + `.localhost`)? Cheap to support.
-- **Binary size**: embedding Caddy means a ~40MB binary. Fine for a dev
-  tool; worth trimming unused Caddy modules (import only what we use
-  instead of `modules/standard`) if it bothers us.
+- **Binary size**: embedding Caddy means a ~64MB binary (measured, already
+  importing only the Caddy modules we use rather than `modules/standard` —
+  the weight is Caddy's core dependency tree: quic-go, smallstep, etc.).
+  Fine for a dev tool; revisit only if it starts to hurt.
 - **Name-constraints upstream**: propose to Caddy's PKI? (See §4.)
 - Upstream health indication in `ls` (connect-probe the port?) — nice
   `doctor` candidate.

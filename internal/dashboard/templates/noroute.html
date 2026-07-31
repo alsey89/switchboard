@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>No route — Switchboard</title>
+<style>
+  :root { color-scheme: light dark;
+    --fg: #1a1a1a; --bg: #ffffff; --muted: #6b7280; --line: #e5e7eb; --accent: #4f46e5; }
+  @media (prefers-color-scheme: dark) { :root {
+    --fg: #e5e7eb; --bg: #111318; --muted: #9ca3af; --line: #2a2e37; } }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.6 ui-sans-serif, system-ui, -apple-system, sans-serif;
+    display: grid; min-height: 100vh; place-items: center; }
+  main { max-width: 560px; padding: 2rem 1.25rem; text-align: center; }
+  h1 { font-size: 1.2rem; margin-bottom: .5rem; }
+  p { color: var(--muted); }
+  code { background: color-mix(in srgb, var(--line) 50%, transparent);
+    padding: .15rem .45rem; border-radius: 4px; font-size: .9em; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>No route for <code>{{.Host}}</code></h1>
+  <p>Switchboard resolved this domain, but nothing is connected to it yet.</p>
+  <p>Patch it through to a local port:</p>
+  <p><code>switchboard add {{.Host}} 3000</code></p>
+  <p><a href="https://{{.Dashboard}}">open the dashboard →</a></p>
+</main>
+</body>
+</html>
