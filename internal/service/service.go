@@ -1,7 +1,12 @@
 // Package service installs Switchboard as a background service so the daemon
-// survives closing your terminal. On macOS that is a launchd *user agent* in
-// ~/Library/LaunchAgents: it runs as you, needs no privilege, and preserves
-// the project's "no root daemon" property (see DESIGN.md §5).
+// survives closing your terminal. On macOS that is one of two launchd shapes,
+// chosen by the configured ports (see Mode):
+//
+//   - a *user agent* in ~/Library/LaunchAgents, which runs as you and needs
+//     no privilege, for configurations on high ports; or
+//   - a *launch daemon* in /Library/LaunchDaemons, for :443 and :80. launchd
+//     starts it as root, it binds the two sockets, drops to you, and execs
+//     the daemon — so the proxy still never runs as root. See ADR 0001.
 package service
 
 import (

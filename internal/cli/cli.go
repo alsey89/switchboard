@@ -55,7 +55,7 @@ func Root() *cobra.Command {
 	root := &cobra.Command{
 		Use:           "switchboard",
 		Short:         "Local domains with real HTTPS: app.test → localhost:3000",
-		Long:          "Switchboard routes *.test domains to local ports with locally-trusted HTTPS.\nNo /etc/hosts editing, no root daemon.",
+		Long:          "Switchboard routes *.test domains to local ports with locally-trusted HTTPS.\nNo /etc/hosts editing; the proxy never runs as root.",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
@@ -431,7 +431,7 @@ func cmdUninstall(flagConfig *string) *cobra.Command {
 			}
 			out := cmd.OutOrStdout()
 
-			// Remove the launch agent first, and before anything else can
+			// Remove the launchd job first, and before anything else can
 			// fail. Leaving it behind made this command's own closing advice
 			// wrong: the plist lives in ~/Library/LaunchAgents, so it
 			// survived both `switchboard uninstall` and the `rm -rf` this
@@ -486,7 +486,7 @@ func daemonRunning(cfg *config.Config) bool {
 func cmdDaemon(flagConfig *string) *cobra.Command {
 	c := &cobra.Command{
 		Use:   "daemon",
-		Short: "Run Switchboard in the background (launchd agent)",
+		Short: "Run Switchboard in the background (launchd)",
 		Long: "Install Switchboard as a background service so it survives closing your\n" +
 			"terminal. It runs as you — no root, no system daemon.",
 	}

@@ -4,6 +4,9 @@
 - **Date:** 2026-07-30
 - **Supersedes:** the "lucky break #1" premise in `DESIGN.md` §5
 - **Affects:** `internal/daemon`, `internal/setup`, `internal/service`, `internal/proxy`, the install story, and the project's core positioning
+- **Implemented:** commit `87c2ddc`. All three open questions below are
+  resolved; each records what was decided and where it now lives in code.
+  The seam the daemon sees is [ADR 0002](0002-the-listener-seam.md).
 - **Revised before merge:** the chosen option changed from a privileged *peer*
   passing descriptors over a Unix socket to a privileged *parent* passing them
   by inheritance. Both forms are documented; the reasoning for the change is in
@@ -399,11 +402,12 @@ unchanged. This matters because it is precisely the property Option 1 lacks.
 
 ---
 
-## Open questions (must be settled before implementation)
+## Open questions — all resolved during implementation
 
 The parent/child form dissolved the original open question — "who may receive
-the descriptors" — by removing the socket entirely. Three smaller ones remain,
-and the first is the one that actually matters.
+the descriptors" — by removing the socket entirely. Three smaller ones
+remained, and the first is the one that actually mattered. Each is answered
+below, with what shipped.
 
 ### 1. Which ports may the privileged parent bind?
 
@@ -420,6 +424,17 @@ in a root-owned file written at install time. It reads the user's config never.
 This applies identically to the `SCM_RIGHTS` variant; the earlier draft asked
 who may *receive* a descriptor and failed to ask what they may receive.
 
+**Shipped:** hardcoded, in `privileged.Ports()`. The allowlist-file variant
+was dropped as unnecessary complexity — nothing has ever wanted a third
+privileged port, and a file expressing which ports root may bind is one more
+thing whose ownership and permissions have to be right. `TestPortsAreFixed`
+asserts the set is exactly `{https: 443, http: 80}`, so widening it is a
+deliberate act with a test to change rather than a one-line edit.
+
+The daemon side follows from this: `https_port` and `http_port` in the config
+are inert when the sockets were inherited, and the daemon logs a warning
+naming each one rather than letting a setting appear to work.
+
 ### 2. Where does the target uid come from?
 
 Under `sudo switchboard run`, `SUDO_UID` and `SUDO_USER` are present but must be
@@ -431,6 +446,16 @@ Resolution: both modes take the target uid and home directory as explicit
 arguments, and `daemon install` writes them into the root-owned plist. Nothing
 is inferred from the ambient environment at runtime.
 
+**Shipped:** `privileged.FromSudo` (for `sudo switchboard start`) and
+`privileged.FromFlags` (for the plist) are separate functions on purpose — a
+single one that tried to guess in both cases would silently pick root's home
+in the launchd case, and that failure surfaces much later as a CA under
+`/var/root` that `setup` cannot find. Both refuse uid or gid 0.
+
+`daemon install` itself is run *without* sudo, so every path it records
+resolves against the real user's home; only writing the plist and
+bootstrapping it elevate, each printed before it runs.
+
 ### 3. Supervision and lifecycle
 
 The parent must supervise the child with backoff rather than relying on
@@ -439,6 +464,22 @@ child exits zero (a deliberate `switchboard stop`) → parent exits zero →
 `KeepAlive{SuccessfulExit: false}` leaves it down. Child dies unexpectedly →
 parent respawns with the same descriptors. `uninstall` must remove the plist and
 stop the tree.
+
+**Shipped:** exactly that, in `privileged.supervise` — 1s doubling to 30s,
+reset once the child has been up a minute, so a genuine restart much later is
+not punished for a crash loop hours earlier. The child runs in its own
+process group, so stopping it stops anything it spawned instead of leaving
+orphans on the data directory. `uninstall` now clears *both* launchd shapes
+regardless of what the current config implies, because someone who switched
+from high ports to `:443` has a stale user agent that would otherwise fight
+the launch daemon for the DNS and dashboard ports.
+
+One consequence found during implementation and worth naming here, since it
+is the failure that would have been worst and quietest: Caddy closes its
+listeners on every config reload. An inherited descriptor closed once can
+never be rebound by an unprivileged process, so the first config edit would
+have taken `:443` down permanently. Inherited listeners are wrapped so
+`Close` is a no-op — see ADR 0002.
 
 ---
 

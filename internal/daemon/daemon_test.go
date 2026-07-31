@@ -7,16 +7,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/alsey89/switchboard/internal/config"
+	"github.com/alsey89/switchboard/internal/listen"
 	"github.com/alsey89/switchboard/internal/proxy"
 )
 
@@ -322,6 +325,40 @@ func TestFriendlyBindErrorAdvisesTheRightSetting(t *testing.T) {
 	}
 }
 
+// TestProxyAdviceOffersThePrivilegedParentFirst is the regression test for
+// advice that went stale the moment the feature it should recommend shipped.
+//
+// Before the privileged parent, "use high ports" was the only working answer
+// for :443 and the message said so. Afterwards it was still the only thing
+// the message said — so the first person to run `switchboard start` on a
+// stock config was told to reconfigure the tool rather than to run the one
+// command that does what they asked for. Answering "how do I serve :443?"
+// with "don't" is worse than a wrong answer; it hides a working one.
+func TestProxyAdviceOffersThePrivilegedParentFirst(t *testing.T) {
+	denied := &net.OpError{Op: "listen", Net: "tcp", Err: os.ErrPermission}
+	msg := friendlyBindError(denied, "proxy", "127.0.0.1:443", "/tmp/config.toml").Error()
+
+	for _, want := range []string{"sudo switchboard start", "switchboard daemon install"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("proxy advice must offer %q, got:\n%s", want, msg)
+		}
+	}
+	// High ports stay on offer — they are a supported configuration, not a
+	// workaround — but must not be the only thing suggested.
+	if !strings.Contains(msg, "https_port = 8443") {
+		t.Errorf("proxy advice should still mention high ports as an alternative, got:\n%s", msg)
+	}
+	if strings.Index(msg, "sudo switchboard start") > strings.Index(msg, "https_port") {
+		t.Error("high ports are listed before the privileged parent; the parent is " +
+			"what actually does what the user asked for")
+	}
+	// The parent is only worth recommending if the sentence that recommends
+	// it is true about privilege.
+	if !strings.Contains(msg, "does not run as root") {
+		t.Errorf("advice to run something under sudo must say what stays unprivileged, got:\n%s", msg)
+	}
+}
+
 // TestFriendlyBindErrorPassesThroughUnknownCauses: only the two causes with
 // real advice get decorated. Anything else must reach the user unchanged
 // rather than wearing a misleading privileged-port explanation.
@@ -332,5 +369,82 @@ func TestFriendlyBindErrorPassesThroughUnknownCauses(t *testing.T) {
 	}
 	if got := friendlyBindError(nil, "proxy", "127.0.0.1:8443", ""); got != nil {
 		t.Errorf("nil error should stay nil, got: %v", got)
+	}
+}
+
+// TestSupervisedRunRefusesAMissingConfig covers a failure that only happens
+// at boot on someone else's machine, which is the worst kind to leave
+// untested.
+//
+// A launch daemon starts before anyone logs in, and on a FileVault Mac the
+// user's home directory does not exist at that moment. config.Load treats a
+// missing file as "use the defaults", so the daemon would come up healthy,
+// serve zero routes, and watch a directory that is not there — and it would
+// never recover once the user logged in and their config appeared.
+//
+// Under a privileged parent this must be a non-zero exit instead, so the
+// parent's existing backoff retries until the home directory shows up.
+func TestSupervisedRunRefusesAMissingConfig(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := ln.(*net.TCPListener).File()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close() //nolint:errcheck
+	ln.Close()      //nolint:errcheck
+
+	t.Setenv(listen.EnvFDs, listen.HTTPS+":"+strconv.Itoa(int(f.Fd())))
+
+	missing := filepath.Join(t.TempDir(), "not-yet", "config.toml")
+	err = Run(context.Background(), Options{
+		ConfigPath: missing,
+		DataDir:    t.TempDir(),
+		Log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err == nil {
+		t.Fatal("a supervised daemon with no config file must exit non-zero; " +
+			"coming up with zero routes would look healthy and never recover")
+	}
+	if !strings.Contains(err.Error(), "not readable yet") {
+		t.Errorf("error should explain the boot-order cause, got: %v", err)
+	}
+}
+
+// TestUnsupervisedRunStillDefaults: the same missing file is fine when
+// nobody handed us sockets. `switchboard start` before `switchboard add` has
+// always worked and must keep working.
+func TestUnsupervisedRunStillDefaults(t *testing.T) {
+	t.Setenv(listen.EnvFDs, "")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "config.toml")
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- Run(ctx, Options{
+			ConfigPath: missing,
+			DataDir:    t.TempDir(),
+			Log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		})
+	}()
+
+	// Give it long enough to get past config loading and fail on something
+	// else if it were going to; the ports will collide on a busy machine, so
+	// only the "not readable yet" refusal is treated as a failure here.
+	time.Sleep(500 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err != nil && strings.Contains(err.Error(), "not readable yet") {
+			t.Fatal("an unsupervised daemon must still fall back to defaults " +
+				"when no config file exists")
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("Run did not return after cancel")
 	}
 }

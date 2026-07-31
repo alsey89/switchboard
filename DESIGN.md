@@ -1,11 +1,13 @@
 # Switchboard — Design Document
 
-> Status: revision 3 — v0.1 (§3, §6) is implemented in this repo. Supersedes
-> the pure-Rust plan (preserved in git history at fe3533d if ever needed).
+> Status: revision 4 — v0.1 and v0.2 (§3, §6) are implemented in this repo,
+> including the privileged-port resolution (ADR 0001/0002) and the
+> name-constrained local CA (ADR 0003). Supersedes the pure-Rust plan
+> (preserved in git history at fe3533d if ever needed).
 
 **Switchboard** is an open-source tool for local web development with real
 domains: `app.test` → `localhost:3000`, with automatic locally-trusted HTTPS,
-no `/etc/hosts` editing, no root daemon. Later: traffic inspection and public
+no `/etc/hosts` editing, no root proxy. Later: traffic inspection and public
 tunnels.
 
 The telephone-operator metaphor is the mental model: you tell the operator
@@ -66,6 +68,9 @@ The product is the UX and integration, not the proxy.
 | 9 | License | **Apache-2.0** | Matches Caddy (no compatibility analysis needed) and carries an explicit patent grant, which matters more for infrastructure than for a library |
 | 10 | Domain suffix policy | **Reserved single-label TLDs (`test`, `internal`, `localhost`) or any multi-label domain the user owns** | A bare non-reserved TLD is or could become real; hijacking it in the OS resolver breaks real sites machine-wide. A multi-label suffix is the user *asserting* they own it — the rule shifts the collision risk onto them, it does not remove it. `co.uk`, `com.au` and `github.io` all pass validation, and `/etc/resolver/co.uk` would hijack that namespace machine-wide. Telling those apart needs a public-suffix list; that means a new dependency, which the no-new-modules constraint rules out, so the policy stands as-is with the risk named honestly |
 | 11 | Distribution | **GoReleaser → GitHub releases + a Homebrew cask** (`alsey89/homebrew-tap`) | `brew install` is table stakes for a dev CLI; a cask is the right shape for a prebuilt binary (a formula would imply building from source). Notarization is deferred: it needs a paid Apple Developer account. Note casks **do** quarantine their payload, unlike formulae — hence the `xattr -dr com.apple.quarantine` post-install hook in `.goreleaser.yaml`. Without it Gatekeeper blocks the binary outright, so this is not a browser-download-only concern |
+| 12 | Privileged ports | **A privileged parent binds :443/:80, drops privileges, and execs the daemon with the sockets inherited** | macOS reserves <1024 for root and there is no exemption. Of the four options weighed in [ADR 0001](docs/adr/0001-binding-privileged-ports-on-macos.md), this is the only one that keeps the whole TLS/proxy/CA surface unprivileged while giving portless URLs. The root component is a socket binder — it reads no config, parses no traffic, exposes no IPC — and the ports it may bind are hardcoded, because a config-driven parent would be a "root will bind whatever port you name" primitive |
+| 13 | Listener origin | **The daemon asks a `listen.Set` for a socket by name and does not know whether it was inherited or bound** | The seam, not the mechanism, is what has to survive the roadmap. Windows has no privileged-port range at all, so its Set is simply always empty and no platform branch appears in startup; Linux gets to pick between the same parent, `setcap`, and socket activation without touching the daemon. See [ADR 0002](docs/adr/0002-the-listener-seam.md) |
+| 14 | Local CA | **Switchboard mints a name-constrained root and supplies it to Caddy's PKI** | A root in the system trust store with no constraints is a sign-anything capability on the user's disk; a leaked key forges certificates for any site the browser will believe. Caddy cannot express name constraints but accepts a supplied root, so we pin `PermittedDNSDomains` to the suffix and exclude all IP ranges (constraints are per-type). It is also the one artifact that cannot be fixed after release — fixing it means removing the old root from every user's keychain. See [ADR 0003](docs/adr/0003-name-constrained-local-ca.md) |
 
 ### Why Go + Caddy (and the road not taken)
 
@@ -91,10 +96,23 @@ considered and fully designed — see fe3533d. What decided it:
 
 ## 3. Architecture (v0.1, macOS)
 
-One unprivileged user-space Go binary. No root daemon — DNS needs no
-privilege thanks to `/etc/resolver`'s `port` directive (§5). The `:80`/`:443`
-listeners in the diagram below are the unresolved part of that goal: they
-*do* need privilege on macOS, and how to get it is an open problem (§5).
+> For the system as actually built and verified — process model, privilege
+> boundaries, the full inventory of what lands on a machine, and what each
+> command does — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). This
+> section is the design intent; that one is the operational reference.
+
+
+One unprivileged user-space Go binary does everything that serves traffic.
+DNS needs no privilege at all, thanks to `/etc/resolver`'s `port` directive
+(§5).
+
+The `:80`/`:443` listeners are the exception, and the only one: they *do*
+need privilege on macOS. They are bound by a separate ~150-line parent
+process that immediately drops to the user and execs the binary below with
+the two sockets already open — so the process in the diagram still holds no
+privilege, it just did not open those two descriptors itself. The reasoning,
+and the three options that lost, are in ADR 0001; the interface that keeps
+this from leaking into the daemon is ADR 0002.
 
 ```
                       ┌─────────────────────────────────────────────┐
@@ -117,9 +135,22 @@ listeners in the diagram below are the unresolved part of that goal: they
                       │    unknown host → branded "no route" page   │
                       └─────────────────────────────────────────────┘
 
-  One-time `switchboard setup` (two admin prompts; ADR 0001 may add a third):
+  One-time `switchboard setup` (two admin prompts):
     1. write /etc/resolver/test  (nameserver 127.0.0.1, port 53535)
-    2. install Caddy's root CA into the System Keychain (Smallstep truststore)
+    2. install our name-constrained root CA into the System Keychain
+       (Smallstep truststore) — see ADR 0003
+
+  One-time `switchboard daemon install` (a third prompt, only when serving
+  :443/:80 — see ADR 0001):
+    3. write /Library/LaunchDaemons/…plist and bootstrap it
+
+       launchd ──starts as root──▶ switchboard __supervise
+                                     binds :443 and :80
+                                     setgroups/setgid/setuid → you
+                                     exec ──▶ switchboard __serve
+                                                (everything above,
+                                                 unprivileged, with the
+                                                 two sockets inherited)
 ```
 
 ### How the Caddy embedding works
@@ -202,10 +233,14 @@ switchboard doctor             # port conflicts, resolver state, CA trust state
   leaves are minted per-host on demand and auto-rotated in-process.
 - Trust install via Smallstep truststore: macOS Keychain, Windows root
   store, Linux system anchors, **and Firefox/NSS where `certutil` exists**.
-- Known gap vs the Rust plan: Caddy's PKI does not expose X.509 **name
-  constraints** on its root. Acceptable for v0.1; a potential upstream
-  contribution to Caddy later (constrain root to `.test`/`.localhost` so a
-  leaked key can't mint browser-accepted certs for real domains).
+- **Name constraints: closed.** Caddy's PKI cannot express them, so
+  Switchboard mints the root itself with `PermittedDNSDomains` pinned to the
+  suffix (plus all IP ranges excluded, since constraints are per-type) and
+  supplies it via `caddypki.CA.Root`. A leaked key cannot mint a
+  browser-accepted certificate for a real domain. See
+  [ADR 0003](docs/adr/0003-name-constrained-local-ca.md). Contributing
+  name-constraint support upstream to Caddy is still worthwhile, but is no
+  longer on the critical path.
 
 ### Proxy behavior we still assert (via generated config + tests)
 
@@ -236,44 +271,55 @@ switchboard doctor             # port conflicts, resolver state, CA trust state
 With Caddy handling TLS + trust stores everywhere, per-OS work reduces to
 **DNS routing + service packaging**.
 
-### macOS (v0.1) — the easy one, one lucky break and one open problem
+### macOS (v0.1) — the easy one: one lucky break, one problem solved the hard way
 
 1. **`/etc/resolver/<suffix>` files support a `port` directive** — DNS listens
    on 53535, no fight over :53. (puma-dev ships exactly this pattern.) This
    is the lucky break: it is what removes any need for a privileged DNS
    listener.
 
-2. **:80/:443 are still root-only — OPEN PROBLEM.** Earlier revisions of this
+2. **:80/:443 are still root-only — SOLVED, but there was no lucky break.**
+   Earlier revisions of this
    document claimed macOS had lifted the <1024 restriction since Mojave.
    That is false, and it was never true: macOS enforces the classic Unix
    boundary like every other Unix. Verified on macOS 15 (Darwin 25.5.0) as
    uid 501 — binding `127.0.0.1:80`, `:443` and `:1023` all fail with
    `permission denied`; `:1024` succeeds.
 
-   So an unprivileged daemon on the default ports cannot start. Today the
-   only working answer is the escape hatch already contemplated above in §4:
-   set `http_port`/`https_port` to high ports and accept `:8443` in URLs.
-   The real options — pf redirect from 443, a root LaunchDaemon or helper,
-   launchd socket activation (which binds privileged sockets and passes them
-   to an unprivileged job), or simply defaulting to high ports — trade off
-   differently on privilege, install friction, and URL aesthetics. They are
-   weighed in full, with the measurements and the rejected alternatives, in
+   So an unprivileged daemon cannot bind the default ports, and privilege
+   has to come from somewhere. The options — pf redirect from 443, a root
+   LaunchDaemon, a privileged helper, launchd socket activation, or simply
+   defaulting to high ports — trade off differently on privilege, install
+   friction, and URL aesthetics. They are weighed in full, with the
+   measurements and the rejected alternatives, in
    [ADR 0001](docs/adr/0001-binding-privileged-ports-on-macos.md).
 
-   **Decided there:** a small privileged parent binds :80/:443, drops
-   privileges, and spawns the daemon as the user with the listeners inherited
-   as file descriptors. That is a separate piece of work, gated on the open
-   questions the ADR records; none of it is implemented yet.
+   **Decided and implemented there:** a small privileged parent binds
+   :80/:443, drops privileges, and execs the daemon as the user with the
+   listeners inherited as file descriptors. All three of the ADR's open
+   questions are resolved; the ports the parent may bind are hardcoded and
+   never read from the config, which is the security crux.
 
-   Until it is: `switchboard daemon install` refuses when a configured port
-   below 1024 is genuinely unbindable, rather than installing a launch agent
-   that crash-loops (`KeepAlive{SuccessfulExit: false}` relaunches a failing
-   daemon forever, throttled to roughly every 10s, into an unrotated log).
+   The seam this creates — the daemon asks for a socket by name and does not
+   know whether it was inherited or bound — is
+   [ADR 0002](docs/adr/0002-the-listener-seam.md). It matters most for
+   Windows, which has no privileged ports at all and therefore needs none of
+   this machinery.
 
-Privileged surface *today*: two one-shot admin prompts in `setup` (write
-resolver file, install CA trust). Everything else runs as the user — but
-that holds only on high ports; whatever resolves the open problem above may
-add a third privileged step or a one-time helper install.
+   `switchboard daemon install` no longer refuses a stock config. The
+   privileged-port check that used to be a wall now picks the shape: ports
+   below 1024 install a LaunchDaemon running the parent; anything else
+   installs a plain user agent, unchanged from before.
+
+Privileged surface: three one-shot admin prompts — write the resolver file,
+install CA trust (both in `setup`), and install the launch daemon. Each is a
+visible `sudo` command printed before it runs. On high ports the third is not
+needed at all, and the agent runs with no privilege anywhere.
+
+The daemon itself — Caddy, the TLS stack, the reverse proxy, the CA — never
+holds privilege in either shape. That is the property the whole design is
+arranged around, and it is why the root component is a ~150-line socket
+binder rather than the daemon with a `UserName` key in a plist.
 
 ### Windows (v0.4) — NRPT is the /etc/resolver equivalent
 
@@ -291,8 +337,11 @@ add a third privileged step or a one-time helper install.
 - No `/etc/resolver`. Options, in preference order: `systemd-resolved`
   split-DNS (per-link DNS + `~test` routing domain), `dnsmasq` drop-in
   (`server=/test/127.0.0.1#53535`), NetworkManager integration.
-- Low ports need `CAP_NET_BIND_SERVICE` (`setcap` on the binary, or
-  systemd socket activation).
+- Low ports need `CAP_NET_BIND_SERVICE` (`setcap` on the binary), systemd
+  socket activation, or the same privileged parent macOS uses — `Credential`
+  and `ExtraFiles` are POSIX, so that code already works here. Whichever is
+  chosen becomes a `listen.Set` constructor rather than a change to how the
+  daemon starts; see [ADR 0002](docs/adr/0002-the-listener-seam.md).
 - Trust: system anchors + Firefox/Chromium NSS — covered by Caddy's
   truststore where `certutil` is installed; `doctor` should detect and
   advise otherwise.
@@ -305,7 +354,7 @@ add a third privileged step or a one-time helper install.
 |---|---|
 | **v0.1** | macOS. CLI + daemon: DNS, embedded Caddy (proxy + HTTPS + trust), `setup`/`add`/`rm`/`ls`/`doctor`, hot-reload config. **The whole point, shippable alone.** |
 | **v0.2** | Apache-2.0 license; `.internal` and user-owned domain suffixes; dashboard reachable on loopback; websocket/HMR integration test; **launchd agent (`switchboard daemon install`)**; Homebrew distribution. |
-| **v0.3** | Inspector: custom Caddy handler module captures method/URL/headers/bodies → SQLite ring buffer → live WS feed. Dashboard matured (inspector split-pane, route add/remove). Best demo material. |
+| **v0.3** | Inspector: custom Caddy handler module captures method/URL/headers/bodies → SQLite ring buffer → live WS feed. Dashboard matured (inspector split-pane, route add/remove). Best demo material. **Constraint, decided now rather than after the schema exists: request and response bodies are captured only when explicitly enabled, never by default.** The inspector records the user's own dev traffic — auth headers, session cookies, request payloads — to disk, and a ring buffer means it persists past the moment they were looking at it. Metadata by default is useful; bodies by default is a credential store nobody asked for. |
 | **v0.4** | Windows (NRPT + hosts-block fallback). |
 | **v0.5** | Linux (resolved/dnsmasq + setcap). |
 | **v1.x** | Tunnels: OSS self-hostable relay first (candidates to embed or crib: `frp`, `chisel` — embeddable Go lib — or custom on `yamux`); hosted paid tier only on traction. mDNS/Bonjour LAN sharing (`myapp.local` to your phone) as a separate opt-in feature — note mDNS can't do wildcards and only `.local`. |
