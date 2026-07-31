@@ -10,6 +10,7 @@ require (
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/net v0.55.0
 	golang.org/x/sys v0.45.0
+	howett.net/plist v1.0.0
 )
 
 require (
@@ -150,5 +151,4 @@ require (
 	google.golang.org/grpc v1.81.0 // indirect
 	google.golang.org/grpc/cmd/protoc-gen-go-grpc v1.5.1 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
-	howett.net/plist v1.0.0 // indirect
 )

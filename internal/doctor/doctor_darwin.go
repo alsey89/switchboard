@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/alsey89/switchboard/internal/config"
+	"github.com/alsey89/switchboard/internal/service"
 )
 
 func osChecks(cfg *config.Config, rootCertPath string) []Check {
@@ -46,6 +47,30 @@ func osChecks(cfg *config.Config, rootCertPath string) []Check {
 				detail = "root CA not found in System keychain"
 			}
 			checks = append(checks, Check{"trust", Fail, detail, "run: switchboard setup"})
+		}
+	}
+
+	// Background service: a plist pointing at a binary that has since moved
+	// (a Homebrew upgrade, a rebuild elsewhere) fails silently at boot.
+	if state, plistPath, err := service.Status(); err == nil && state != service.NotInstalled {
+		exe := service.InstalledExec()
+		switch {
+		case exe == "":
+			checks = append(checks, Check{"service", Warn,
+				"could not read the executable path from " + plistPath,
+				"reinstall it: switchboard daemon install"})
+		case !fileExists(exe):
+			checks = append(checks, Check{"service", Fail,
+				"launch agent points at " + exe + ", which no longer exists",
+				"repoint it: switchboard daemon install"})
+		case state == service.Running:
+			checks = append(checks, Check{"service", OK, "launch agent running (" + exe + ")", ""})
+		case state == service.Loaded:
+			checks = append(checks, Check{"service", Warn, "launch agent loaded but not running (" + exe + ")",
+				"check the log: switchboard daemon logs"})
+		default: // service.NotLoaded
+			checks = append(checks, Check{"service", Warn, "plist installed but not loaded by launchd (" + exe + ")",
+				"reinstall it: switchboard daemon install"})
 		}
 	}
 
