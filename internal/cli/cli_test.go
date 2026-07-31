@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/alsey89/switchboard/internal/config"
+	"github.com/alsey89/switchboard/internal/service"
+	"github.com/alsey89/switchboard/internal/setup"
 )
 
 // TestRetargetRoutesMovesEveryRouteToTheNewSuffix.
@@ -111,5 +113,119 @@ func TestLoadLenientStillRejectsABadSuffix(t *testing.T) {
 	if _, err := config.LoadLenient(path); err == nil {
 		t.Error("LoadLenient accepted .dev, a real gTLD — hijacking it in the OS " +
 			"resolver breaks go.dev and web.dev machine-wide")
+	}
+}
+
+// TestSuffixWarnsAboutAuthorizationBeforeAsking.
+//
+// The keychain prompt is a separate window macOS may open behind whatever is
+// in front. Someone who confirms and looks away sees nothing happen and
+// reasonably concludes the command hung — and an unannounced password prompt
+// is the exact shape of the thing people are taught to cancel. Saying it is
+// coming, before asking them to commit, costs two lines.
+func TestSuffixWarnsAboutAuthorizationBeforeAsking(t *testing.T) {
+	if len(setup.AuthNotice()) == 0 {
+		t.Skip("this platform elevates nothing during setup")
+	}
+
+	dir := t.TempDir()
+	t.Setenv("SWITCHBOARD_DIR", dir)
+	if err := os.WriteFile(filepath.Join(dir, "config.toml"),
+		[]byte("suffix = \"test\"\n\n[[routes]]\n  domain = \"app.test\"\n  port = 3000\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out strings.Builder
+	root := Root()
+	root.SetArgs([]string{"suffix", "internal"})
+	root.SetOut(&out)
+	root.SetIn(strings.NewReader("n\n")) // decline
+	if err := root.Execute(); err != nil {
+		t.Fatal(err)
+	}
+
+	got := out.String()
+	warnAt := strings.Index(got, "asked to authorize")
+	askAt := strings.Index(got, "continue?")
+	if warnAt < 0 {
+		t.Fatalf("the confirmation never mentions that authorization is coming:\n%s", got)
+	}
+	if askAt < 0 {
+		t.Fatalf("no confirmation prompt:\n%s", got)
+	}
+	if warnAt > askAt {
+		t.Error("the warning comes after the question; by then they have already committed")
+	}
+	if !strings.Contains(got, "behind other windows") {
+		t.Errorf("the notice should say the dialog can open behind other windows — "+
+			"that is the part that makes it look hung. Got:\n%s", got)
+	}
+	// Touch ID is only armed while that dialog has focus. Without this, the
+	// prompt looks like it is refusing fingerprint for some reason of its
+	// own — which is exactly the wrong conclusion, and one that was drawn
+	// and written down before someone noticed the window was behind another.
+	if !strings.Contains(got, "Touch ID will not respond") {
+		t.Errorf("the notice should say Touch ID needs the window focused. Not that it "+
+			"is unavailable — the fingerprint icon is shown either way, it just does "+
+			"nothing unfocused. Got:\n%s", got)
+	}
+	// Declining must change nothing.
+	if !strings.Contains(got, "aborted") {
+		t.Errorf("declining should abort, got:\n%s", got)
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "app.test") {
+		t.Error("the config was rewritten despite the user declining")
+	}
+}
+
+// TestDaemonInstallWarnsOnlyWhenItWillElevate.
+//
+// The launch daemon needs sudo; a user agent needs nothing at all. Announcing
+// a prompt that never arrives is its own small harm — it teaches people to
+// expect one, which is exactly the habit that makes an unexpected prompt
+// elsewhere look normal.
+func TestDaemonInstallWarnsOnlyWhenItWillElevate(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  *config.Config
+		want bool
+	}{
+		{"stock ports need the parent", config.Default(), true},
+		{"high ports need nothing",
+			&config.Config{Suffix: "test", HTTPPort: 8080, HTTPSPort: 8443}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("SWITCHBOARD_DIR", t.TempDir())
+			spec, err := service.DefaultSpec(tc.cfg, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			elevates := spec.Mode == service.ModeDaemon
+			if elevates != tc.want {
+				t.Errorf("Mode elevates = %v, want %v — the warning is keyed off this",
+					elevates, tc.want)
+			}
+		})
+	}
+}
+
+// TestRemoveBinaryHintMatchesTheInstaller: telling a Homebrew user to `rm`
+// the binary leaves brew believing the cask is still installed, and the next
+// `brew upgrade` puts it back. Getting this wrong is worse than omitting it.
+func TestRemoveBinaryHintMatchesTheInstaller(t *testing.T) {
+	for _, tc := range []struct{ exe, want string }{
+		{"/opt/homebrew/bin/switchboard", "brew uninstall"},
+		{"/usr/local/Homebrew/bin/switchboard", "brew uninstall"},
+		{"/opt/homebrew/Caskroom/switchboard/0.1.0/switchboard", "brew uninstall"},
+		{"/usr/local/bin/switchboard", "sudo rm /usr/local/bin/switchboard"},
+		{"/Users/me/go/bin/switchboard", "sudo rm /Users/me/go/bin/switchboard"},
+	} {
+		if got := removeBinaryHint(tc.exe); !strings.Contains(got, tc.want) {
+			t.Errorf("removeBinaryHint(%q) = %q, want it to contain %q", tc.exe, got, tc.want)
+		}
 	}
 }

@@ -90,3 +90,42 @@ func TestBindablePortsReportOK(t *testing.T) {
 		}
 	}
 }
+
+// TestDownDaemonAdviceNamesSomethingThatWorks.
+//
+// doctor used to say "run: switchboard start" whenever nothing was listening.
+// On a stock config that command cannot bind :443 and fails — so the
+// diagnostic's advice was a command that would not work, and the only way
+// forward was to read the resulting failure carefully enough to find the real
+// remedy buried in it. Someone hit this three times in a row before getting out.
+func TestDownDaemonAdviceNamesSomethingThatWorks(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		cfg       *config.Config
+		wantStart bool
+	}{
+		{"stock ports cannot be bound by `start`", config.Default(), false},
+		{"high ports can", &config.Config{Suffix: "test", HTTPPort: 8080, HTTPSPort: 8443}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			origBind, origDial := bindProbe, dialProbe
+			bindProbe = func(string, string) error { return nil }
+			dialProbe = func(string) bool { return false } // nothing listening
+			t.Cleanup(func() { bindProbe, dialProbe = origBind, origDial })
+
+			checks := Run(tc.cfg, "/tmp/config.toml", t.TempDir(), nil)
+			c, ok := findCheck(checks, "daemon")
+			if !ok {
+				t.Fatal("no daemon check")
+			}
+			if !strings.Contains(c.Hint, "daemon install") {
+				t.Errorf("the advice should name `daemon install`, which works in both "+
+					"cases. Got: %q", c.Hint)
+			}
+			if got := strings.Contains(c.Hint, "switchboard start"); got != tc.wantStart {
+				t.Errorf("mentions `switchboard start` = %v, want %v — on privileged "+
+					"ports it cannot bind and fails. Got: %q", got, tc.wantStart, c.Hint)
+			}
+		})
+	}
+}

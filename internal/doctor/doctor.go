@@ -87,12 +87,19 @@ func Run(cfg *config.Config, cfgPath, dataDir string, cfgErr error) []Check {
 
 	// Daemon liveness: something must be answering on the HTTPS port.
 	httpsAddr := "127.0.0.1:" + strconv.Itoa(cfg.EffHTTPSPort())
-	daemonUp := dialable(httpsAddr)
+	daemonUp := dialProbe(httpsAddr)
 	if daemonUp {
 		checks = append(checks, Check{"daemon", OK, "listening on " + httpsAddr, ""})
 	} else {
-		checks = append(checks, Check{"daemon", Fail, "nothing listening on " + httpsAddr,
-			"run: switchboard start"})
+		// Recommend the thing that actually works. On a stock config
+		// `switchboard start` cannot bind :443 and fails — this used to send
+		// people to it repeatedly, and the only way out was to read the
+		// failure carefully enough to find the real remedy inside it.
+		remedy := "run: switchboard daemon install"
+		if cfg.EffHTTPSPort() >= 1024 && cfg.EffHTTPPort() >= 1024 {
+			remedy = "run: switchboard daemon install    (or `switchboard start` to run it in this terminal)"
+		}
+		checks = append(checks, Check{"daemon", Fail, "nothing listening on " + httpsAddr, remedy})
 		// Only meaningful to test bindability when the daemon is down.
 		checks = append(checks, bindChecks(cfg)...)
 	}
@@ -100,7 +107,7 @@ func Run(cfg *config.Config, cfgPath, dataDir string, cfgErr error) []Check {
 	// Upstreams.
 	for _, r := range cfg.Routes {
 		addr := r.UpstreamAddr()
-		if dialable(addr) {
+		if dialProbe(addr) {
 			checks = append(checks, Check{"upstream " + r.Domain, OK, addr + " is up", ""})
 		} else {
 			checks = append(checks, Check{"upstream " + r.Domain, Warn, addr + " is not answering",
@@ -155,6 +162,12 @@ func bindChecks(cfg *config.Config) []Check {
 	}
 	return checks
 }
+
+// dialProbe is dialable, indirected for the same reason bindProbe is: without
+// it these checks report on whatever happens to be listening on the machine
+// running the tests, so a developer with the daemon up sees different results
+// from one without it.
+var dialProbe = dialable
 
 func dialable(addr string) bool {
 	c, err := net.DialTimeout("tcp", addr, 400*time.Millisecond)

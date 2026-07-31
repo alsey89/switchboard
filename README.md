@@ -11,12 +11,15 @@ You tell the operator which line a name connects to; every call gets patched
 through.
 
 ```console
-$ switchboard setup            # once, ever — one sudo, one keychain prompt
+$ switchboard setup            # once, ever — resolver, trusted CA, background service
 $ switchboard add app 3000
 https://app.test → 127.0.0.1:3000
-$ switchboard daemon install   # one more prompt; runs in the background from now on
 $ open https://app.test        # green padlock
 ```
+
+`setup` does everything needed to make it work, and `switchboard uninstall`
+undoes all of it. `switchboard start` runs the daemon in your terminal
+instead, for when you want to watch it.
 
 > **Where the password prompts go.** `:80` and `:443` are reserved for root on
 > macOS, so something has to be privileged. That something is a ~150-line

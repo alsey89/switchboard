@@ -32,9 +32,9 @@ import (
 func isolateResolverDir(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	orig := resolverDir
-	resolverDir = dir
-	t.Cleanup(func() { resolverDir = orig })
+	orig := ResolverDir
+	ResolverDir = dir
+	t.Cleanup(func() { ResolverDir = orig })
 	return dir
 }
 
@@ -82,11 +82,11 @@ func TestInstallResolverCreatesTheDirectoryFirst(t *testing.T) {
 	for i, cmd := range *got {
 		switch {
 		case cmd[0] == "sudo" && cmd[1] == "install" && slices.Contains(cmd, "-d"):
-			if !slices.Contains(cmd, resolverDir) {
-				t.Errorf("the mkdir should target %s, got %v", resolverDir, cmd)
+			if !slices.Contains(cmd, ResolverDir) {
+				t.Errorf("the mkdir should target %s, got %v", ResolverDir, cmd)
 			}
 			mkdirAt = i
-		case cmd[0] == "sudo" && cmd[1] == "install" && slices.Contains(cmd, filepath.Join(resolverDir, "test")):
+		case cmd[0] == "sudo" && cmd[1] == "install" && slices.Contains(cmd, filepath.Join(ResolverDir, "test")):
 			writeAt = i
 		}
 	}

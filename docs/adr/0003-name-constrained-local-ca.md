@@ -138,11 +138,30 @@ name-constrained CA was trusted in the user domain on macOS 15 and probed:
 The two rejections are not regressions: neither runtime consults the macOS
 keychain in any domain. Everything that did work before still works.
 
-One prediction did not survive contact. The user-domain dialog was expected
-to offer Touch ID consistently; it offered it on one run and not the next,
-with an identical command. macOS falls back to a password on its own schedule.
-Touch ID is therefore *sometimes* available and is not a reason to prefer this
-design — the privilege reduction is.
+One prediction did not survive contact, and the first explanation for why was
+also wrong.
+
+The user-domain dialog was expected to offer Touch ID consistently. It offered
+it on one run and not the next, with an identical command, and that was
+recorded here as macOS rationing Touch ID on a schedule of its own. It is not.
+**Touch ID is only armed while the authorization dialog is the frontmost
+window.** The dialog shows the fingerprint prompt either way; unfocused, the
+sensor simply does not respond. The two runs differed in which window had
+focus, not in anything macOS decided.
+
+Corrected twice, in fact: the second attempt said the prompt "will not be
+offered", which described something the user had not seen — the icon is
+displayed, it just does nothing.
+
+Worth keeping as a lesson about evidence rather than about Touch ID: given two
+observations and no mechanism, the plausible-sounding story ("macOS decides")
+got written down as a finding. It explained the data and was wrong, and being
+wrong in a way that closed the question is the expensive part — nobody looks
+for a cause they believe they already have.
+
+Touch ID is therefore reliably available, provided the window has focus, and
+`setup` now says so. It still is not the reason to prefer this design; the
+privilege reduction is.
 
 Known costs, accepted:
 
