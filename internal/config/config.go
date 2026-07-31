@@ -100,6 +100,31 @@ func DataDir() (string, error) {
 	return filepath.Join(dir, "data"), nil
 }
 
+// LoadLenient reads the config without requiring routes to match the suffix.
+//
+// It exists for exactly one caller: the command that changes the suffix. Once
+// someone edits `suffix` by hand, Load fails — every route now ends in the
+// wrong domain — and that failure takes `add`, `ls`, `doctor` and the suffix
+// command itself down with it. The tool that repairs the situation cannot be
+// the one that refuses to read it.
+func LoadLenient(path string) (*Config, error) {
+	b, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return Default(), nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var c Config
+	if _, err := toml.Decode(string(b), &c); err != nil {
+		return nil, fmt.Errorf("parsing %s: %w", path, err)
+	}
+	if c.Suffix == "" {
+		c.Suffix = DefaultSuffix
+	}
+	return &c, validateSuffix(c.Suffix)
+}
+
 // Load reads and validates the config at path. A missing file yields the
 // default config (not an error): the tool should work before `add` runs.
 func Load(path string) (*Config, error) {
@@ -155,7 +180,13 @@ func (c *Config) Validate() error {
 		r := &c.Routes[i]
 		norm, err := NormalizeDomain(r.Domain, c.Suffix)
 		if err != nil {
-			return fmt.Errorf("route %q: %w", r.Domain, err)
+			// The overwhelmingly likely cause is an edited `suffix` with the
+			// routes left behind, and the generic "must end in" message does
+			// not suggest that — it reads as a typo in one route. Name the
+			// command that migrates all of them at once.
+			return fmt.Errorf("route %q does not match suffix .%s: %w\n"+
+				"  If you changed the suffix, migrate the routes with it:\n"+
+				"    switchboard suffix %s", r.Domain, c.Suffix, err, c.Suffix)
 		}
 		r.Domain = norm
 		if seen[norm] {

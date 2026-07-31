@@ -10,7 +10,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/alsey89/switchboard/internal/proxy"
 )
+
+// isTrusted is proxy.IsTrusted, indirected so tests can exercise the
+// trust-removal path without a real keychain — genuinely trusting a
+// certificate needs an authorization dialog a test cannot answer.
+var isTrusted = proxy.IsTrusted
 
 // sha1Sum wraps the hash so the nolint above sits in one place.
 func sha1Sum(b []byte) []byte {
@@ -24,7 +31,16 @@ func sha1Sum(b []byte) []byte {
 // A multi-label suffix works the same way: /etc/resolver/dev.example.com
 // matches that domain and all its subdomains.
 
-func resolverFilePath(suffix string) string { return filepath.Join("/etc/resolver", suffix) }
+// resolverDir is /etc/resolver, as a var so tests can redirect it.
+//
+// As a literal it made tests depend on the developer's own machine:
+// removeResolver short-circuits when the file does not exist, so an assertion
+// that the old suffix's file is removed passed or failed according to what
+// happened to be in /etc/resolver at the time. That is the third test in this
+// package to be caught reaching real system paths.
+var resolverDir = "/etc/resolver"
+
+func resolverFilePath(suffix string) string { return filepath.Join(resolverDir, suffix) }
 
 // ResolverFileContents is exported for doctor to compare against.
 func ResolverFileContents(dnsPort int) string {
@@ -90,14 +106,50 @@ func removeResolver(suffix string, out io.Writer) error {
 	return nil
 }
 
-const systemKeychain = "/Library/Keychains/System.keychain"
+// userKeychain resolves the login keychain — the user's own trust domain.
+//
+// Switchboard installs its CA here rather than in /Library/Keychains/
+// System.keychain, and the difference is a privilege one. The system store
+// requires root and grants trust to every account and system service on the
+// machine. The login keychain requires no root at all and grants trust to
+// the one user who asked for it, which is the only one who needs it: the
+// daemon runs as you, and so does your browser.
+//
+// Verified on macOS 15 that curl, Go's verifier (which is what `doctor`
+// uses) and a real TLS handshake all honour user-domain trust. Python and
+// Node do not — but they do not honour the system store either, since both
+// ship their own CA bundles; that is unchanged either way and needs
+// NODE_EXTRA_CA_CERTS or equivalent.
+func userKeychain() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	// login.keychain-db since Sierra; the older name is still accepted on
+	// machines upgraded across that boundary.
+	for _, name := range []string{"login.keychain-db", "login.keychain"} {
+		p := filepath.Join(home, "Library", "Keychains", name)
+		if _, err := os.Stat(p); err == nil {
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf("no login keychain found in %s/Library/Keychains", home)
+}
 
 func installTrust(rootPath string, out io.Writer) ([]string, error) {
-	if err := runVisible(out, "security", "add-trusted-cert", "-d", "-r", "trustRoot",
-		"-k", systemKeychain, rootPath); err != nil {
-		return nil, fmt.Errorf("installing CA into System keychain: %w", err)
+	kc, err := userKeychain()
+	if err != nil {
+		return nil, err
 	}
-	notes := []string{"root CA trusted in the System keychain"}
+	// No sudo: this touches the user's own keychain. macOS still asks for
+	// authorization — that dialog is the Security framework, not sudo, and
+	// it is what makes "trust a new certificate authority" a deliberate act
+	// rather than something a script can do silently.
+	if err := runVisibleUnprivileged(out, "security", "add-trusted-cert", "-r", "trustRoot",
+		"-k", kc, rootPath); err != nil {
+		return nil, fmt.Errorf("installing CA into your login keychain: %w", err)
+	}
+	notes := []string{"root CA trusted in your login keychain (no root required)"}
 	if firefoxPresent() {
 		notes = append(notes,
 			"Firefox: recent versions read the system trust store; if you run an older "+
@@ -110,8 +162,41 @@ func removeTrust(rootPath string, out io.Writer) error {
 	if _, err := os.Stat(rootPath); os.IsNotExist(err) {
 		return nil
 	}
-	if err := runVisible(out, "security", "remove-trusted-cert", "-d", rootPath); err != nil {
+	kc, err := userKeychain()
+	if err != nil {
 		return err
+	}
+
+	// What matters is whether the certificate ends up untrusted, not whether
+	// `security` exits zero. Those differ in both directions:
+	//
+	//   - Removing trust that was never granted exits 1 with "The specified
+	//     item could not be found in the keychain". That is the desired end
+	//     state, not a failure — and treating it as one made `setup` abort
+	//     mid-rotation on a machine where the old root simply was not trusted.
+	//
+	//   - The reverse matters more. A root trusted in the *system* keychain by
+	//     an older version cannot be untrusted from the user domain, so the
+	//     command can fail while the certificate stays trusted. Silently
+	//     continuing there would delete the file and strand a trusted root
+	//     that nothing on disk can identify any more.
+	//
+	// So: attempt it, then check.
+	sum, sumErr := certSHA1(rootPath)
+	if trusted, tErr := isTrusted(rootPath); tErr == nil && trusted {
+		runVisibleUnprivileged(out, "security", "remove-trusted-cert", rootPath) //nolint:errcheck
+
+		if stillTrusted, tErr := isTrusted(rootPath); tErr == nil && stillTrusted {
+			hint := ""
+			if sumErr == nil {
+				hint = fmt.Sprintf("\n  If it was trusted system-wide by an older version, remove it with:\n"+
+					"    sudo security delete-certificate -Z %s /Library/Keychains/System.keychain", sum)
+			}
+			return fmt.Errorf("the root CA at %s is still trusted after trying to remove it.%s",
+				rootPath, hint)
+		}
+	} else {
+		fmt.Fprintln(out, "  (the old root was not trusted; nothing to remove)")
 	}
 
 	// remove-trusted-cert clears the *trust setting* and leaves the
@@ -125,18 +210,45 @@ func removeTrust(rootPath string, out io.Writer) error {
 	// on the common name, and every Switchboard root ever generated on this
 	// machine shares one. Deleting the specific certificate we installed is
 	// the only version of this that cannot remove someone else's.
-	sum, err := certSHA1(rootPath)
-	if err != nil {
-		fmt.Fprintf(out, "  (could not fingerprint %s to remove it from the keychain: %v)\n", rootPath, err)
+	if sumErr != nil {
+		fmt.Fprintf(out, "  (could not fingerprint %s to remove it from the keychain: %v)\n", rootPath, sumErr)
 		return nil
 	}
-	if err := runVisible(out, "security", "delete-certificate", "-Z", sum, systemKeychain); err != nil {
-		// Non-fatal: trust is already gone, which is the part that matters for
-		// safety. Say so rather than failing the whole uninstall.
+
+	// Only attempt the delete if the certificate is actually there. Otherwise
+	// `security` prints its own failure and we print a second, wronger one:
+	// the previous version claimed the certificate was "untrusted but still
+	// in the keychain" when the truth was that it had never been in this
+	// keychain at all.
+	present, presErr := certInKeychain(sum, kc)
+	if presErr == nil && !present {
+		return nil
+	}
+	runVisibleUnprivileged(out, "security", "delete-certificate", "-Z", sum, kc) //nolint:errcheck
+
+	// Same rule as trust removal: report what is true afterwards, not what
+	// the command returned.
+	if still, err := certInKeychain(sum, kc); err == nil && still {
 		fmt.Fprintf(out, "  (the certificate is untrusted but still in the keychain; "+
-			"remove it with: sudo security delete-certificate -Z %s %s)\n", sum, systemKeychain)
+			"remove it with: security delete-certificate -Z %s %s)\n", sum, kc)
 	}
 	return nil
+}
+
+// certInKeychain reports whether a certificate with the given SHA-1
+// fingerprint is present in a keychain.
+//
+// `security find-certificate` has no search-by-hash, so this lists the
+// fingerprints it does have and looks for ours. Matching on the hash rather
+// than the common name matters: every Switchboard root ever generated on a
+// machine shares a name, and the question here is about one specific
+// certificate.
+var certInKeychain = func(sha1hex, keychain string) (bool, error) {
+	out, err := exec.Command("security", "find-certificate", "-a", "-Z", keychain).Output()
+	if err != nil {
+		return false, err
+	}
+	return strings.Contains(strings.ToUpper(string(out)), strings.ToUpper(sha1hex)), nil
 }
 
 // certSHA1 is the fingerprint `security` uses to identify a certificate.

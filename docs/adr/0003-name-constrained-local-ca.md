@@ -109,6 +109,55 @@ macOS's Security framework, NSS/Firefox, Chrome's verifier, and Go's
 
 ---
 
+## Where the root is trusted
+
+Separate from *what* the root is, and decided later, after measurement:
+Switchboard installs it into the **user's login keychain**, not
+`/Library/Keychains/System.keychain`.
+
+The system store requires root and grants trust to every account and every
+system service on the machine. The login keychain requires no root at all and
+grants trust to the one user who asked for it — which is the only one who
+needs it, since both the daemon and the browser run as that user.
+
+For a project whose entire argument is that only a socket binder is
+privileged, asking for root to install a certificate authority was an
+inconsistency. Removing it costs nothing that anyone has been shown to need.
+
+**This was settled empirically, not by preference.** A throwaway
+name-constrained CA was trusted in the user domain on macOS 15 and probed:
+
+| Client | Result |
+|---|---|
+| `curl` | trusted |
+| Go's `crypto/x509` verifier (what `doctor` uses) | trusted |
+| Live TLS handshake against a leaf it signed | trusted |
+| Python (`certifi`) | rejected — **and equally rejected via the system store** |
+| Node (bundled CA list) | rejected — **same, needs `NODE_EXTRA_CA_CERTS` either way** |
+
+The two rejections are not regressions: neither runtime consults the macOS
+keychain in any domain. Everything that did work before still works.
+
+One prediction did not survive contact. The user-domain dialog was expected
+to offer Touch ID consistently; it offered it on one run and not the next,
+with an identical command. macOS falls back to a password on its own schedule.
+Touch ID is therefore *sometimes* available and is not a reason to prefer this
+design — the privilege reduction is.
+
+Known costs, accepted:
+
+- `sudo switchboard doctor` cannot see the user's trust domain. It reports a
+  warning explaining exactly that rather than a confident "not trusted",
+  which would be a wrong answer given to someone who reached for `sudo`
+  because something already looked broken.
+- Anything run *as root* that needs the CA will not trust it.
+- Trust does not extend to a second human account on the machine.
+- It diverges from mkcert, `caddy trust` and Valet, which all use the system
+  store. The divergence is deliberate and is in the direction of asking for
+  less.
+
+---
+
 ## Consequences
 
 ### Positive
@@ -117,6 +166,7 @@ macOS's Security framework, NSS/Firefox, Chrome's verifier, and Go's
   difference between "can impersonate your bank" and "can impersonate your
   own dev machine" is the difference between a system-wide compromise and a
   local one.
+- Installing the CA needs no root at all — see "Where the root is trusted".
 - `setup` no longer starts Caddy at all. Minting the root became our own few
   lines, so the CA step is now pure `crypto/x509` — faster, and one fewer
   place where a partially-started Caddy can leave state behind.

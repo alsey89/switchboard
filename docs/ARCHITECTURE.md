@@ -54,15 +54,23 @@ same fact as a `privilege` check.
 | Action | Runs as | When |
 |---|---|---|
 | Write `/etc/resolver/<suffix>` | root | once, in `setup` |
-| Trust the root CA | root | once, in `setup` |
+| Trust the root CA | **you** | once, in `setup` |
 | Install the launch daemon | root | once, in `daemon install` |
 | Bind `:443` and `:80` | root | at every start, then drops immediately |
 | **Everything else** | **you** | always |
 
-Each privileged step is a separate `sudo` command, printed before it runs, so
-you can read what you are agreeing to rather than hand root to one opaque
-installer. `sudo` caches its timestamp, so in practice you are asked for a
-password once or twice, not five times.
+Each step that needs elevation is a separate `sudo` command, printed before
+it runs, so you can read what you are agreeing to rather than hand root to
+one opaque installer. `sudo` caches its timestamp, so consecutive elevated
+steps ask once.
+
+Trusting the CA is deliberately *not* one of them. It goes into your login
+keychain, which needs no root and grants trust to your user rather than to
+every account and system service on the machine. macOS still shows its own
+authorization dialog — that is the Security framework, a different mechanism
+from `sudo`, insisting that "trust a new certificate authority" be a
+deliberate human act. It is un-scriptable by design, which is the property
+you want here.
 
 **Nothing user-writable steers a root process.** The parent's ports are
 hardcoded, never read from the config file. This is deliberate and is the
@@ -93,12 +101,12 @@ let anything running as you replace the binary and get root at the next boot.
 
 `rm -rf ~/.config/switchboard` is a complete reset of everything unprivileged.
 
-### System-wide (installed with your password)
+### Outside your home directory (each authorized explicitly)
 
 | Path | Owner | Installed by | Removed by |
 |---|---|---|---|
 | `/etc/resolver/<suffix>` | `root:wheel 0644` | `setup` | `uninstall` |
-| System keychain entry | root | `setup` | `uninstall` |
+| Login keychain trust entry | **you, no root** | `setup` | `uninstall` |
 | `/Library/LaunchDaemons/io.github.alsey89.switchboard.plist` | `root:wheel 0644` | `daemon install` | `uninstall` |
 | `/Library/PrivilegedHelperTools/io.github.alsey89.switchboard` | `root:wheel 0755` | `daemon install` | `uninstall` |
 | `/Library/Logs/switchboard.log` | root | the daemon | left in place |
@@ -133,11 +141,14 @@ and knows nothing about UDP.
 2. **sudo:** creates `/etc/resolver` if needed and writes
    `/etc/resolver/<suffix>` → `nameserver 127.0.0.1`, `port 53535`, then
    HUPs `mDNSResponder`.
-3. **sudo:** adds the root CA to the System keychain as a trusted root.
+3. **keychain authorization (not sudo, no root):** adds the root CA to your
+   login keychain as a trusted root. macOS shows its own dialog for this —
+   that is the Security framework insisting a human authorize "trust a new
+   certificate authority", which is un-scriptable by design.
 
-Run it *without* `sudo`. It elevates the two steps that need it. Running the
-whole command as root would create the CA under `/var/root`, where nothing
-else would look for it.
+Run it *without* `sudo`. It elevates only step 2. Running the whole command
+as root would create the CA under `/var/root`, where nothing else would look
+for it — and would put the trust in root's keychain rather than yours.
 
 ### `switchboard add app 3000`
 
@@ -165,16 +176,36 @@ $ switchboard daemon logs         # prints the log path
 ```
 
 Editing `~/.config/switchboard/config.toml` by hand works identically — the
-daemon watches the file. Changing `suffix` requires a restart and a re-run of
-`setup`, because the resolver file and the CA's name constraint are both tied
-to it; the daemon says so rather than silently half-applying it.
+daemon watches the file.
+
+**Changing the suffix is the exception**, and has its own command:
+
+```console
+$ switchboard suffix internal
+```
+
+It is an operation, not a setting. It rewrites every route domain, re-issues
+the CA under the new name constraint, invalidates every certificate issued so
+far, and replaces `/etc/resolver/<old>` with `/etc/resolver/<new>` — the old
+file left behind would keep sending that whole namespace to a responder that
+no longer answers for it. Doing it by hand means knowing all four steps, and
+getting the routes wrong makes the config unloadable, which takes `add`, `ls`
+and `doctor` down with it.
+
+The command shows what will change and asks before touching anything, then
+restarts the background service itself. That last part is not a convenience:
+between the config change and the restart, DNS sends the new suffix to a
+daemon still serving the old zone and holding certificates that no longer
+exist, so the machine works less well than before the command ran. A
+foreground `switchboard start` cannot be restarted for you, and the command
+says so instead.
 
 ### `switchboard uninstall`
 
-**sudo:** boots out and removes the launch daemon and its staged binary,
-removes the resolver file, removes CA trust *and* deletes the certificate
-from the keychain. Leaves `~/.config/switchboard` alone, so your routes
-survive; delete that directory for a full reset.
+Boots out and removes the launch daemon and its staged binary, and removes
+the resolver file (**sudo**); removes CA trust *and* deletes the certificate
+from your keychain (no root). Leaves `~/.config/switchboard` alone, so your
+routes survive; delete that directory for a full reset.
 
 ---
 
@@ -255,6 +286,7 @@ in isolation:
 
 | Claim | How it was checked |
 |---|---|
+| User-domain trust works for real clients | `curl`, Go's verifier and a live TLS handshake all accept it |
 | Root binds, unprivileged process serves | `lsof -iTCP:443` shows uid 501 |
 | Only the socket binder is root | `ps` — root parent, user child |
 | The CA cannot sign outside the suffix | `openssl` on the live root; chain verifies, `google.com` leaf rejected in test |

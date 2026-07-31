@@ -2,10 +2,7 @@ package doctor
 
 import (
 	"crypto/sha256"
-	"crypto/x509"
 	"encoding/hex"
-	"encoding/pem"
-	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -14,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/alsey89/switchboard/internal/config"
+	"github.com/alsey89/switchboard/internal/proxy"
 	"github.com/alsey89/switchboard/internal/service"
 )
 
@@ -54,15 +52,24 @@ func osChecks(cfg *config.Config, rootCertPath string) []Check {
 	// Verifying the certificate against the system pool asks exactly what a
 	// TLS client asks, and cannot be satisfied by an untrusted leftover.
 	if _, err := os.Stat(rootCertPath); err == nil {
-		switch trusted, err := systemTrusts(rootCertPath); {
+		switch trusted, err := proxy.IsTrusted(rootCertPath); {
 		case err != nil:
 			checks = append(checks, Check{"trust", Warn,
-				"could not check the system trust store: " + err.Error(), ""})
+				"could not check the trust store: " + err.Error(), ""})
 		case trusted:
-			checks = append(checks, Check{"trust", OK, "root CA trusted in the System keychain", ""})
+			checks = append(checks, Check{"trust", OK, "root CA trusted in your login keychain", ""})
+		case os.Geteuid() == 0:
+			// The CA is trusted in the *user's* keychain, which root cannot
+			// see. Reporting Fail here would be a confident wrong answer to
+			// someone who reached for sudo precisely because something looked
+			// broken.
+			checks = append(checks, Check{"trust", Warn,
+				"cannot verify trust as root — the CA is trusted in your login keychain, " +
+					"which root does not have",
+				"re-run without sudo: switchboard doctor"})
 		default:
 			checks = append(checks, Check{"trust", Fail,
-				"root CA is not trusted by the system (browsers will warn)",
+				"root CA is not trusted (browsers will warn)",
 				"run: switchboard setup"})
 		}
 	}
@@ -138,33 +145,6 @@ func osChecks(cfg *config.Config, rootCertPath string) []Check {
 	}
 
 	return checks
-}
-
-// systemTrusts reports whether the system trust store accepts the
-// certificate at path as a valid anchor.
-//
-// It verifies the certificate against itself as its own root: a
-// self-signed CA verifies only if the platform verifier already trusts it,
-// which is the same test a browser applies. Caddy's PKI uses this exact
-// check for the same purpose.
-func systemTrusts(path string) (bool, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return false, err
-	}
-	block, _ := pem.Decode(b)
-	if block == nil || block.Type != "CERTIFICATE" {
-		return false, fmt.Errorf("%s is not a PEM certificate", path)
-	}
-	cert, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		return false, err
-	}
-	// Empty VerifyOptions means "use the system roots". A name-constrained
-	// root permits its own subject, so no DNSName is supplied — this asks
-	// only whether the anchor is trusted, not whether it may sign a host.
-	chains, err := cert.Verify(x509.VerifyOptions{})
-	return len(chains) > 0 && err == nil, nil
 }
 
 // sameContents reports whether two files are byte-identical. Sizes are

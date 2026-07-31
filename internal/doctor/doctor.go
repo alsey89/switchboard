@@ -4,6 +4,7 @@
 package doctor
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -110,6 +111,11 @@ func Run(cfg *config.Config, cfgPath, dataDir string, cfgErr error) []Check {
 	return checks
 }
 
+// bindProbe is netprobe.Bindable, indirected so tests can exercise the
+// advice each failure produces without depending on the privileges of the
+// machine running them.
+var bindProbe = netprobe.Bindable
+
 func bindChecks(cfg *config.Config) []Check {
 	var checks []Check
 	for _, p := range []struct {
@@ -121,11 +127,26 @@ func bindChecks(cfg *config.Config) []Check {
 		{"port https", "tcp", "127.0.0.1:" + strconv.Itoa(cfg.EffHTTPSPort())},
 		{"port dns", "udp", "127.0.0.1:" + strconv.Itoa(cfg.EffDNSPort())},
 	} {
-		if err := netprobe.Bindable(p.net, p.addr); err != nil {
-			hint := "find the conflict: lsof -nP -i:" + portOf(p.addr)
-			if runtime.GOOS == "linux" {
-				hint += "  (or, for <1024: sudo setcap cap_net_bind_service=+ep $(which switchboard))"
+		if err := bindProbe(p.net, p.addr); err != nil {
+			// "Permission denied" on a port below 1024 is not a conflict, and
+			// telling someone to go hunting with lsof for a process that is
+			// not there wastes their time on the most common state there is:
+			// a stock config with the service not yet installed. Nothing is
+			// holding :443 — an ordinary user simply may not bind it.
+			if errors.Is(err, os.ErrPermission) {
+				hint := "this port needs the privileged parent:\n" +
+					"    switchboard daemon install    (or `sudo switchboard start` for one session)\n" +
+					"  or serve on a high port instead — see `switchboard doctor` after editing the config"
+				if runtime.GOOS == "linux" {
+					hint = "grant the capability:\n" +
+						"    sudo setcap cap_net_bind_service=+ep $(which switchboard)\n" +
+						"  or use a high port, or install the service"
+				}
+				checks = append(checks, Check{p.name, Fail,
+					p.addr + " is reserved for root, and the daemon runs as you", hint})
+				continue
 			}
+			hint := "find the conflict: lsof -nP -i:" + portOf(p.addr)
 			checks = append(checks, Check{p.name, Fail,
 				p.addr + " not bindable: " + err.Error(), hint})
 		} else {
