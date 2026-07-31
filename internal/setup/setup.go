@@ -37,12 +37,16 @@ func Run(ctx context.Context, cfg *config.Config, dataDir string, out io.Writer)
 	}
 
 	// 1. Make sure the CA exists (unprivileged; must happen before trust).
+	// Switchboard mints this root itself rather than asking Caddy for one,
+	// so that it can carry name constraints — see internal/proxy/ca.go. A
+	// side benefit is that setup no longer has to boot Caddy at all.
 	fmt.Fprintln(out, "→ ensuring local root CA exists…")
-	rootPath, err := proxy.EnsureCA(ctx, dataDir)
+	rootPath, err := proxy.EnsureRoot(dataDir, cfg.Suffix)
 	if err != nil {
 		return nil, err
 	}
 	fmt.Fprintf(out, "  CA root: %s\n", rootPath)
+	fmt.Fprintf(out, "  constrained to .%s — it cannot sign for any other domain\n", cfg.Suffix)
 
 	res := &Result{RootCertPath: rootPath}
 

@@ -61,10 +61,22 @@ func Run(cfg *config.Config, cfgPath, dataDir string, cfgErr error) []Check {
 			fmt.Sprintf("%s (%d routes, suffix .%s)", cfgPath, len(cfg.Routes), cfg.Suffix), ""})
 	}
 
-	// CA existence.
+	// CA existence, and — separately — whether it is name-constrained. The
+	// second check exists because an unconstrained root is not a broken
+	// install: everything works perfectly, which is exactly why nobody would
+	// notice that the root in their keychain can sign for any site on the
+	// internet.
 	rootPath := proxy.RootCertPath(dataDir)
 	if _, err := os.Stat(rootPath); err == nil {
 		checks = append(checks, Check{"local CA", OK, rootPath, ""})
+
+		if err := proxy.RootCoversSuffix(rootPath, cfg.Suffix); err != nil {
+			checks = append(checks, Check{"CA name constraints", Fail, err.Error(),
+				"run: switchboard uninstall && switchboard setup"})
+		} else {
+			checks = append(checks, Check{"CA name constraints", OK,
+				"limited to ." + cfg.Suffix + " (cannot sign for other domains)", ""})
+		}
 	} else {
 		checks = append(checks, Check{"local CA", Fail, "root certificate not found",
 			"run: switchboard setup"})

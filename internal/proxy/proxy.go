@@ -9,15 +9,12 @@
 package proxy
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strconv"
-	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
@@ -114,12 +111,25 @@ func Generate(cfg *config.Config, dataDir string) (*caddy.Config, error) {
 		},
 	}
 
+	// The root is Switchboard's, not Caddy's: we mint it with name
+	// constraints (see ca.go) and hand it over, because Caddy's PKI has no
+	// way to express them. Caddy still owns the intermediate and the leaves.
+	rootPath, err := EnsureRoot(dataDir, cfg.Suffix)
+	if err != nil {
+		return nil, err
+	}
+
 	falseVal := false
 	pkiApp := caddypki.PKI{CAs: map[string]*caddypki.CA{
 		"local": {
 			Name:                   caName,
 			RootCommonName:         caName,
 			IntermediateCommonName: caName + " - Intermediate",
+			Root: &caddypki.KeyPair{
+				Certificate: rootPath,
+				PrivateKey:  rootKeyPath(dataDir),
+				Format:      "pem_file",
+			},
 			// Trust is installed explicitly by `switchboard setup`, never
 			// implicitly at daemon start.
 			InstallTrust: &falseVal,
@@ -176,61 +186,3 @@ func Load(cfg *config.Config, dataDir string) error {
 func Stop() error { return caddy.Stop() }
 
 func caddyStorageDir(dataDir string) string { return filepath.Join(dataDir, "caddy") }
-
-// RootCertPath is where Caddy's internal PKI keeps the root CA certificate.
-func RootCertPath(dataDir string) string {
-	return filepath.Join(caddyStorageDir(dataDir), "pki", "authorities", "local", "root.crt")
-}
-
-// EnsureCA makes sure the local root CA exists without starting any
-// listeners: it loads a PKI-only Caddy config, waits for the root
-// certificate to land in storage, and shuts down. Used by `setup`, which
-// needs the root cert before the daemon has ever run.
-func EnsureCA(ctx context.Context, dataDir string) (string, error) {
-	rootPath := RootCertPath(dataDir)
-	if _, err := os.Stat(rootPath); err == nil {
-		return rootPath, nil
-	}
-
-	falseVal := false
-	cc := &caddy.Config{
-		Admin: &caddy.AdminConfig{Disabled: true},
-		Logging: &caddy.Logging{Logs: map[string]*caddy.CustomLog{
-			"default": {BaseLog: caddy.BaseLog{Level: "ERROR"}},
-		}},
-		StorageRaw: caddyconfig.JSONModuleObject(
-			filestorage.FileStorage{Root: caddyStorageDir(dataDir)},
-			"module", "file_system", nil),
-		AppsRaw: caddy.ModuleMap{
-			"pki": caddyconfig.JSON(caddypki.PKI{CAs: map[string]*caddypki.CA{
-				"local": {
-					Name:                   caName,
-					RootCommonName:         caName,
-					IntermediateCommonName: caName + " - Intermediate",
-					InstallTrust:           &falseVal,
-				},
-			}}, nil),
-		},
-	}
-	j, err := json.Marshal(cc)
-	if err != nil {
-		return "", err
-	}
-	if err := caddy.Load(j, true); err != nil {
-		return "", fmt.Errorf("provisioning CA: %w", err)
-	}
-	defer caddy.Stop() //nolint:errcheck
-
-	deadline := time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(rootPath); err == nil {
-			return rootPath, nil
-		}
-		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
-		case <-time.After(100 * time.Millisecond):
-		}
-	}
-	return "", fmt.Errorf("CA root certificate did not appear at %s", rootPath)
-}
