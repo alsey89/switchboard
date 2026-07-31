@@ -3,9 +3,11 @@ package service
 import (
 	"errors"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -286,6 +288,99 @@ func TestInstallRefusesRoot(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "sudo") {
 		t.Errorf("root-guard error should mention sudo, got: %v", err)
+	}
+}
+
+// TestInstallRefusesUnbindablePrivilegedPort is the guard against installing
+// a crash-loop. macOS reserves ports below 1024 for root and the daemon runs
+// as the user, so with the default :443 the agent exits 1 at bind time — and
+// KeepAlive{SuccessfulExit: false} means launchd relaunches it forever,
+// appending to an unrotated log. bindProbe is a package var (same style as
+// geteuid above) so this runs identically wherever the tests do, including
+// somewhere ports below 1024 happen to be bindable.
+func TestInstallRefusesUnbindablePrivilegedPort(t *testing.T) {
+	orig := bindProbe
+	bindProbe = func(_, addr string) error {
+		return &net.OpError{Op: "listen", Net: "tcp", Err: os.ErrPermission}
+	}
+	defer func() { bindProbe = orig }()
+
+	t.Setenv("HOME", t.TempDir()) // nothing may be written to the real home
+	err := Install(Spec{
+		Exec:       "/bin/x",
+		Args:       []string{"start"},
+		StdoutPath: filepath.Join(t.TempDir(), "out.log"),
+		StderrPath: filepath.Join(t.TempDir(), "err.log"),
+		ConfigPath: "/Users/me/.config/switchboard/config.toml",
+		Ports: []GuardedPort{
+			{Name: "https", Network: "tcp", Addr: "127.0.0.1:443",
+				Remedy: "    http_port  = 8080\n    https_port = 8443"},
+			{Name: "http", Network: "tcp", Addr: "127.0.0.1:80",
+				Remedy: "    http_port  = 8080\n    https_port = 8443"},
+		},
+	}, io.Discard)
+	if err == nil {
+		t.Fatal("Install should refuse a privileged port it cannot bind, got nil error")
+	}
+	// The message has to be actionable: name the port that failed, and name
+	// the escape hatch plus where to set it.
+	for _, want := range []string{"127.0.0.1:443", "https_port", "/Users/me/.config/switchboard/config.toml"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal message should mention %q, got:\n%s", want, err)
+		}
+	}
+
+	// And it must refuse *before* touching the filesystem — otherwise it
+	// leaves a plist behind for launchd to find.
+	plistPath, perr := PlistPath()
+	if perr != nil {
+		t.Fatal(perr)
+	}
+	if _, serr := os.Stat(plistPath); serr == nil {
+		t.Errorf("a plist was written at %s despite the refusal", plistPath)
+	}
+}
+
+// TestInstallAllowsPortInUse pins the narrowness of that guard. `daemon
+// install` is documented as "re-run to restart it", so on the happy path the
+// daemon being replaced is itself holding :443 and the probe fails with
+// EADDRINUSE. Treating that as fatal would break the documented restart
+// flow; only EACCES/EPERM may block an install.
+func TestInstallAllowsPortInUse(t *testing.T) {
+	orig := bindProbe
+	bindProbe = func(_, addr string) error {
+		return &net.OpError{Op: "listen", Net: "tcp", Err: syscall.EADDRINUSE}
+	}
+	defer func() { bindProbe = orig }()
+
+	err := checkPrivilegedPorts(Spec{Ports: []GuardedPort{
+		{Name: "https", Network: "tcp", Addr: "127.0.0.1:443"},
+	}})
+	if err != nil {
+		t.Errorf("an in-use privileged port must not block a reinstall/restart, got: %v", err)
+	}
+}
+
+// TestCheckPrivilegedPortsIgnoresHighPorts: the escape hatch has to actually
+// work. A user who set https_port = 8443 must be able to install.
+func TestCheckPrivilegedPortsIgnoresHighPorts(t *testing.T) {
+	orig := bindProbe
+	called := false
+	bindProbe = func(_, _ string) error {
+		called = true
+		return os.ErrPermission
+	}
+	defer func() { bindProbe = orig }()
+
+	err := checkPrivilegedPorts(Spec{Ports: []GuardedPort{
+		{Name: "https", Network: "tcp", Addr: "127.0.0.1:8443"},
+		{Name: "http", Network: "tcp", Addr: "127.0.0.1:8080"},
+	}})
+	if err != nil {
+		t.Errorf("high ports must not be guarded, got: %v", err)
+	}
+	if called {
+		t.Error("ports >= 1024 should not even be probed")
 	}
 }
 

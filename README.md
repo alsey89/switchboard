@@ -12,11 +12,20 @@ through.
 
 ```console
 $ switchboard setup            # once, ever — two password prompts
+$ $EDITOR ~/.config/switchboard/config.toml   # http_port = 8080, https_port = 8443
 $ switchboard add app 3000
 https://app.test → 127.0.0.1:3000
 $ switchboard daemon install   # runs in the background from now on
-$ open https://app.test        # green padlock
+$ open https://app.test:8443   # green padlock
 ```
+
+> **Why the port, and why that edit.** `:80` and `:443` are reserved for root
+> on macOS, and Switchboard's daemon deliberately runs as you. On a stock
+> config the daemon cannot bind them, so `switchboard daemon install` refuses
+> outright rather than installing a service that crash-loops. High ports work
+> completely — real subdomains, real certificates, no warnings — at the cost of
+> the port in the URL. Removing that cost is
+> [ADR 0001](docs/adr/0001-binding-privileged-ports-on-macos.md).
 
 ## Install
 
@@ -98,7 +107,8 @@ switchboard add api --upstream 192.168.1.5:8080
 switchboard rm <name>        remove a route
 switchboard ls               list routes and status
 switchboard doctor           diagnose setup/port/upstream problems
-switchboard uninstall        undo system setup (keeps your config)
+switchboard uninstall        undo system setup: service + resolver + CA trust
+                             (keeps your config)
 switchboard daemon install   run in the background (launchd agent, no root)
 switchboard daemon status    is it installed and running?
 switchboard daemon logs      path to the service log

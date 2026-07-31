@@ -260,8 +260,16 @@ func validateSuffix(s string) error {
 			return fmt.Errorf("invalid suffix %q: bad label %q", s, l)
 		}
 	}
-	// A multi-label suffix is a domain the user is asserting they own.
-	// Scoping the resolver to it cannot collide with anyone else's names.
+	// A multi-label suffix is a domain the user is *asserting* they own.
+	// This rule moves the collision risk onto them; it does not eliminate
+	// it. "co.uk", "com.au" and "github.io" all pass here, and writing
+	// /etc/resolver/co.uk would hijack that whole namespace machine-wide.
+	// Distinguishing a registrable domain from a public suffix requires the
+	// Public Suffix List — a new dependency, which this project's
+	// no-new-modules constraint rules out — and the list is a moving target
+	// that would then need vendoring and refreshing. So the check stays
+	// structural, and the honest framing is "you told us you own this",
+	// not "this cannot collide".
 	if len(labels) > 1 {
 		return nil
 	}

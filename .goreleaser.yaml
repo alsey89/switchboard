@@ -66,13 +66,26 @@ homebrew_casks:
     uninstall:
       launchctl:
         - io.github.alsey89.switchboard
+    # Keep in step with README.md's quickstart. `daemon install` REFUSES on a
+    # stock config — :80/:443 are root-only on macOS and the daemon runs as
+    # the user — so telling people to run it without the port edit first sends
+    # every new install straight into a hard error. See ADR 0001.
     caveats: |
-      Two one-time steps, then you're done:
+      Set up once:
 
         switchboard setup            # resolver file + trust the local CA (asks for your password)
-        switchboard daemon install   # run in the background
 
-      Then:  switchboard add app 3000  &&  open https://app.test
+      Then set high ports in ~/.config/switchboard/config.toml:
+
+        http_port  = 8080
+        https_port = 8443
+
+      macOS reserves :80/:443 for root and Switchboard runs as you, so the
+      defaults cannot bind and `daemon install` will refuse them. Everything
+      else works unchanged — real certs, no warnings — URLs just carry the port.
+
+        switchboard daemon install   # run in the background
+        switchboard add app 3000  &&  open https://app.test:8443
 
 release:
   draft: false

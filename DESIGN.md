@@ -58,14 +58,14 @@ The product is the UX and integration, not the proxy.
 | 1 | MVP scope | **Local domains + HTTPS only** (v0.1) | Smallest genuinely-useful slice; proves the hard part (DNS + certs + privilege UX) |
 | 2 | Stack | **Go, with Caddy embedded as a library** | See below. Ships in days, not weeks; borrows a decade of proxy/TLS hardening |
 | 3 | OS order | **macOS → Windows → Linux** | macOS has the cleanest story (see §5); Windows has NRPT; Linux DNS is the messiest and lands last |
-| 4 | Default TLD | **`.test`** (configurable; `.localhost` also permitted) | RFC 6761 reserves it for exactly this. `.local` collides with mDNS (RFC 6762); `.dev` is a real Google gTLD and HSTS-preloaded |
+| 4 | Default suffix | **`.test`** (configurable — see row 10 for the full permitted set: `test`, `internal`, `localhost`, or any multi-label domain the user owns) | RFC 6761 reserves `.test` for exactly this, so nothing can ever be delegated under it. `.local` collides with mDNS (RFC 6762). `.dev` and `.app` are real gTLDs Google sells — the objection is **namespace collision**, not HSTS: Switchboard serves genuinely trusted HTTPS, so HSTS preloading is satisfied. Hijacking `.dev` in the OS resolver would send `go.dev`, `web.dev` and `*.workers.dev` to 127.0.0.1 machine-wide |
 | 5 | Proxy & TLS | **Caddy's** — reverse proxy, internal PKI, trust-store install | The parts we shouldn't hand-roll; Caddy erases WS/h2/streaming edge cases and cross-platform CA install |
 | 6 | Inspector (v0.2) | **Custom Caddy handler module**, compiled into our binary | Caddy modules are plain Go registered at build time; ~300 lines to tee traffic into SQLite |
 | 7 | GUI | **Web dashboard served by the daemon** (at `https://switchboard.<suffix>`); a native *tray* item, not a native dashboard, if/when we want glanceability | Zero framework cost, and once the daemon runs under launchd there is no terminal for a TUI to draw in. The only thing the web dashboard genuinely can't do is be glanceable — that's a menu-bar item, not a Wails port |
 | 8 | Business model | **Open-core; tunnel relay is the only paid surface** | See §1 |
 | 9 | License | **Apache-2.0** | Matches Caddy (no compatibility analysis needed) and carries an explicit patent grant, which matters more for infrastructure than for a library |
-| 10 | Domain suffix policy | **Reserved single-label TLDs (`test`, `internal`, `localhost`) or any multi-label domain the user owns** | A bare non-reserved TLD is or could become real; hijacking it in the OS resolver breaks real sites machine-wide. Multi-label means the user owns it, so collision is impossible |
-| 11 | Distribution | **GoReleaser → GitHub releases + a Homebrew tap** (`alsey89/homebrew-tap`) | `brew install` is table stakes for a dev CLI. Notarization is deferred: it needs a paid Apple Developer account, and Homebrew formula installs aren't quarantined, so it only affects browser downloads |
+| 10 | Domain suffix policy | **Reserved single-label TLDs (`test`, `internal`, `localhost`) or any multi-label domain the user owns** | A bare non-reserved TLD is or could become real; hijacking it in the OS resolver breaks real sites machine-wide. A multi-label suffix is the user *asserting* they own it — the rule shifts the collision risk onto them, it does not remove it. `co.uk`, `com.au` and `github.io` all pass validation, and `/etc/resolver/co.uk` would hijack that namespace machine-wide. Telling those apart needs a public-suffix list; that means a new dependency, which the no-new-modules constraint rules out, so the policy stands as-is with the risk named honestly |
+| 11 | Distribution | **GoReleaser → GitHub releases + a Homebrew cask** (`alsey89/homebrew-tap`) | `brew install` is table stakes for a dev CLI; a cask is the right shape for a prebuilt binary (a formula would imply building from source). Notarization is deferred: it needs a paid Apple Developer account. Note casks **do** quarantine their payload, unlike formulae — hence the `xattr -dr com.apple.quarantine` post-install hook in `.goreleaser.yaml`. Without it Gatekeeper blocks the binary outright, so this is not a browser-download-only concern |
 
 ### Why Go + Caddy (and the road not taken)
 
@@ -91,8 +91,10 @@ considered and fully designed — see fe3533d. What decided it:
 
 ## 3. Architecture (v0.1, macOS)
 
-One unprivileged user-space Go binary. No root daemon — see §5 for why
-macOS permits this.
+One unprivileged user-space Go binary. No root daemon — DNS needs no
+privilege thanks to `/etc/resolver`'s `port` directive (§5). The `:80`/`:443`
+listeners in the diagram below are the unresolved part of that goal: they
+*do* need privilege on macOS, and how to get it is an open problem (§5).
 
 ```
                       ┌─────────────────────────────────────────────┐
@@ -115,7 +117,7 @@ macOS permits this.
                       │    unknown host → branded "no route" page   │
                       └─────────────────────────────────────────────┘
 
-  One-time `switchboard setup` (two admin prompts, then never again):
+  One-time `switchboard setup` (two admin prompts; ADR 0001 may add a third):
     1. write /etc/resolver/test  (nameserver 127.0.0.1, port 53535)
     2. install Caddy's root CA into the System Keychain (Smallstep truststore)
 ```
@@ -234,15 +236,44 @@ switchboard doctor             # port conflicts, resolver state, CA trust state
 With Caddy handling TLS + trust stores everywhere, per-OS work reduces to
 **DNS routing + service packaging**.
 
-### macOS (v0.1) — the easy one, two lucky breaks
+### macOS (v0.1) — the easy one, one lucky break and one open problem
 
-1. **Since Mojave (10.14), unprivileged processes may bind ports < 1024** —
-   the daemon binds :80/:443 as the user. No root, no helper daemon.
-2. **`/etc/resolver/<tld>` files support a `port` directive** — DNS listens
-   on 53535, no fight over :53. (puma-dev ships exactly this pattern.)
+1. **`/etc/resolver/<suffix>` files support a `port` directive** — DNS listens
+   on 53535, no fight over :53. (puma-dev ships exactly this pattern.) This
+   is the lucky break: it is what removes any need for a privileged DNS
+   listener.
 
-Total privileged surface: two one-shot admin prompts in `setup`
-(write resolver file, install CA trust). Everything else runs as the user.
+2. **:80/:443 are still root-only — OPEN PROBLEM.** Earlier revisions of this
+   document claimed macOS had lifted the <1024 restriction since Mojave.
+   That is false, and it was never true: macOS enforces the classic Unix
+   boundary like every other Unix. Verified on macOS 15 (Darwin 25.5.0) as
+   uid 501 — binding `127.0.0.1:80`, `:443` and `:1023` all fail with
+   `permission denied`; `:1024` succeeds.
+
+   So an unprivileged daemon on the default ports cannot start. Today the
+   only working answer is the escape hatch already contemplated above in §4:
+   set `http_port`/`https_port` to high ports and accept `:8443` in URLs.
+   The real options — pf redirect from 443, a root LaunchDaemon or helper,
+   launchd socket activation (which binds privileged sockets and passes them
+   to an unprivileged job), or simply defaulting to high ports — trade off
+   differently on privilege, install friction, and URL aesthetics. They are
+   weighed in full, with the measurements and the rejected alternatives, in
+   [ADR 0001](docs/adr/0001-binding-privileged-ports-on-macos.md).
+
+   **Decided there:** a small privileged parent binds :80/:443, drops
+   privileges, and spawns the daemon as the user with the listeners inherited
+   as file descriptors. That is a separate piece of work, gated on the open
+   questions the ADR records; none of it is implemented yet.
+
+   Until it is: `switchboard daemon install` refuses when a configured port
+   below 1024 is genuinely unbindable, rather than installing a launch agent
+   that crash-loops (`KeepAlive{SuccessfulExit: false}` relaunches a failing
+   daemon forever, throttled to roughly every 10s, into an unrotated log).
+
+Privileged surface *today*: two one-shot admin prompts in `setup` (write
+resolver file, install CA trust). Everything else runs as the user — but
+that holds only on high ports; whatever resolves the open problem above may
+add a third privileged step or a one-time helper install.
 
 ### Windows (v0.4) — NRPT is the /etc/resolver equivalent
 

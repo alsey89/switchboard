@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +15,9 @@ import (
 	"time"
 
 	"howett.net/plist"
+
+	"github.com/alsey89/switchboard/internal/config"
+	"github.com/alsey89/switchboard/internal/netprobe"
 )
 
 // PlistPath is where the launch agent definition lives. A *user* agent
@@ -104,6 +108,71 @@ var bootstrapRetryDelay = 200 * time.Millisecond
 // bootstrapAttempts bounds the retries in bootstrapWithRetry.
 const bootstrapAttempts = 3
 
+// bindProbe is netprobe.Bindable, indirected so tests can exercise the
+// privileged-port guard without depending on the machine's real privileges
+// (and without actually binding anything).
+var bindProbe = netprobe.Bindable
+
+// checkPrivilegedPorts refuses to install an agent that cannot possibly
+// start.
+//
+// macOS enforces the classic Unix restriction: an unprivileged process
+// cannot bind a port below 1024. The daemon's defaults are :80 and :443, so
+// on a stock configuration `switchboard start` exits 1 at bind time — and
+// the launch agent sets KeepAlive{SuccessfulExit: false}, which means
+// launchd relaunches it forever (throttled to roughly every 10s), appending
+// to an unrotated log the whole time. Installing that is worse than
+// refusing to.
+//
+// Only EACCES/EPERM counts. An in-use port must NOT block the install:
+// `daemon install` is documented as "re-run to restart it", so on the happy
+// path the daemon we are about to replace is itself holding :443, and
+// treating that as fatal would break the documented restart flow.
+func checkPrivilegedPorts(s Spec) error {
+	for _, p := range s.Ports {
+		port, err := strconv.Atoi(portOf(p.Addr))
+		if err != nil || port >= 1024 {
+			continue
+		}
+		if err := bindProbe(p.Network, p.Addr); err == nil || !errors.Is(err, os.ErrPermission) {
+			continue
+		}
+		remedy := p.Remedy
+		if remedy == "" {
+			remedy = "    (raise this listener's port above 1024)"
+		}
+		return fmt.Errorf("cannot bind %s for %s: permission denied.\n"+
+			"  macOS reserves ports below 1024 for root, and the daemon runs as you — so this\n"+
+			"  agent would fail at startup and be relaunched by launchd in a loop.\n\n"+
+			"  Use a high port instead, in %s:\n\n"+
+			"%s\n\n"+
+			"  then re-run `switchboard daemon install`. Proxy URLs grow the port\n"+
+			"  (https://app.test:8443); that is the documented trade-off.",
+			p.Addr, p.Name, configPathFor(s), remedy)
+	}
+	return nil
+}
+
+// configPathFor names the config file in user-facing errors, falling back to
+// the conventional location if the Spec somehow lacks one.
+func configPathFor(s Spec) string {
+	if s.ConfigPath != "" {
+		return s.ConfigPath
+	}
+	if p, err := config.Path(); err == nil {
+		return p
+	}
+	return "~/.config/switchboard/config.toml"
+}
+
+func portOf(addr string) string {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	return port
+}
+
 // Install writes the plist and bootstraps the agent. Safe to re-run: an
 // already-loaded agent is booted out first, so this doubles as "restart".
 func Install(s Spec, out io.Writer) error {
@@ -117,6 +186,12 @@ func Install(s Spec, out io.Writer) error {
 		return errors.New("run `switchboard daemon install` without sudo — a launch agent " +
 			"installed as root loads into a different launchd domain (gui/0) than your own " +
 			"session, so you'd never see it running. The daemon always runs as you, never as root")
+	}
+
+	// Refuse before writing anything: an agent that can't bind its ports
+	// doesn't fail, it crash-loops. See checkPrivilegedPorts.
+	if err := checkPrivilegedPorts(s); err != nil {
+		return err
 	}
 
 	plistPath, err := PlistPath()

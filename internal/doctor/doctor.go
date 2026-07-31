@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/alsey89/switchboard/internal/config"
+	"github.com/alsey89/switchboard/internal/netprobe"
 	"github.com/alsey89/switchboard/internal/proxy"
 )
 
@@ -108,7 +109,7 @@ func bindChecks(cfg *config.Config) []Check {
 		{"port https", "tcp", "127.0.0.1:" + strconv.Itoa(cfg.EffHTTPSPort())},
 		{"port dns", "udp", "127.0.0.1:" + strconv.Itoa(cfg.EffDNSPort())},
 	} {
-		if err := bindable(p.net, p.addr); err != nil {
+		if err := netprobe.Bindable(p.net, p.addr); err != nil {
 			hint := "find the conflict: lsof -nP -i:" + portOf(p.addr)
 			if runtime.GOOS == "linux" {
 				hint += "  (or, for <1024: sudo setcap cap_net_bind_service=+ep $(which switchboard))"
@@ -129,24 +130,6 @@ func dialable(addr string) bool {
 	}
 	c.Close()
 	return true
-}
-
-func bindable(network, addr string) error {
-	switch network {
-	case "udp":
-		pc, err := net.ListenPacket("udp", addr)
-		if err != nil {
-			return err
-		}
-		pc.Close()
-	default:
-		ln, err := net.Listen("tcp", addr)
-		if err != nil {
-			return err
-		}
-		ln.Close()
-	}
-	return nil
 }
 
 func portOf(addr string) string {

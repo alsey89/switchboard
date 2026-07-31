@@ -278,3 +278,59 @@ func dialable(host string, port int) bool {
 	c.Close()
 	return true
 }
+
+// TestFriendlyBindErrorAdvisesTheRightSetting guards a defect that reads as a
+// typo but sends users to the wrong file. friendlyBindError is shared by all
+// four listeners, and its permission-denied branch used to hardcode
+// http_port/https_port — so a DNS responder that failed to bind advised
+// changing the proxy's ports, a setting with no bearing on the error.
+//
+// Each listener must be advised about its own setting, and must not be
+// advised about another's.
+func TestFriendlyBindErrorAdvisesTheRightSetting(t *testing.T) {
+	denied := &net.OpError{Op: "listen", Net: "tcp", Err: os.ErrPermission}
+
+	for _, tc := range []struct {
+		what    string
+		want    string
+		notWant []string
+	}{
+		{what: "proxy", want: "https_port", notWant: []string{"dns_port", "dashboard_port"}},
+		{what: "DNS", want: "dns_port", notWant: []string{"https_port", "dashboard_port"}},
+		{what: "dashboard", want: "dashboard_port", notWant: []string{"https_port", "dns_port"}},
+	} {
+		t.Run(tc.what, func(t *testing.T) {
+			err := friendlyBindError(denied, tc.what, "127.0.0.1:443", "/tmp/config.toml")
+			if err == nil {
+				t.Fatal("permission denied should produce a decorated error")
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, tc.want) {
+				t.Errorf("%s advice should name %q, got:\n%s", tc.what, tc.want, msg)
+			}
+			for _, nw := range tc.notWant {
+				if strings.Contains(msg, nw) {
+					t.Errorf("%s advice should not mention %q — that is another "+
+						"listener's setting. Got:\n%s", tc.what, nw, msg)
+				}
+			}
+			// The failing address and the config file are what make it actionable.
+			if !strings.Contains(msg, "127.0.0.1:443") || !strings.Contains(msg, "/tmp/config.toml") {
+				t.Errorf("%s advice must name the address and the config file, got:\n%s", tc.what, msg)
+			}
+		})
+	}
+}
+
+// TestFriendlyBindErrorPassesThroughUnknownCauses: only the two causes with
+// real advice get decorated. Anything else must reach the user unchanged
+// rather than wearing a misleading privileged-port explanation.
+func TestFriendlyBindErrorPassesThroughUnknownCauses(t *testing.T) {
+	orig := fmt.Errorf("some unrelated failure")
+	if got := friendlyBindError(orig, "proxy", "127.0.0.1:8443", ""); got != orig {
+		t.Errorf("unknown cause should pass through unchanged, got: %v", got)
+	}
+	if got := friendlyBindError(nil, "proxy", "127.0.0.1:8443", ""); got != nil {
+		t.Errorf("nil error should stay nil, got: %v", got)
+	}
+}
