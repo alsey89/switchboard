@@ -3,6 +3,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -317,7 +318,11 @@ func cmdDoctor(flagConfig *string) *cobra.Command {
 func cmdUninstall(flagConfig *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "uninstall",
-		Short: "Undo system setup (resolver + CA trust); keeps your config file",
+		Short: "Undo system setup: background service, resolver, and CA trust; keeps your config file",
+		Long: "Undo everything `switchboard setup` and `switchboard daemon install` put on\n" +
+			"this system: the background service, the resolver file, and the trusted CA.\n" +
+			"Your config file and CA material under ~/.config/switchboard are left alone,\n" +
+			"so deleting that directory afterwards is a genuinely full reset.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			p, err := resolvePaths(*flagConfig)
 			if err != nil {
@@ -327,10 +332,32 @@ func cmdUninstall(flagConfig *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := setup.Remove(cfg, p.dataDir, cmd.OutOrStdout()); err != nil {
+			out := cmd.OutOrStdout()
+
+			// Remove the launch agent first, and before anything else can
+			// fail. Leaving it behind made this command's own closing advice
+			// wrong: the plist lives in ~/Library/LaunchAgents, so it
+			// survived both `switchboard uninstall` and the `rm -rf` this
+			// used to suggest — and `rm -rf`ing the config dir while the
+			// agent is still loaded leaves launchd respawning a daemon whose
+			// config no longer exists. ErrUnsupported just means this
+			// platform has no service automation yet, which is not a failure
+			// of uninstalling.
+			// Best-effort, not a gate. Uninstall exists to get system state
+			// back off the machine; aborting here on an unexpected launchd
+			// failure would strand the resolver file and the trusted CA —
+			// the two things that actually alter how the whole system
+			// behaves. Report and keep going. ErrUnsupported is not even a
+			// failure: it just means this platform has no service automation.
+			if _, err := service.Uninstall(out); err != nil && !errors.Is(err, service.ErrUnsupported) {
+				fmt.Fprintf(out, "  warning: could not remove the background service: %v\n", err)
+				fmt.Fprintf(out, "  continuing — remove it by hand, then re-run this command\n")
+			}
+
+			if err := setup.Remove(cfg, p.dataDir, out); err != nil {
 				return err
 			}
-			fmt.Fprintf(cmd.OutOrStdout(),
+			fmt.Fprintf(out,
 				"system setup removed ✓\nconfig and CA files kept in %s — delete that directory for a full reset\n",
 				mustDir())
 			return nil
@@ -380,7 +407,18 @@ func cmdDaemonInstall(flagConfig *string) *cobra.Command {
 		Use:   "install",
 		Short: "Install and start the background service (re-run to restart it)",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			spec, err := service.DefaultSpec(*flagConfig)
+			p, err := resolvePaths(*flagConfig)
+			if err != nil {
+				return err
+			}
+			// The spec needs the configured ports: Install refuses rather
+			// than installing an agent that would crash-loop on a port it
+			// cannot bind.
+			cfg, err := config.Load(p.configPath)
+			if err != nil {
+				return err
+			}
+			spec, err := service.DefaultSpec(cfg, *flagConfig)
 			if err != nil {
 				return err
 			}

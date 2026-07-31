@@ -5,7 +5,9 @@
 // Philosophy: the daemon itself always runs unprivileged. Only these
 // one-shot steps elevate, each as a separate, visible command (printed
 // before it runs), so the user can see exactly what they are consenting to.
-// On macOS that is two `sudo` prompts, ever. See DESIGN.md §5.
+// On macOS that is two `sudo` prompts today — and only because the daemon is
+// confined to high ports. Binding :80/:443 needs privilege from somewhere,
+// and resolving that (ADR 0001) is expected to add a third one-time step.
 package setup
 
 import (

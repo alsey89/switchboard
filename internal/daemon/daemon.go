@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -48,7 +49,7 @@ func Run(ctx context.Context, opts Options) error {
 	dns := dnsd.New([]string{cfg.Suffix})
 	dnsBind := net.JoinHostPort("127.0.0.1", strconv.Itoa(cfg.EffDNSPort()))
 	if err := dns.Start(dnsBind); err != nil {
-		return friendlyBindError(err, "DNS", dnsBind)
+		return friendlyBindError(err, "DNS", dnsBind, opts.ConfigPath)
 	}
 	defer dns.Shutdown(context.Background()) //nolint:errcheck
 	log.Info("dns responder up", "addr", dnsBind, "suffix", "."+cfg.Suffix)
@@ -57,13 +58,13 @@ func Run(ctx context.Context, opts Options) error {
 	dash := dashboard.New(cfg, opts.Version)
 	dashBind := net.JoinHostPort("127.0.0.1", strconv.Itoa(cfg.EffDashboardPort()))
 	if err := dash.Start(dashBind); err != nil {
-		return friendlyBindError(err, "dashboard", dashBind)
+		return friendlyBindError(err, "dashboard", dashBind, opts.ConfigPath)
 	}
 	defer dash.Shutdown(context.Background()) //nolint:errcheck
 
 	// Embedded Caddy: proxy + TLS + PKI.
 	if err := proxy.Load(cfg, opts.DataDir); err != nil {
-		return friendlyBindError(err, "proxy", "127.0.0.1:"+strconv.Itoa(cfg.EffHTTPSPort()))
+		return friendlyBindError(err, "proxy", "127.0.0.1:"+strconv.Itoa(cfg.EffHTTPSPort()), opts.ConfigPath)
 	}
 	defer proxy.Stop() //nolint:errcheck
 	log.Info("proxy up",
@@ -142,8 +143,24 @@ func Run(ctx context.Context, opts Options) error {
 	}
 }
 
-// friendlyBindError decorates address-in-use errors with actionable advice.
-func friendlyBindError(err error, what, addr string) error {
+// listenerRemedy is the config snippet a given listener's permission-denied
+// error should suggest. Keyed by the `what` passed to friendlyBindError.
+//
+// This exists because the advice used to be hardcoded to http_port/https_port
+// for every caller, which was right for the proxy and wrong for the other two:
+// a user told to set https_port after the DNS responder failed to bind would
+// change a setting unrelated to the error they were reading.
+var listenerRemedy = map[string]string{
+	"proxy":     "    http_port  = 8080\n    https_port = 8443\n\n  URLs then carry the port (https://app.test:8443).",
+	"DNS":       "    dns_port = 53535\n\n  The /etc/resolver file must name the same port — re-run `switchboard setup`.",
+	"dashboard": "    dashboard_port = 8484",
+}
+
+// friendlyBindError decorates bind failures with actionable advice.
+// cfgPath is named in the advice, so the user can act on it without first
+// having to work out which config file this daemon was started with.
+// what must be a key of listenerRemedy.
+func friendlyBindError(err error, what, addr, cfgPath string) error {
 	if err == nil {
 		return nil
 	}
@@ -156,11 +173,39 @@ func friendlyBindError(err error, what, addr string) error {
 			what, addr, portOf(addr), portOf(addr), err)
 	}
 	if strings.Contains(msg, "permission denied") {
+		// Do not claim macOS exempts unprivileged processes from the <1024
+		// restriction. It does not — that claim used to be printed directly
+		// beneath this very error, which made the message self-refuting.
+		hint := "  Ports below 1024 are reserved for root, and Switchboard runs as you.\n"
+		if runtime.GOOS == "linux" {
+			hint += "  Either grant the capability:\n" +
+				"    sudo setcap cap_net_bind_service=+ep $(which switchboard)\n" +
+				"  or use high ports"
+		} else {
+			hint += "  Use high ports"
+		}
+		remedy, ok := listenerRemedy[what]
+		if !ok {
+			remedy = "    (raise the port for this listener above 1024)"
+		}
 		return fmt.Errorf("%s cannot bind %s: permission denied.\n"+
-			"  On Linux, ports <1024 need: sudo setcap cap_net_bind_service=+ep $(which switchboard)\n"+
-			"  (macOS 10.14+ allows this without privileges.)\n  (%w)", what, addr, err)
+			"%s in %s:\n\n"+
+			"%s\n  (%w)",
+			what, addr, hint, configPathOr(cfgPath), remedy, err)
 	}
 	return err
+}
+
+// configPathOr names the config file for an error message, falling back to
+// the conventional location when the daemon was started without one.
+func configPathOr(cfgPath string) string {
+	if cfgPath != "" {
+		return cfgPath
+	}
+	if p, err := config.Path(); err == nil {
+		return p
+	}
+	return "~/.config/switchboard/config.toml"
 }
 
 func portOf(addr string) string {
