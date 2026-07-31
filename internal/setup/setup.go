@@ -40,6 +40,14 @@ func Run(ctx context.Context, cfg *config.Config, dataDir string, out io.Writer)
 			"root would create the CA under root's home instead of yours")
 	}
 
+	if notice := AuthNotice(); len(notice) > 0 {
+		fmt.Fprintln(out, "this needs your authorization:")
+		for _, n := range notice {
+			fmt.Fprintf(out, "  • %s\n", n)
+		}
+		fmt.Fprintln(out)
+	}
+
 	// 1. Make sure the CA exists (unprivileged; must happen before trust).
 	// Switchboard mints this root itself rather than asking Caddy for one,
 	// so that it can carry name constraints — see internal/proxy/ca.go. A
@@ -138,12 +146,15 @@ func rotateCA(cfg *config.Config, dataDir string, out io.Writer) (string, error)
 	return rootPath, nil
 }
 
-// Remove undoes Run (leaves config and CA files on disk).
-func Remove(cfg *config.Config, dataDir string, out io.Writer) error {
+// Remove undoes Run (leaves config and CA files on disk). removed reports
+// whether there was anything to undo, so callers do not announce success for
+// a machine that was already clean.
+func Remove(cfg *config.Config, dataDir string, out io.Writer) (removed bool, err error) {
+	removed = systemSetupPresent(cfg, dataDir)
 	if err := removeResolver(cfg.Suffix, out); err != nil {
-		return err
+		return removed, err
 	}
-	return removeTrust(proxy.RootCertPath(dataDir), out)
+	return removed, removeTrust(proxy.RootCertPath(dataDir), out)
 }
 
 // runVisible prints a command, then runs it attached to the user's terminal

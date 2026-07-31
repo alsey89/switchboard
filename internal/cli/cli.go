@@ -91,9 +91,17 @@ func cmdVersion() *cobra.Command {
 }
 
 func cmdSetup(flagConfig *string) *cobra.Command {
-	return &cobra.Command{
+	var noService bool
+	c := &cobra.Command{
 		Use:   "setup",
-		Short: "One-time system setup: resolver + trusted local CA (asks for your password)",
+		Short: "Get Switchboard working: resolver, trusted CA, and the background service",
+		Long: "Do everything needed to make Switchboard work on this machine:\n" +
+			"  • create the local CA, constrained to your domain suffix\n" +
+			"  • point the OS resolver at Switchboard's DNS\n" +
+			"  • trust the CA in your login keychain\n" +
+			"  • install the background service so it keeps running\n\n" +
+			"`switchboard uninstall` undoes all four. Use --no-service to skip the\n" +
+			"last one and run the daemon yourself with `switchboard start`.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			p, err := resolvePaths(*flagConfig)
 			if err != nil {
@@ -108,15 +116,48 @@ func cmdSetup(flagConfig *string) *cobra.Command {
 				return err
 			}
 			out := cmd.OutOrStdout()
-			fmt.Fprintln(out, "\nsetup complete ✓")
 			for _, n := range append(res.ResolverNotes, res.TrustNotes...) {
 				fmt.Fprintln(out, "  •", n)
 			}
-			fmt.Fprintf(out, "\nnext:\n  switchboard add app %s\n  switchboard start\n  open https://app.%s\n",
-				"3000", cfg.Suffix)
+			// Install the background service too, unless told not to.
+			//
+			// Without this, `setup` installed two of the three things
+			// `uninstall` removes, and the missing one was the difference
+			// between "setup complete ✓" and anything actually working. The
+			// gap was discoverable only by running `start`, failing on :443,
+			// and reading the remedy — which is a poor way to learn that a
+			// step exists.
+			if !noService {
+				fmt.Fprintln(out, "\n→ installing the background service…")
+				if err := installService(cmd, cfg, *flagConfig, out); err != nil {
+					fmt.Fprintf(out, "  could not install it: %v\n", err)
+					fmt.Fprintln(out, "  system setup is done — install the service with: switchboard daemon install")
+					return nil
+				}
+			}
+
+			fmt.Fprintln(out, "\nsetup complete ✓")
+			if noService {
+				fmt.Fprintf(out, "\nnext:\n  switchboard add app 3000\n  switchboard daemon install"+
+					"   (or run it yourself: switchboard start)\n  open https://app.%s\n", cfg.Suffix)
+			} else {
+				fmt.Fprintf(out, "\nnext:\n  switchboard add app 3000\n  open https://app.%s\n", cfg.Suffix)
+			}
 			return nil
 		},
 	}
+	c.Flags().BoolVar(&noService, "no-service", false,
+		"do not install the background service; run the daemon yourself with `switchboard start`")
+	return c
+}
+
+// installService installs (or restarts) the background service for cfg.
+func installService(cmd *cobra.Command, cfg *config.Config, flagConfig string, out io.Writer) error {
+	spec, err := service.DefaultSpec(cfg, flagConfig)
+	if err != nil {
+		return err
+	}
+	return service.Install(spec, out)
 }
 
 func cmdStart(flagConfig *string) *cobra.Command {
@@ -284,6 +325,12 @@ func cmdSuffix(flagConfig *string) *cobra.Command {
 			fmt.Fprintf(out, "  • re-issue the local CA, constrained to .%s\n", next)
 			fmt.Fprintf(out, "  • invalidate every certificate issued for .%s\n", old)
 			fmt.Fprintf(out, "  • replace /etc/resolver/%s with /etc/resolver/%s\n", old, next)
+			if notice := setup.AuthNotice(); len(notice) > 0 {
+				fmt.Fprintln(out, "\nyou will be asked to authorize this:")
+				for _, n := range notice {
+					fmt.Fprintf(out, "  • %s\n", n)
+				}
+			}
 			if !yes {
 				fmt.Fprint(out, "\ncontinue? [y/N] ")
 				var answer string
@@ -319,6 +366,17 @@ func cmdSuffix(flagConfig *string) *cobra.Command {
 	}
 	c.Flags().BoolVar(&yes, "yes", false, "skip the confirmation prompt")
 	return c
+}
+
+// removeBinaryHint suggests how to remove the executable, based on where it
+// is. Getting this wrong is worse than omitting it: telling a Homebrew user
+// to `rm` the binary leaves brew believing the cask is still installed.
+func removeBinaryHint(exe string) string {
+	if strings.Contains(exe, "/Cellar/") || strings.Contains(exe, "/Caskroom/") ||
+		strings.HasPrefix(exe, "/opt/homebrew/") || strings.HasPrefix(exe, "/usr/local/Homebrew/") {
+		return "brew uninstall switchboard"
+	}
+	return "sudo rm " + exe
 }
 
 // restartService restarts the background service if there is one, so the
@@ -595,17 +653,37 @@ func cmdUninstall(flagConfig *string) *cobra.Command {
 			// the two things that actually alter how the whole system
 			// behaves. Report and keep going. ErrUnsupported is not even a
 			// failure: it just means this platform has no service automation.
-			if _, err := service.Uninstall(out); err != nil && !errors.Is(err, service.ErrUnsupported) {
+			removedService, err := service.Uninstall(out)
+			if err != nil && !errors.Is(err, service.ErrUnsupported) {
 				fmt.Fprintf(out, "  warning: could not remove the background service: %v\n", err)
 				fmt.Fprintf(out, "  continuing — remove it by hand, then re-run this command\n")
 			}
 
-			if err := setup.Remove(cfg, p.dataDir, out); err != nil {
+			removedSetup, err := setup.Remove(cfg, p.dataDir, out)
+			if err != nil {
 				return err
 			}
-			fmt.Fprintf(out,
-				"system setup removed ✓\nconfig and CA files kept in %s — delete that directory for a full reset\n",
-				mustDir())
+
+			if !removedService && !removedSetup {
+				fmt.Fprintln(out, "\nnothing to remove — no system setup was in place")
+			} else {
+				fmt.Fprintln(out, "\nsystem setup removed ✓")
+			}
+			fmt.Fprintf(out, "  kept: your config and CA files in %s\n", mustDir())
+			fmt.Fprintln(out, "        (delete that directory to also discard your routes and CA)")
+
+			// Say that the program is still installed, because "uninstall"
+			// does not mean here what it means for a package manager. This
+			// command undoes what `setup` and `daemon install` did to the
+			// system; removing the binary belongs to whatever installed it,
+			// and a program deleting its own executable would be a poor idea
+			// besides. Leaving it unsaid means the user reads "uninstall ✓",
+			// finds the command still on their PATH, and has to guess which
+			// of the two is lying.
+			if exe, err := os.Executable(); err == nil {
+				fmt.Fprintf(out, "  still installed: the switchboard binary at %s\n", exe)
+				fmt.Fprintf(out, "        remove it with: %s\n", removeBinaryHint(exe))
+			}
 			return nil
 		},
 	}
@@ -670,6 +748,13 @@ func cmdDaemonInstall(flagConfig *string) *cobra.Command {
 			}
 			out := cmd.OutOrStdout()
 			fmt.Fprintf(out, "→ installing %s\n", service.Label)
+			// Only the launch daemon elevates. A user agent needs nothing, and
+			// claiming otherwise would train people to expect a prompt that
+			// never comes.
+			if spec.Mode == service.ModeDaemon {
+				fmt.Fprintln(out, "  :443 and :80 need a privileged parent, so this asks for your")
+				fmt.Fprintln(out, "  password in this terminal (sudo). The proxy itself still runs as you.")
+			}
 			if err := service.Install(spec, out); err != nil {
 				return err
 			}

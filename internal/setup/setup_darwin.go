@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/alsey89/switchboard/internal/config"
 	"github.com/alsey89/switchboard/internal/proxy"
 )
 
@@ -31,16 +32,21 @@ func sha1Sum(b []byte) []byte {
 // A multi-label suffix works the same way: /etc/resolver/dev.example.com
 // matches that domain and all its subdomains.
 
-// resolverDir is /etc/resolver, as a var so tests can redirect it.
+// ResolverDir is /etc/resolver, as a var so tests can redirect it.
+//
+// Exported because the isolation is needed from other packages too: a CLI
+// test that drives `switchboard uninstall` end to end reaches this path, and
+// without a way to redirect it the test issues `sudo rm` against the real
+// /etc/resolver of whatever machine runs the suite.
 //
 // As a literal it made tests depend on the developer's own machine:
 // removeResolver short-circuits when the file does not exist, so an assertion
 // that the old suffix's file is removed passed or failed according to what
 // happened to be in /etc/resolver at the time. That is the third test in this
 // package to be caught reaching real system paths.
-var resolverDir = "/etc/resolver"
+var ResolverDir = "/etc/resolver"
 
-func resolverFilePath(suffix string) string { return filepath.Join(resolverDir, suffix) }
+func resolverFilePath(suffix string) string { return filepath.Join(ResolverDir, suffix) }
 
 // ResolverFileContents is exported for doctor to compare against.
 func ResolverFileContents(dnsPort int) string {
@@ -104,6 +110,45 @@ func removeResolver(suffix string, out io.Writer) error {
 	}
 	runVisible(out, "killall", "-HUP", "mDNSResponder") //nolint:errcheck
 	return nil
+}
+
+// systemSetupPresent reports whether anything setup installed is still on the
+// machine. Used so `uninstall` does not announce success for a machine that
+// was already clean — which is indistinguishable, to the reader, from having
+// actually undone something.
+func systemSetupPresent(cfg *config.Config, dataDir string) bool {
+	if _, err := os.Stat(resolverFilePath(cfg.Suffix)); err == nil {
+		return true
+	}
+	trusted, err := isTrusted(proxy.RootCertPath(dataDir))
+	return err == nil && trusted
+}
+
+// AuthNotice describes the authorization prompts a `setup` will produce, so
+// callers can warn before starting rather than let them arrive unannounced.
+//
+// The keychain one is worth calling out specifically. It is a separate window
+// that macOS may open behind whatever is in front, so someone who confirms and
+// looks away sees nothing happen and reasonably concludes it hung. An
+// unannounced password prompt is also the exact shape of the thing people are
+// taught to cancel.
+//
+// The focus note is not padding. The dialog shows the Touch ID prompt whether
+// or not it has focus, but the sensor is only armed while it is frontmost —
+// so an unfocused dialog displays a fingerprint icon that does nothing. That
+// was mistaken first for macOS rationing Touch ID on a schedule of its own,
+// and then for the prompt not offering it at all. Both were wrong in the same
+// direction: the icon is there, it just will not respond.
+//
+// The counts are deliberately vague. sudo caches its timestamp and macOS
+// reuses keychain authorizations under rules of its own, so a precise promise
+// would be wrong often enough to be worse than none.
+func AuthNotice() []string {
+	return []string{
+		"in this terminal, for the system files (sudo)",
+		"in a macOS dialog window, for the keychain — it can open behind other windows;" +
+			" click it to focus, or Touch ID will not respond",
+	}
 }
 
 // userKeychain resolves the login keychain — the user's own trust domain.

@@ -72,6 +72,10 @@ from `sudo`, insisting that "trust a new certificate authority" be a
 deliberate human act. It is un-scriptable by design, which is the property
 you want here.
 
+That dialog can open behind whatever is in front. Click it to focus before
+authorizing: Touch ID is only armed while it is the frontmost window, and
+unfocused it silently offers password entry alone.
+
 **Nothing user-writable steers a root process.** The parent's ports are
 hardcoded, never read from the config file. This is deliberate and is the
 security crux: a config-driven parent would be a "root will bind whatever
@@ -136,6 +140,16 @@ and knows nothing about UDP.
 
 ### `switchboard setup` — once, ever
 
+Does everything needed to make Switchboard work, and is the exact inverse of
+`switchboard uninstall`. That symmetry is deliberate: `setup` used to install
+two of the three things `uninstall` removed, and the missing one — the
+background service — was the difference between "setup complete ✓" and
+anything actually working. It was discoverable only by running `start`,
+failing to bind :443, and reading the remedy out of the error.
+
+`--no-service` skips the last step for anyone who would rather run the daemon
+themselves.
+
 1. Mints the root CA if absent (unprivileged, pure `crypto/x509`), with name
    constraints pinning it to your suffix.
 2. **sudo:** creates `/etc/resolver` if needed and writes
@@ -155,7 +169,10 @@ for it — and would put the trust in root's keychain rather than yours.
 Writes a route to your config. If the daemon is running it hot-reloads within
 about 200ms; if not, it tells you. Nothing privileged.
 
-### `switchboard daemon install` — once, ever
+### `switchboard daemon install`
+
+Run by `setup`; also available on its own to restart the service or to pick up
+a new binary after an upgrade.
 
 **sudo:** stages a root-owned copy of the binary, writes the LaunchDaemon
 plist, and bootstraps it into the system domain. Re-run it any time to

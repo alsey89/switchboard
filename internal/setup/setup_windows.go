@@ -2,12 +2,22 @@ package setup
 
 import (
 	"fmt"
+	"github.com/alsey89/switchboard/internal/config"
 	"io"
 )
 
 // Windows automation lands in v0.4 (see DESIGN.md §5): NRPT is the
 // /etc/resolver equivalent, with a hosts-file block as fallback. Until
 // then, setup prints exact manual steps.
+
+// AuthNotice describes the authorization prompts setup will produce. Windows
+// automation is not implemented yet (v0.4); setup prints manual steps.
+// systemSetupPresent reports whether anything setup installed is still on
+// the machine. Automation is not implemented on this platform yet, so setup
+// installs nothing of its own to find.
+func systemSetupPresent(*config.Config, string) bool { return false }
+
+func AuthNotice() []string { return nil }
 
 func installResolver(suffix string, dnsPort int, out io.Writer) ([]string, error) {
 	fmt.Fprintf(out, `  Windows DNS automation is planned for v0.4. Manual option (admin PowerShell):

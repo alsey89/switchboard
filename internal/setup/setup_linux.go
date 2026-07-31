@@ -2,6 +2,7 @@ package setup
 
 import (
 	"fmt"
+	"github.com/alsey89/switchboard/internal/config"
 	"io"
 )
 
@@ -9,6 +10,16 @@ import (
 // /etc/resolver equivalent, so split-DNS needs systemd-resolved or dnsmasq
 // integration. Until then, setup prints exact manual steps instead of
 // failing opaquely.
+
+// AuthNotice describes the authorization prompts setup will produce. Linux
+// automation is not implemented yet (v0.5), so setup prints manual steps
+// rather than elevating anything itself.
+// systemSetupPresent reports whether anything setup installed is still on
+// the machine. Automation is not implemented on this platform yet, so setup
+// installs nothing of its own to find.
+func systemSetupPresent(*config.Config, string) bool { return false }
+
+func AuthNotice() []string { return nil }
 
 func installResolver(suffix string, dnsPort int, out io.Writer) ([]string, error) {
 	fmt.Fprintf(out, `  Linux DNS automation is planned for v0.5. Manual options until then:
