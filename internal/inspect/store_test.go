@@ -1,0 +1,258 @@
+package inspect
+
+import (
+	"fmt"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+func testStore(t *testing.T, lim Limits) *Store {
+	t.Helper()
+	s, err := Open(filepath.Join(t.TempDir(), "inspect.db"), lim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() }) //nolint:errcheck
+	return s
+}
+
+func rec(at time.Time, path string) *Record {
+	return &Record{
+		StartedAt:   at,
+		Duration:    3 * time.Millisecond,
+		Domain:      "app.test",
+		Method:      "GET",
+		Path:        path,
+		Status:      200,
+		Proto:       "HTTP/1.1",
+		ReqHeaders:  map[string][]string{"Accept": {"*/*"}},
+		RespHeaders: map[string][]string{"Content-Type": {"text/plain"}},
+	}
+}
+
+func TestStoreRoundTrip(t *testing.T) {
+	s := testStore(t, Limits{MaxRequests: 100, MaxBytes: 1 << 20, MaxAge: time.Hour})
+	// Truncated to a whole second, not an arbitrary fixed epoch: the store
+	// round-trips StartedAt through UnixMicro, and a whole-second value has
+	// no sub-microsecond remainder to lose. It also has to stay inside the
+	// MaxAge: time.Hour window above, since Insert trims by age too.
+	now := time.Now().Truncate(time.Second).UTC()
+
+	in := rec(now, "/hello?a=1")
+	in.ReqBody = []byte("ping")
+	in.RespBody = []byte("pong")
+	if err := s.Insert([]*Record{in}); err != nil {
+		t.Fatal(err)
+	}
+	if in.ID == 0 {
+		t.Fatal("Insert must set the ID")
+	}
+	if in.SizeBytes == 0 {
+		t.Fatal("Insert must set SizeBytes")
+	}
+
+	got, err := s.Get(in.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Path != "/hello?a=1" || got.Domain != "app.test" || got.Status != 200 {
+		t.Errorf("scalars round-tripped wrong: %+v", got)
+	}
+	if !got.StartedAt.Equal(now) {
+		t.Errorf("StartedAt = %s, want %s", got.StartedAt, now)
+	}
+	if got.Duration != 3*time.Millisecond {
+		t.Errorf("Duration = %s", got.Duration)
+	}
+	if string(got.ReqBody) != "ping" || string(got.RespBody) != "pong" {
+		t.Errorf("bodies round-tripped wrong: %q %q", got.ReqBody, got.RespBody)
+	}
+	if v := got.ReqHeaders["Accept"]; len(v) != 1 || v[0] != "*/*" {
+		t.Errorf("ReqHeaders = %v", got.ReqHeaders)
+	}
+}
+
+func TestListOmitsBodies(t *testing.T) {
+	s := testStore(t, Limits{MaxRequests: 100, MaxBytes: 1 << 20, MaxAge: time.Hour})
+	in := rec(time.Now(), "/x")
+	in.RespBody = []byte("a large body")
+	if err := s.Insert([]*Record{in}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.List(Query{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d rows, want 1", len(got))
+	}
+	if got[0].RespBody != nil {
+		t.Error("List must not carry bodies; that is what Get is for")
+	}
+}
+
+func TestTrimByRowCap(t *testing.T) {
+	s := testStore(t, Limits{MaxRequests: 3, MaxBytes: 1 << 30, MaxAge: time.Hour})
+	now := time.Now()
+	for i := 0; i < 10; i++ {
+		if err := s.Insert([]*Record{rec(now, fmt.Sprintf("/%d", i))}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.List(Query{Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("kept %d rows, want 3", len(got))
+	}
+	if got[0].Path != "/9" {
+		t.Errorf("newest is %s, want /9", got[0].Path)
+	}
+}
+
+func TestTrimByByteCap(t *testing.T) {
+	s := testStore(t, Limits{MaxRequests: 10000, MaxBytes: 900, MaxAge: time.Hour})
+	now := time.Now()
+	for i := 0; i < 40; i++ {
+		r := rec(now, fmt.Sprintf("/%d", i))
+		r.RespBody = make([]byte, 100)
+		if err := s.Insert([]*Record{r}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.List(Query{Limit: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) == 0 {
+		t.Fatal("byte cap trimmed everything")
+	}
+	if len(got) >= 40 {
+		t.Fatalf("kept %d rows, byte cap did not bite", len(got))
+	}
+	if s.Bytes() > 900 {
+		t.Errorf("running total %d exceeds the cap", s.Bytes())
+	}
+}
+
+func TestTrimByAge(t *testing.T) {
+	s := testStore(t, Limits{MaxRequests: 1000, MaxBytes: 1 << 30, MaxAge: time.Hour})
+	now := time.Now()
+	if err := s.Insert([]*Record{rec(now.Add(-3*time.Hour), "/old")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Insert([]*Record{rec(now, "/new")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Trim(now); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.List(Query{Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Path != "/new" {
+		t.Fatalf("kept %d rows %v, want just /new", len(got), got)
+	}
+}
+
+func TestOpenTrimsStaleRows(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "inspect.db")
+
+	// Age off for the first session, so Insert's own trim leaves the row
+	// alone and Open is the only thing that can remove it later. Without
+	// this the test passes whether or not Open trims at all.
+	s, err := Open(path, Limits{MaxRequests: 1000, MaxBytes: 1 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Insert([]*Record{rec(time.Now().Add(-25*time.Hour), "/stale")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A daemon that sat idle overnight has stale rows and no writes coming
+	// to trigger a trim. Open is the other place age gets enforced.
+	s2, err := Open(path, Limits{MaxRequests: 1000, MaxBytes: 1 << 30, MaxAge: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close() //nolint:errcheck
+	got, err := s2.List(Query{Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("Open kept %d stale rows", len(got))
+	}
+}
+
+func TestListFilters(t *testing.T) {
+	s := testStore(t, Limits{MaxRequests: 1000, MaxBytes: 1 << 30, MaxAge: time.Hour})
+	now := time.Now()
+	mk := func(domain, method, path string, status int) *Record {
+		r := rec(now, path)
+		r.Domain, r.Method, r.Status = domain, method, status
+		return r
+	}
+	all := []*Record{
+		mk("app.test", "GET", "/users", 200),
+		mk("app.test", "POST", "/users", 404),
+		mk("api.test", "GET", "/health", 503),
+	}
+	for _, r := range all {
+		if err := s.Insert([]*Record{r}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cases := []struct {
+		name string
+		q    Query
+		want int
+	}{
+		{"domain", Query{Domain: "app.test"}, 2},
+		{"method", Query{Method: "POST"}, 1},
+		{"exact status", Query{Status: "404"}, 1},
+		{"status class", Query{Status: "5xx"}, 1},
+		{"path substring", Query{Q: "user"}, 2},
+		{"combined", Query{Domain: "app.test", Status: "2xx"}, 1},
+		{"no filter", Query{}, 3},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := s.List(c.q)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != c.want {
+				t.Errorf("got %d rows, want %d", len(got), c.want)
+			}
+		})
+	}
+}
+
+func TestClearEmptiesTheBuffer(t *testing.T) {
+	s := testStore(t, Limits{MaxRequests: 100, MaxBytes: 1 << 20, MaxAge: time.Hour})
+	if err := s.Insert([]*Record{rec(time.Now(), "/x")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Clear(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.List(Query{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("%d rows survived Clear", len(got))
+	}
+	if s.Bytes() != 0 {
+		t.Errorf("running byte total = %d after Clear, want 0", s.Bytes())
+	}
+}
