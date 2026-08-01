@@ -164,6 +164,9 @@ currently prints exact manual steps instead.
 Roadmap (details in [DESIGN.md](DESIGN.md)): traffic inspector →
 dashboard/GUI → Windows → Linux → self-hostable tunnels.
 
+What changed in each release, and anything you need to do about it, is in
+[CHANGELOG.md](CHANGELOG.md).
+
 ### FAQ: `dig app.test` doesn't resolve!
 
 Expected. `/etc/resolver` configures the *system* resolver; `dig` and
