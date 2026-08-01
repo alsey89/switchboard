@@ -226,11 +226,27 @@ func (r *Route) validateUpstream() error {
 }
 
 // UpstreamAddr returns the dial address for the route.
+//
+// The port shorthand resolves through "localhost" rather than 127.0.0.1.
+// Those are different addresses — 127.0.0.1 is IPv4, ::1 is IPv6 — and a
+// server listening on one does not answer on the other. Node dev servers
+// commonly bind IPv6 loopback only, so 127.0.0.1 produced a route that was
+// dead from the moment it was added. `ls` reported it as `down`, the same
+// word it uses for a server that is not running at all, which points away
+// from the cause rather than at it.
+//
+// A name lets Go's dialer try both families and take whichever answers
+// (RFC 6555). That is what a browser does when the user checks
+// localhost:3000, sees their app, and reasonably concludes the problem is
+// Switchboard.
+//
+// Upstream is returned exactly as typed. Someone who names an address means
+// that address, and guessing on their behalf is what this fixes.
 func (r *Route) UpstreamAddr() string {
 	if r.Upstream != "" {
 		return r.Upstream
 	}
-	return net.JoinHostPort("127.0.0.1", strconv.Itoa(r.Port))
+	return net.JoinHostPort("localhost", strconv.Itoa(r.Port))
 }
 
 // NormalizeDomain lowercases, strips any trailing dot, appends the suffix
