@@ -1,6 +1,7 @@
 package inspect
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -204,5 +205,178 @@ func TestHandlerPassesThroughWithNoRecorder(t *testing.T) {
 	}
 	if rw.Code != 204 {
 		t.Fatalf("status = %d; a nil recorder must be a clean pass-through", rw.Code)
+	}
+}
+
+func TestHandlerRecordsImplicit200(t *testing.T) {
+	r := withRecorder(t, Options{})
+
+	h := Handler{}
+	req := httptest.NewRequest("GET", "http://app.test/x", nil)
+	err := h.ServeHTTP(httptest.NewRecorder(), req, nextFunc(func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, "ok") //nolint:errcheck
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := firstRecord(t, r)
+	if got.Status != http.StatusOK {
+		t.Errorf("Status = %d, want 200 for a handler that never calls WriteHeader", got.Status)
+	}
+}
+
+func TestHandlerRecordsExactlyOnceWhenNextErrors(t *testing.T) {
+	r := withRecorder(t, Options{})
+
+	h := Handler{}
+	wantErr := errors.New("boom")
+	req := httptest.NewRequest("GET", "http://app.test/x", nil)
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+		return wantErr
+	})
+
+	err := h.ServeHTTP(httptest.NewRecorder(), req, next)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("ServeHTTP error = %v, want %v passed through unchanged", err, wantErr)
+	}
+
+	got := firstRecord(t, r)
+	if got.Error != wantErr.Error() {
+		t.Errorf("Error = %q, want %q", got.Error, wantErr.Error())
+	}
+
+	rows, lerr := r.Store().List(Query{Limit: 10})
+	if lerr != nil {
+		t.Fatal(lerr)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("next returning an error produced %d records, want exactly 1", len(rows))
+	}
+}
+
+func TestHandlerRecordsTheRealStatusOnAFailedProxyAttempt(t *testing.T) {
+	r := withRecorder(t, Options{})
+
+	h := Handler{}
+	req := httptest.NewRequest("GET", "http://app.test/x", nil)
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+		// This is what reverse_proxy returns when the upstream refuses the
+		// connection: no WriteHeader call, just a HandlerError carrying the
+		// real status. Defaulting that to 200 would hide the single most
+		// common failure in a local dev proxy.
+		return caddyhttp.Error(http.StatusBadGateway, errors.New("dial tcp: connection refused"))
+	})
+
+	if err := h.ServeHTTP(httptest.NewRecorder(), req, next); err == nil {
+		t.Fatal("expected ServeHTTP to pass the HandlerError through")
+	}
+
+	got := firstRecord(t, r)
+	if got.Status != http.StatusBadGateway {
+		t.Errorf("Status = %d, want %d recovered from the HandlerError", got.Status, http.StatusBadGateway)
+	}
+}
+
+func TestHandlerFlushReachesTheUnderlyingWriter(t *testing.T) {
+	withRecorder(t, Options{})
+
+	h := Handler{}
+	rw := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "http://app.test/x", nil)
+	err := h.ServeHTTP(rw, req, nextFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		// A real SSE or streaming handler flushes through
+		// http.ResponseController, never a direct type assertion, and that
+		// call has to make it past the watcher wrapper to the recorder that
+		// actually implements Flush.
+		if ferr := http.NewResponseController(w).Flush(); ferr != nil {
+			t.Errorf("Flush through the wrapper: %v", ferr)
+		}
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rw.Flushed {
+		t.Error("Flush did not reach the underlying ResponseRecorder")
+	}
+}
+
+func TestHandlerReadFromStillGoesThroughWrite(t *testing.T) {
+	r := withRecorder(t, Options{Bodies: true, MaxBodyBytes: 64})
+
+	h := Handler{}
+	req := httptest.NewRequest("GET", "http://app.test/x", nil)
+	err := h.ServeHTTP(httptest.NewRecorder(), req, nextFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// io.Copy prefers src.WriteTo, then dst.ReadFrom, then a plain
+		// Write loop. strings.Reader implements WriteTo, which would take
+		// that first branch and hide a broken ReadFrom entirely, so the
+		// source is stripped down to a bare io.Reader to force io.Copy onto
+		// dst's ReadFrom - the same path a real io.Reader without WriteTo
+		// (an os.File's body, a network conn) would take.
+		//
+		// *caddyhttp.ResponseWriterWrapper promotes a ReadFrom that writes
+		// straight to the underlying ResponseWriter; watcher must shadow it
+		// or this bypasses every counter and the body tee.
+		src := struct{ io.Reader }{strings.NewReader("copied body")}
+		io.Copy(w, src) //nolint:errcheck
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := firstRecord(t, r)
+	if got.RespBytes != int64(len("copied body")) {
+		t.Errorf("RespBytes = %d, want %d; io.Copy must not bypass Write", got.RespBytes, len("copied body"))
+	}
+	if string(got.RespBody) != "copied body" {
+		t.Errorf("RespBody = %q, want %q captured through the ReadFrom shadow", got.RespBody, "copied body")
+	}
+}
+
+func TestHandlerRecordsAnHTTP2ExtendedConnectWebSocketImmediately(t *testing.T) {
+	r := withRecorder(t, Options{})
+
+	release := make(chan struct{})
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		h := Handler{}
+		// RFC 8441: an HTTP/2 websocket arrives as a CONNECT with a
+		// :protocol pseudo-header, and Caddy accepts it with a plain 200,
+		// never a 101. See streaming.go's handleUpgradeResponse.
+		req := httptest.NewRequest(http.MethodConnect, "app.test:443", nil)
+		req.Proto = "HTTP/2.0"
+		req.ProtoMajor = 2
+		req.ProtoMinor = 0
+		req.Header.Set(":protocol", "websocket")
+		rw := httptest.NewRecorder()
+		h.ServeHTTP(rw, req, nextFunc(func(w http.ResponseWriter, _ *http.Request) { //nolint:errcheck
+			w.WriteHeader(http.StatusOK)
+			// Stand in for a websocket that stays open. The record must
+			// already exist while this is still blocked.
+			<-release
+		}))
+	}()
+
+	waitFor(t, "the extended-CONNECT upgrade to be recorded before the connection closes", func() bool {
+		rows, err := r.Store().List(Query{Limit: 10})
+		return err == nil && len(rows) == 1 && rows[0].Upgraded
+	})
+
+	close(release)
+	<-done
+
+	rows, err := r.Store().List(Query{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("an h2 extended-connect upgrade produced %d rows, want exactly 1", len(rows))
+	}
+	if rows[0].Status != http.StatusOK {
+		t.Errorf("Status = %d, want 200: that is the real wire status Caddy writes for RFC 8441, "+
+			"Upgraded is what marks the row", rows[0].Status)
 	}
 }

@@ -1,6 +1,8 @@
 package inspect
 
 import (
+	"errors"
+	"io"
 	"net"
 	"net/http"
 	"time"
@@ -51,12 +53,26 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 		ww.body = newCapWriter(nilWriter{}, maxBody)
 	}
 
+	// An HTTP/2 extended CONNECT websocket (RFC 8441) never sees a 101: Caddy
+	// answers the client's CONNECT with a plain 200 once the backend accepts
+	// the upgrade (reverseproxy/streaming.go). Only h1/h2 are enabled here
+	// (see proxy.go), so ProtoMajor == 2 is the only extended-connect case
+	// that can reach this handler; h3 detects the upgrade differently and
+	// does not apply.
+	h2Websocket := r.ProtoMajor == 2 && r.Method == http.MethodConnect &&
+		r.Header.Get(":protocol") == "websocket"
+
 	// An upgraded connection blocks in next until the socket dies. Recording
 	// it on return would mean an HMR websocket shows up in the inspector an
-	// hour after it opened, so it is recorded the moment the 101 lands and
-	// never again.
+	// hour after it opened, so it is recorded the moment the upgrade lands
+	// and never again. That moment is a 101 for a plain HTTP/1.1 Upgrade, or
+	// a 200 for the HTTP/2 extended-CONNECT case above; either way the wire
+	// status is stored as-is and Upgraded is what marks the row, not the
+	// status number.
 	ww.onHeader = func(status int) {
-		if status != http.StatusSwitchingProtocols {
+		upgraded := status == http.StatusSwitchingProtocols ||
+			(h2Websocket && status == http.StatusOK)
+		if !upgraded {
 			return
 		}
 		ww.emitted = true
@@ -67,6 +83,16 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 	if ww.emitted {
 		return err
 	}
+	// A panic here (a bug deeper in reverse_proxy, say) unwinds through this
+	// point without ever reaching a Submit call, so that request produces no
+	// record. That is intentional, not an oversight: Caddy's own connection
+	// handling already surfaces the panic (logs it and aborts the
+	// connection), and recovering here to emit one would come at a real
+	// cost. A recover-and-repanic loses the original stack, which is the
+	// thing that makes a panic actionable, and http.ErrAbortHandler is a
+	// sentinel net/http treats specially for a handler that aborts on
+	// purpose - naively recovering it would fabricate an error record for
+	// every one of those.
 	rec.Submit(buildRecord(r, ww, reqBody, start, time.Now(), bodies, false, err))
 	return err
 }
@@ -83,9 +109,24 @@ func buildRecord(r *http.Request, ww *watcher, reqBody *capReader,
 
 	status := ww.status
 	if status == 0 {
-		status = http.StatusOK
+		// A failed proxy attempt (no upstream, a dial timeout) never calls
+		// WriteHeader; reverse_proxy returns a HandlerError carrying the
+		// real status instead, and the default-to-200 rule below is for a
+		// handler that legitimately wrote nothing, not for this. "Backend
+		// isn't running" is the single most common failure a local dev
+		// proxy sees, and it must not show up in the inspector as a 200.
+		var he caddyhttp.HandlerError
+		if errors.As(err, &he) && he.StatusCode != 0 {
+			status = he.StatusCode
+		} else {
+			status = http.StatusOK
+		}
 	}
 
+	// Body capture on also turns redaction off: once bodies are being
+	// written to disk, keeping Authorization or Cookie values out of the
+	// header copy next to them buys nothing. This is a real side effect of
+	// a flag named "bodies", not just a header-copying detail.
 	copyHeaders := RedactHeaders
 	if bodies {
 		copyHeaders = CopyHeaders
@@ -165,6 +206,17 @@ func (w *watcher) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// ReadFrom shadows the io.ReaderFrom that *caddyhttp.ResponseWriterWrapper
+// promotes. That promoted version writes straight to the underlying
+// ResponseWriter, bypassing Write and with it every line of instrumentation
+// above: written would stay at 0, no response body would be captured, and an
+// implicit 200 would never be recorded. Wrapping w in an anonymous
+// io.Writer-only struct is what stops io.Copy from rediscovering this same
+// ReadFrom method on w and recursing into itself.
+func (w *watcher) ReadFrom(r io.Reader) (int64, error) {
+	return io.Copy(struct{ io.Writer }{w}, r)
+}
+
 // nilWriter is the sink under a capWriter used only for capture: the real
 // bytes have already gone to the client by then.
 type nilWriter struct{}
@@ -174,4 +226,11 @@ func (nilWriter) Write(p []byte) (int, error) { return len(p), nil }
 var (
 	_ caddyhttp.MiddlewareHandler = (*Handler)(nil)
 	_ http.ResponseWriter         = (*watcher)(nil)
+
+	// The load-bearing contract is Unwrap, not http.ResponseWriter above:
+	// Flush and Hijack only reach the real socket through it (see
+	// http.ResponseController). This guard fails the build if the
+	// ResponseWriterWrapper embed is ever dropped, instead of silently
+	// breaking SSE and websockets.
+	_ interface{ Unwrap() http.ResponseWriter } = (*watcher)(nil)
 )
