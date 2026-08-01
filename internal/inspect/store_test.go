@@ -167,6 +167,41 @@ func TestTrimByByteCap(t *testing.T) {
 	}
 }
 
+// TestTrimStopsOnDriftedCounters proves the byte-cap loop in Trim cannot spin
+// forever if the in-memory rows/bytes counters ever overstate what is
+// actually on disk — say, rows > 0 against an empty table. The byte
+// condition alone (s.Bytes() > lim.MaxBytes) would keep such a loop
+// looping forever, issuing DELETEs that free nothing; the no-progress
+// guard (deleteAndAccount's returned count hitting zero) has to be the
+// thing that stops it.
+//
+// This kind of drift is reachable in principle from Clear (its DELETE and
+// counter reset now happen under one held lock, closing that particular
+// window — see Clear and deleteAndAccount), but the guard here is a
+// backstop against drift from *any* source, not a test of Clear
+// specifically. It runs on the drain goroutine in the recorder (Task 4),
+// so a spin here would hang capture entirely rather than just fail loudly.
+func TestTrimStopsOnDriftedCounters(t *testing.T) {
+	s := testStore(t, Limits{MaxRequests: 1000, MaxBytes: 1, MaxAge: time.Hour})
+	// Manufacture the drift directly: claim a nonzero row/byte total against
+	// a table that is actually empty.
+	s.mu.Lock()
+	s.rows = 5
+	s.bytes = 1000
+	s.mu.Unlock()
+
+	done := make(chan error, 1)
+	go func() { done <- s.Trim(time.Now()) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Trim did not return: byte-cap loop spun on drifted counters")
+	}
+}
+
 func TestTrimByAge(t *testing.T) {
 	// MaxAge starts at zero (unbounded) so Insert's own trailing Trim cannot
 	// remove /old before this test gets to exercise anything: with a

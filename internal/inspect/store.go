@@ -178,11 +178,16 @@ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 		r.ID = id
 		added += r.SizeBytes
 	}
+	// The mutex is held across the commit itself, not just the counter
+	// update after it: otherwise a window opens, exactly like the one that
+	// was in Clear, where the rows are already durable on disk but a
+	// concurrent Bytes()/Rows()/Trim() reads the pre-commit totals against
+	// a table that has already changed underneath them.
+	s.mu.Lock()
 	if err := tx.Commit(); err != nil {
+		s.mu.Unlock()
 		return err
 	}
-
-	s.mu.Lock()
 	s.rows += len(recs)
 	s.bytes += added
 	s.mu.Unlock()
@@ -250,7 +255,15 @@ func (s *Store) Trim(now time.Time) error {
 // what it removed from the running totals, and reports how many rows it
 // deleted so a caller looping on "still over the limit" can tell that
 // apart from "deleted nothing, stop".
+//
+// The mutex is held across the delete itself, not just the bookkeeping
+// after it, for the same reason as Insert and Clear: releasing it in
+// between would let a concurrent Bytes()/Rows() observe the pre-delete
+// totals against a table the delete has already changed.
 func (s *Store) deleteAndAccount(query string, args ...any) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return 0, err
@@ -271,7 +284,6 @@ func (s *Store) deleteAndAccount(query string, args ...any) (int, error) {
 		return 0, err
 	}
 
-	s.mu.Lock()
 	s.rows -= n
 	s.bytes -= freed
 	if s.rows < 0 {
@@ -280,18 +292,23 @@ func (s *Store) deleteAndAccount(query string, args ...any) (int, error) {
 	if s.bytes < 0 {
 		s.bytes = 0
 	}
-	s.mu.Unlock()
 	return n, nil
 }
 
 // Clear empties the buffer.
+//
+// The mutex is held across the delete and the counter reset together: the
+// previous version took it only after the delete, leaving a window where
+// the table was already empty but s.rows/s.bytes still reported the old
+// totals — visible to a concurrent Bytes()/Rows() call, and exactly the
+// drift TestTrimStopsOnDriftedCounters guards Trim's byte-cap loop against.
 func (s *Store) Clear() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if _, err := s.db.Exec(`DELETE FROM requests`); err != nil {
 		return err
 	}
-	s.mu.Lock()
 	s.rows, s.bytes = 0, 0
-	s.mu.Unlock()
 	return nil
 }
 
