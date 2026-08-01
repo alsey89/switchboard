@@ -3,6 +3,7 @@ package inspect
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -11,6 +12,16 @@ import (
 
 	_ "modernc.org/sqlite" // pure-Go driver, registered as "sqlite"
 )
+
+// ErrTrimAfterInsert wraps an error from the Trim call Insert makes after a
+// successful commit. It marks the one case where an error from Insert does
+// not mean the batch was lost: the rows are already durable, only the
+// ring-buffer cleanup that follows failed. A caller that treated every
+// Insert error the same would either wrongly believe committed rows never
+// happened, or, worse, would have to guess and risk announcing rows that
+// were actually rolled back. errors.Is against this sentinel removes the
+// guesswork.
+var ErrTrimAfterInsert = errors.New("inspect: trim after insert failed")
 
 const schema = `
 CREATE TABLE IF NOT EXISTS requests (
@@ -192,7 +203,10 @@ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	s.bytes += added
 	s.mu.Unlock()
 
-	return s.Trim(time.Now())
+	if err := s.Trim(time.Now()); err != nil {
+		return fmt.Errorf("%w: %w", ErrTrimAfterInsert, err)
+	}
+	return nil
 }
 
 // Trim enforces all three limits. Age first, because it is the cheapest and

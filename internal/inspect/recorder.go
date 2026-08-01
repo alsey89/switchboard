@@ -1,6 +1,7 @@
 package inspect
 
 import (
+	"errors"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -59,6 +60,7 @@ type Recorder struct {
 	mu     sync.Mutex
 	subs   map[int64]chan *Record
 	nextID int64
+	closed bool // set once the drain goroutine has torn down subscribers
 
 	closeOnce sync.Once
 	done      chan struct{}
@@ -119,7 +121,10 @@ func (r *Recorder) Submit(rec *Record) {
 	}
 }
 
-// Dropped reports how many records were lost to a full buffer.
+// Dropped reports how many records were lost: either dropped from a full
+// buffer, or lost because a batch failed to write to the store. Either way
+// they never reached the store, which is the one thing an operator querying
+// this number needs to know — not which of the two happened.
 func (r *Recorder) Dropped() int64 { return r.dropped.Load() }
 
 // Store returns the underlying buffer, for history queries.
@@ -140,10 +145,21 @@ func (r *Recorder) SetOptions(bodies bool, maxBody int) {
 // Subscribe returns a channel of newly stored records and a function to stop
 // receiving. The channel is closed when the subscription ends, whether the
 // caller cancelled it or the recorder dropped a slow reader.
+//
+// A subscription requested after the drain goroutine has already shut down
+// gets a channel that is already closed and a cancel that does nothing:
+// there is nobody left to add it to, and a caller ranging over the channel
+// (an SSE handler, in particular) must see it end rather than hang forever
+// waiting for a record that will never come.
 func (r *Recorder) Subscribe() (<-chan *Record, func()) {
-	ch := make(chan *Record, 256)
-
 	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		ch := make(chan *Record)
+		close(ch)
+		return ch, func() {}
+	}
+	ch := make(chan *Record, 256)
 	r.nextID++
 	id := r.nextID
 	r.subs[id] = ch
@@ -183,15 +199,37 @@ func (r *Recorder) publish(recs []*Record) {
 	}
 }
 
+// closeSubscribers tears down every live subscription and marks the
+// recorder closed so a later Subscribe call knows not to add a channel that
+// nothing will ever close. It runs exactly once, from drain's deferred
+// cleanup, so it fires whether drain returns normally or panics — a
+// subscriber must never be left holding a channel nobody is going to close.
+func (r *Recorder) closeSubscribers() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return
+	}
+	r.closed = true
+	for id, ch := range r.subs {
+		delete(r.subs, id)
+		close(ch)
+	}
+}
+
 // drain owns every write. It batches to keep the transaction count down and
 // flushes on a timer so a single request does not sit unwritten.
 func (r *Recorder) drain(batchSize int, flush time.Duration, tick <-chan time.Time) {
 	defer func() {
-		// A panic in here would silently stop all capture. Log it and let
-		// the daemon keep proxying, which is the only thing that matters.
+		// A panic here would otherwise leave every subscriber channel open
+		// forever: an SSE handler ranging over one would hang rather than
+		// see the recorder die. closeSubscribers must run on every exit
+		// path, panic or not, which is why it lives in this defer rather
+		// than only at the bottom of the shutdown case below.
 		if p := recover(); p != nil {
 			r.log.Error("inspector recorder stopped after a panic", "panic", p)
 		}
+		r.closeSubscribers()
 	}()
 
 	batch := make([]*Record, 0, batchSize)
@@ -202,10 +240,23 @@ func (r *Recorder) drain(batchSize int, flush time.Duration, tick <-chan time.Ti
 		if len(batch) == 0 {
 			return
 		}
-		if err := r.store.Insert(batch); err != nil {
-			r.log.Warn("inspector could not write a batch", "err", err, "records", len(batch))
-		} else {
+		err := r.store.Insert(batch)
+		switch {
+		case err == nil:
 			r.publish(batch)
+		case errors.Is(err, ErrTrimAfterInsert):
+			// The batch itself committed before Trim ran; only the
+			// ring-buffer cleanup after it failed. The rows are really in
+			// the store, so subscribers can still be told about them —
+			// treating this the same as a real write failure would hide a
+			// live update for rows that are not actually missing.
+			r.log.Warn("inspector trim failed after a successful insert", "err", err)
+			r.publish(batch)
+		default:
+			// Nothing committed. This has to be as visible as a full-buffer
+			// drop, or Dropped() understates how much was actually lost.
+			r.log.Warn("inspector could not write a batch", "err", err, "records", len(batch))
+			r.dropped.Add(int64(len(batch)))
 		}
 		batch = batch[:0]
 	}
@@ -231,7 +282,9 @@ func (r *Recorder) drain(batchSize int, flush time.Duration, tick <-chan time.Ti
 			}
 
 		case <-r.done:
-			// Drain what is already queued, then stop.
+			// Drain what is already queued, then stop. Subscriber teardown
+			// happens in the deferred cleanup above, not here, so it also
+			// runs if something above panics instead of reaching this case.
 			for {
 				select {
 				case rec := <-r.ch:
@@ -242,12 +295,6 @@ func (r *Recorder) drain(batchSize int, flush time.Duration, tick <-chan time.Ti
 				break
 			}
 			write()
-			r.mu.Lock()
-			for id, ch := range r.subs {
-				delete(r.subs, id)
-				close(ch)
-			}
-			r.mu.Unlock()
 			return
 		}
 	}
