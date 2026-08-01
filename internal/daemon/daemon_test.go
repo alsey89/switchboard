@@ -37,6 +37,38 @@ const (
 	tDashPort  = 18484
 )
 
+// tSuffixInternal and tSuffixLocalhost are the two other reserved suffixes
+// (see config.ReservedSuffixes), reserved here for any test that verifies a
+// certificate against the daemon's minted root CA.
+//
+// This is not bureaucracy for its own sake. Caddy's on-demand certificate
+// cache (certCache in modules/caddytls/tls.go) is a package-level variable,
+// not scoped to one *caddy.Config or one daemon.Run call. caddy.Stop() only
+// evicts entries that were under explicit certificate management; an
+// on-demand-issued cert never was, so it survives in that global cache
+// after Stop() returns. A second daemon boot in the same test process that
+// requests a certificate for a domain name it has seen before gets served
+// the *first* boot's cert — signed by the *first* boot's root — verified
+// against the *second* boot's root pool, which fails with something like
+// "x509: certificate signed by unknown authority". Confirmed with a
+// minimal repro: two sequential proxy.Load/proxy.Stop cycles with the same
+// suffix reproduce the exact failure; giving the second one a different
+// suffix (and therefore different domain names) does not.
+//
+// This is issue #25. It is a real defect, but it lives in vendored Caddy
+// and only manifests when more than one full daemon boots in one OS
+// process — something that only ever happens in this test binary, never in
+// production, where one process serves for the whole life of the daemon.
+// Patching it out is out of scope here; giving each cert-verifying test in
+// this package its own domain names is enough to stop the cache from ever
+// serving a stale cert to the wrong root, and it is the fix that keeps
+// every test running under a plain `go test ./...` rather than gating any
+// of them out.
+const (
+	tSuffixInternal  = "internal"
+	tSuffixLocalhost = "localhost"
+)
+
 type testEnv struct {
 	cfgPath string
 	cfg     *config.Config
@@ -47,7 +79,8 @@ type testEnv struct {
 }
 
 // startOpts customizes startEnv for tests that need to observe the daemon's
-// logs or tamper with the data directory before the daemon starts.
+// logs, tamper with the data directory before the daemon starts, or use a
+// suffix other than the shared default.
 type startOpts struct {
 	// poisonDataDir, when set, runs after the data directory is created but
 	// before the daemon starts. It exists to break one thing the data
@@ -56,9 +89,16 @@ type startOpts struct {
 	// prove a broken inspector does not take the proxy down with it.
 	poisonDataDir func(t *testing.T, dataDir string)
 	log           *slog.Logger
+
+	// suffix overrides the default "test" suffix. Any test that verifies a
+	// certificate against the minted root CA (as opposed to just booting
+	// the daemon) must use a suffix no other such test in this package
+	// uses — see the comment on tSuffixInternal/tSuffixLocalhost for why.
+	suffix string
 }
 
 func startEnv(t *testing.T, routes []config.Route) *testEnv {
+	t.Helper()
 	return startEnvOpts(t, routes, startOpts{})
 }
 
@@ -68,8 +108,12 @@ func startEnvOpts(t *testing.T, routes []config.Route, o startOpts) *testEnv {
 	cfgPath := filepath.Join(dir, "config.toml")
 	dataDir := filepath.Join(dir, "data")
 
+	suffix := o.suffix
+	if suffix == "" {
+		suffix = "test"
+	}
 	cfg := &config.Config{
-		Suffix:        "test",
+		Suffix:        suffix,
 		HTTPPort:      tHTTPPort,
 		HTTPSPort:     tHTTPSPort,
 		DNSPort:       tDNSPort,
@@ -330,9 +374,10 @@ func TestInspectorFailureNeverBlocksTheDaemon(t *testing.T) {
 	defer upstream.Close()
 
 	var logs bytes.Buffer
-	env := startEnvOpts(t, []config.Route{{Domain: "app.test", Upstream: strings.TrimPrefix(upstream.URL, "http://")}},
+	env := startEnvOpts(t, []config.Route{{Domain: "app." + tSuffixInternal, Upstream: strings.TrimPrefix(upstream.URL, "http://")}},
 		startOpts{
-			log: slog.New(slog.NewTextHandler(&logs, nil)),
+			suffix: tSuffixInternal,
+			log:    slog.New(slog.NewTextHandler(&logs, nil)),
 			poisonDataDir: func(t *testing.T, dataDir string) {
 				t.Helper()
 				// inspect.Open will try to create/open a file here; a
@@ -344,7 +389,7 @@ func TestInspectorFailureNeverBlocksTheDaemon(t *testing.T) {
 			},
 		})
 
-	resp, err := env.client().Get(fmt.Sprintf("https://app.test:%d/hello", tHTTPSPort))
+	resp, err := env.client().Get(fmt.Sprintf("https://app.%s:%d/hello", tSuffixInternal, tHTTPSPort))
 	if err != nil {
 		t.Fatalf("the proxy must still serve traffic with capture off: %v", err)
 	}
@@ -377,11 +422,12 @@ func TestReloadAppliesNewInspectorLimits(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	env := startEnv(t, []config.Route{{Domain: "app.test", Upstream: strings.TrimPrefix(upstream.URL, "http://")}})
+	env := startEnvOpts(t, []config.Route{{Domain: "app." + tSuffixLocalhost, Upstream: strings.TrimPrefix(upstream.URL, "http://")}},
+		startOpts{suffix: tSuffixLocalhost})
 	client := env.client()
 
 	get := func() {
-		resp, err := client.Get(fmt.Sprintf("https://app.test:%d/x", tHTTPSPort))
+		resp, err := client.Get(fmt.Sprintf("https://app.%s:%d/x", tSuffixLocalhost, tHTTPSPort))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -433,6 +479,11 @@ func TestShutdownClosesInspectorStoreAfterEverythingElse(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.toml")
 	dataDir := filepath.Join(dir, "data")
+	// Suffix "test" is safe to share with TestEndToEnd here: this test never
+	// verifies a certificate (it shuts down before making any HTTPS
+	// request), so it never touches Caddy's cross-process cert cache and
+	// cannot collide with it. See tSuffixInternal/tSuffixLocalhost above for
+	// the tests that do need to care.
 	cfg := &config.Config{
 		Suffix:        "test",
 		HTTPPort:      tHTTPPort,

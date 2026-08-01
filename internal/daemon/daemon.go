@@ -147,8 +147,9 @@ func Run(ctx context.Context, opts Options) error {
 		// The data directory itself is normally created by proxy.Load's
 		// EnsureRoot — but ensureInspector runs before that call, so on a
 		// brand new install nothing has created it yet. Without this,
-		// inspect.Open fails with "no such file or directory" on every
-		// first run and capture never turns on until a restart.
+		// inspect.Open fails on every first run with SQLite's own
+		// "unable to open database file", and capture never turns on
+		// until something else (a later reload) creates the directory.
 		if err := os.MkdirAll(opts.DataDir, 0o700); err != nil {
 			log.Warn("inspector disabled: cannot create its data directory", "path", opts.DataDir, "err", err)
 			return
