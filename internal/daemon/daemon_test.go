@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/alsey89/switchboard/internal/config"
+	"github.com/alsey89/switchboard/internal/inspect"
 	"github.com/alsey89/switchboard/internal/listen"
 	"github.com/alsey89/switchboard/internal/proxy"
 )
@@ -38,12 +40,29 @@ const (
 type testEnv struct {
 	cfgPath string
 	cfg     *config.Config
+	dataDir string
 	rootCAs *x509.CertPool
 	cancel  context.CancelFunc
 	done    chan error
 }
 
+// startOpts customizes startEnv for tests that need to observe the daemon's
+// logs or tamper with the data directory before the daemon starts.
+type startOpts struct {
+	// poisonDataDir, when set, runs after the data directory is created but
+	// before the daemon starts. It exists to break one thing the data
+	// directory holds (e.g. the inspector's database file) without
+	// disturbing the rest (the proxy's PKI files), which is the only way to
+	// prove a broken inspector does not take the proxy down with it.
+	poisonDataDir func(t *testing.T, dataDir string)
+	log           *slog.Logger
+}
+
 func startEnv(t *testing.T, routes []config.Route) *testEnv {
+	return startEnvOpts(t, routes, startOpts{})
+}
+
+func startEnvOpts(t *testing.T, routes []config.Route, o startOpts) *testEnv {
 	t.Helper()
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.toml")
@@ -61,10 +80,17 @@ func startEnv(t *testing.T, routes []config.Route) *testEnv {
 		t.Fatal(err)
 	}
 
+	if o.poisonDataDir != nil {
+		if err := os.MkdirAll(dataDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		o.poisonDataDir(t, dataDir)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- Run(ctx, Options{ConfigPath: cfgPath, DataDir: dataDir, Version: "test"})
+		done <- Run(ctx, Options{ConfigPath: cfgPath, DataDir: dataDir, Version: "test", Log: o.log})
 	}()
 
 	// Wait for the HTTPS listener, then load the root CA it minted.
@@ -81,7 +107,7 @@ func startEnv(t *testing.T, routes []config.Route) *testEnv {
 		t.Fatal("root CA PEM did not parse")
 	}
 
-	env := &testEnv{cfgPath: cfgPath, cfg: cfg, rootCAs: pool, cancel: cancel, done: done}
+	env := &testEnv{cfgPath: cfgPath, cfg: cfg, dataDir: dataDir, rootCAs: pool, cancel: cancel, done: done}
 	t.Cleanup(func() {
 		cancel()
 		select {
@@ -281,6 +307,178 @@ func TestEndToEnd(t *testing.T) {
 			return resp.StatusCode == 200 && strings.Contains(string(body), "second upstream")
 		}, 15*time.Second, "hot-reloaded route to answer")
 	})
+}
+
+// TestInspectorFailureNeverBlocksTheDaemon proves the daemon's central
+// promise about the inspector: a broken inspector is a warning, never a
+// reason the proxy does not start.
+//
+// The inspector's database path is pre-occupied by a directory, which
+// fails inspect.Open exactly like an unwritable data directory or a
+// corrupt file would. Nothing else in the data directory is touched, so
+// the proxy's own use of it (the PKI files) still succeeds — this is what
+// isolates "the inspector broke" from "the whole data directory broke",
+// and proves the failure is contained rather than merely unexercised.
+func TestInspectorFailureNeverBlocksTheDaemon(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, "ok") //nolint:errcheck
+	}))
+	defer upstream.Close()
+
+	var logs bytes.Buffer
+	env := startEnvOpts(t, []config.Route{{Domain: "app.test", Upstream: strings.TrimPrefix(upstream.URL, "http://")}},
+		startOpts{
+			log: slog.New(slog.NewTextHandler(&logs, nil)),
+			poisonDataDir: func(t *testing.T, dataDir string) {
+				t.Helper()
+				// inspect.Open will try to create/open a file here; a
+				// directory in its place makes that fail without touching
+				// dataDir/pki, which the proxy needs to start at all.
+				if err := os.MkdirAll(filepath.Join(dataDir, "inspect.db"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			},
+		})
+
+	resp, err := env.client().Get(fmt.Sprintf("https://app.test:%d/hello", tHTTPSPort))
+	if err != nil {
+		t.Fatalf("the proxy must still serve traffic with capture off: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 || string(body) != "ok" {
+		t.Errorf("status = %d, body = %q, want 200 and the upstream body", resp.StatusCode, body)
+	}
+
+	if inspect.Current() != nil {
+		t.Error("capture should be off when the inspector's database cannot be opened")
+	}
+	if !strings.Contains(logs.String(), "inspector disabled") {
+		t.Errorf("expected a warning naming the inspector disabled, got log:\n%s", logs.String())
+	}
+}
+
+// TestReloadAppliesNewInspectorLimits proves a config reload actually
+// reaches the store, not just the recorder's in-memory options. It sends
+// real traffic through the proxy (rather than calling Recorder.Submit
+// directly) so the assertion covers the whole path: handler to recorder to
+// store.
+func TestReloadAppliesNewInspectorLimits(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, "ok") //nolint:errcheck
+	}))
+	defer upstream.Close()
+
+	env := startEnv(t, []config.Route{{Domain: "app.test", Upstream: strings.TrimPrefix(upstream.URL, "http://")}})
+	client := env.client()
+
+	get := func() {
+		resp, err := client.Get(fmt.Sprintf("https://app.test:%d/x", tHTTPSPort))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close() //nolint:errcheck
+	}
+
+	for i := 0; i < 10; i++ {
+		get()
+	}
+	waitFor(t, func() bool {
+		r := inspect.Current()
+		return r != nil && r.Store().Rows() >= 10
+	}, 15*time.Second, "10 requests captured")
+
+	env.cfg.Inspect = &config.InspectConfig{MaxRequests: 3}
+	if err := env.cfg.Save(env.cfgPath); err != nil {
+		t.Fatal(err)
+	}
+
+	// Each poll sends one more request: the first one to land after the
+	// reload actually applies triggers the store's insert-then-trim and
+	// should bring the row count down to the new cap in one step.
+	waitFor(t, func() bool {
+		get()
+		r := inspect.Current()
+		return r != nil && r.Store().Rows() <= 3
+	}, 15*time.Second, "row count trimmed to the reloaded max_requests")
+}
+
+// TestShutdownClosesInspectorStoreAfterEverythingElse guards the ordering
+// hazard found in review: Recorder.Close() closes the same SQLite handle
+// the dashboard's history endpoints read from (Store()), so the daemon
+// must stop serving before it closes the store — otherwise a request
+// racing shutdown could query a closed database. It also guards
+// SetCurrent(nil) running before Close(): skip that and a record submitted
+// in the shutdown window sits in the channel forever, counted by nothing.
+//
+// This does not yet have a dashboard endpoint to race against (Tasks 8/9
+// add those), so it checks what is observable now: that Current() is nil
+// before Run returns, and that the store is fully closed and safely
+// reopenable the instant Run returns — proving Close() ran to completion
+// rather than mid-flight or not at all.
+func TestShutdownClosesInspectorStoreAfterEverythingElse(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	t.Setenv(listen.EnvFDs, "")
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	dataDir := filepath.Join(dir, "data")
+	cfg := &config.Config{
+		Suffix:        "test",
+		HTTPPort:      tHTTPPort,
+		HTTPSPort:     tHTTPSPort,
+		DNSPort:       tDNSPort,
+		DashboardPort: tDashPort,
+	}
+	if err := cfg.Save(cfgPath); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, Options{
+			ConfigPath: cfgPath,
+			DataDir:    dataDir,
+			Version:    "test",
+			Log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		})
+	}()
+
+	waitFor(t, func() bool { return inspect.Current() != nil }, 15*time.Second, "inspector up")
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("daemon exited with error: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("daemon did not shut down in time")
+	}
+
+	if inspect.Current() != nil {
+		t.Error("SetCurrent(nil) must run before Close(), or a submit racing shutdown " +
+			"would sit in the channel forever")
+	}
+
+	st, err := inspect.Open(filepath.Join(dataDir, "inspect.db"), inspect.Limits{})
+	if err != nil {
+		t.Fatalf("the store should be cleanly closed and reopenable once Run returns: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Errorf("closing the reopened store: %v", err)
+	}
 }
 
 func waitFor(t *testing.T, cond func() bool, timeout time.Duration, what string) {

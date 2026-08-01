@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/alsey89/switchboard/internal/config"
+	"github.com/alsey89/switchboard/internal/inspect"
 )
 
 //go:embed templates/*.html
@@ -32,6 +33,7 @@ type Server struct {
 	cfg     atomic.Pointer[config.Config]
 	version string
 	httpSrv *http.Server
+	insp    atomic.Pointer[inspect.Recorder]
 }
 
 func New(cfg *config.Config, version string) *Server {
@@ -42,6 +44,10 @@ func New(cfg *config.Config, version string) *Server {
 
 // SetConfig swaps the config shown by the dashboard (called on hot reload).
 func (s *Server) SetConfig(cfg *config.Config) { s.cfg.Store(cfg) }
+
+// SetInspector installs the request recorder the inspector pages read from.
+// A nil recorder means the inspector is off and its endpoints answer 503.
+func (s *Server) SetInspector(r *inspect.Recorder) { s.insp.Store(r) }
 
 // Start begins serving on bind (e.g. "127.0.0.1:8484").
 func (s *Server) Start(bind string) error {

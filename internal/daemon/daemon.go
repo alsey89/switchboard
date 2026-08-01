@@ -21,6 +21,7 @@ import (
 	"github.com/alsey89/switchboard/internal/config"
 	"github.com/alsey89/switchboard/internal/dashboard"
 	"github.com/alsey89/switchboard/internal/dnsd"
+	"github.com/alsey89/switchboard/internal/inspect"
 	"github.com/alsey89/switchboard/internal/listen"
 	"github.com/alsey89/switchboard/internal/proxy"
 )
@@ -41,6 +42,30 @@ func Run(ctx context.Context, opts Options) error {
 	if log == nil {
 		log = slog.Default()
 	}
+
+	// Request inspector state, declared and deferred here, first, so its
+	// cleanup is the *last* thing that runs on the way out.
+	//
+	// insp.Close() closes the SQLite handle that insp.Store() hands to the
+	// dashboard's history endpoints (Tasks 8/9) and that the proxy's
+	// handler submits into via inspect.Current(). Both of those have to
+	// stop serving before the store closes, or a request racing shutdown
+	// queries a closed database. Defers run last-registered-first, so
+	// registering this one before dns/dash/proxy's own defers below is what
+	// makes it unwind after all three of theirs have already run.
+	//
+	// SetCurrent(nil) runs before Close() for a second reason: a record
+	// submitted after Close() returns would sit in the recorder's channel
+	// forever, drained by nobody and counted by nothing. Clearing the
+	// pointer first makes the handler skip Submit entirely once shutdown
+	// starts.
+	var insp *inspect.Recorder
+	defer func() {
+		inspect.SetCurrent(nil)
+		if insp != nil {
+			insp.Close() //nolint:errcheck
+		}
+	}()
 
 	// Sockets a privileged parent bound for us, if we were started by one.
 	// Empty otherwise, in which case everything below binds normally.
@@ -104,6 +129,46 @@ func Run(ctx context.Context, opts Options) error {
 		return friendlyBindError(err, "dashboard", dashBind, opts.ConfigPath)
 	}
 	defer dash.Shutdown(context.Background()) //nolint:errcheck
+
+	// Request inspector. Every failure here is a warning, never a return:
+	// the proxy is the product, and a broken inspector must not be the
+	// reason it does not start. ensureInspector must run before proxy.Load:
+	// that call is what puts the switchboard_inspect handler into Caddy's
+	// config, and the handler reads inspect.Current() on its first request.
+	ensureInspector := func(c *config.Config) {
+		if !c.InspectEnabled() {
+			return
+		}
+		if insp != nil {
+			insp.SetOptions(c.InspectBodies(), c.InspectMaxBodyBytes())
+			insp.Store().SetLimits(inspectLimits(c))
+			return
+		}
+		// The data directory itself is normally created by proxy.Load's
+		// EnsureRoot — but ensureInspector runs before that call, so on a
+		// brand new install nothing has created it yet. Without this,
+		// inspect.Open fails with "no such file or directory" on every
+		// first run and capture never turns on until a restart.
+		if err := os.MkdirAll(opts.DataDir, 0o700); err != nil {
+			log.Warn("inspector disabled: cannot create its data directory", "path", opts.DataDir, "err", err)
+			return
+		}
+		dbPath := filepath.Join(opts.DataDir, "inspect.db")
+		st, err := inspect.Open(dbPath, inspectLimits(c))
+		if err != nil {
+			log.Warn("inspector disabled: cannot open its database", "path", dbPath, "err", err)
+			return
+		}
+		insp = inspect.New(st, inspect.Options{
+			Bodies:       c.InspectBodies(),
+			MaxBodyBytes: c.InspectMaxBodyBytes(),
+			Log:          log,
+		})
+		inspect.SetCurrent(insp)
+		dash.SetInspector(insp)
+		log.Info("inspector up", "db", dbPath, "bodies", c.InspectBodies())
+	}
+	ensureInspector(cfg)
 
 	// Embedded Caddy: proxy + TLS + PKI.
 	httpsAddr, _ := proxy.Addrs(cfg, set)
@@ -176,6 +241,10 @@ func Run(ctx context.Context, opts Options) error {
 			}
 			cfg = next
 			dash.SetConfig(next)
+			// enabled can flip either way in a reload. ensureInspector opens
+			// the store the first time it is turned on, so a user who starts
+			// with it off does not have to restart the daemon to use it.
+			ensureInspector(next)
 			log.Info("config reloaded", "routes", len(cfg.Routes))
 
 		case err, ok := <-watcher.Errors:
@@ -184,6 +253,15 @@ func Run(ctx context.Context, opts Options) error {
 			}
 			log.Warn("config watcher error", "err", err)
 		}
+	}
+}
+
+// inspectLimits translates config settings into the store's limits.
+func inspectLimits(c *config.Config) inspect.Limits {
+	return inspect.Limits{
+		MaxRequests: c.InspectMaxRequests(),
+		MaxBytes:    c.InspectMaxBytes(),
+		MaxAge:      c.InspectMaxAge(),
 	}
 }
 
