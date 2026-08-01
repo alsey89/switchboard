@@ -2,6 +2,8 @@ package service
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -306,6 +308,71 @@ func Install(s Spec, out io.Writer) error {
 // escalation.
 // A var for the same reason as SystemPlistPath.
 var StagedExecPath = "/Library/PrivilegedHelperTools/" + Label
+
+// StagedStale reports whether the installed launch daemon is running a
+// different build from the binary making this call. ok is false when the
+// question does not apply: no launch daemon installed, or the comparison
+// could not be made.
+//
+// It lives here rather than in doctor because doctor is not where people
+// find this out. A `brew upgrade` replaces the binary on PATH and cannot
+// touch the root-owned staged copy, so the two drift on every upgrade, and
+// the person who upgraded to get a fix is the last one who will think to run
+// a diagnostic. Any command can afford to ask this: the sizes differ in the
+// ordinary case, so the answer costs three stats and no reads.
+func StagedStale() (stale, ok bool) {
+	if _, err := os.Stat(SystemPlistPath); err != nil {
+		return false, false // no launch daemon; nothing is staged
+	}
+	current, err := os.Executable()
+	if err != nil {
+		return false, false
+	}
+	same, err := sameContents(current, StagedExecPath)
+	if err != nil {
+		return false, false
+	}
+	return !same, true
+}
+
+// sameContents reports whether two files are byte-identical. Sizes are
+// compared first because the binary is ~64MB and differing sizes settle it
+// without reading either file — which is the common case after an upgrade.
+func sameContents(a, b string) (bool, error) {
+	fa, err := os.Stat(a)
+	if err != nil {
+		return false, err
+	}
+	fb, err := os.Stat(b)
+	if err != nil {
+		return false, err
+	}
+	if fa.Size() != fb.Size() {
+		return false, nil
+	}
+	ha, err := fileSum(a)
+	if err != nil {
+		return false, err
+	}
+	hb, err := fileSum(b)
+	if err != nil {
+		return false, err
+	}
+	return ha == hb, nil
+}
+
+func fileSum(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close() //nolint:errcheck
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
 
 // stagePrivilegedBinary copies exe to StagedExecPath as root and verifies
 // that nothing but root can modify it — including through any directory

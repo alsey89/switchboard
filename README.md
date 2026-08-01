@@ -135,7 +135,8 @@ switchboard setup            make it work: CA, resolver, CA trust, service
                              (--no-service to run the daemon yourself)
 switchboard uninstall        undo all of that (keeps your config)
 
-switchboard add <name> <port>   route a domain (bare names get .test appended)
+switchboard add <name> <port>   route a domain (bare names get .test appended;
+                                re-adding a name changes the port)
 switchboard add api --upstream 192.168.1.5:8080
 switchboard rm <name>        remove a route
 switchboard ls               list routes and status
@@ -145,7 +146,7 @@ switchboard version          print the version
 
 switchboard start            run the daemon in this terminal instead
 switchboard daemon install   (re)install the background service, or restart it
-switchboard daemon status    is it installed and running?
+switchboard daemon status    is it installed, and is it actually serving?
 switchboard daemon logs      show the service log (-f to follow, --path for it)
 switchboard daemon uninstall stop and remove the background service
 ```

@@ -1,9 +1,6 @@
 package doctor
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -152,17 +149,14 @@ func osChecks(cfg *config.Config, rootCertPath string) []Check {
 		// staleness has to be visible, or you would debug a fixed bug against
 		// a daemon still running the old build.
 		if kind == "launch daemon" {
-			if current, err := os.Executable(); err == nil {
-				same, cmpErr := sameContents(current, service.StagedExecPath)
-				switch {
-				case cmpErr != nil:
-					// Not worth a check of its own; the exe checks above
-					// already cover a missing or unreadable staged binary.
-				case !same:
-					checks = append(checks, Check{"service version", Warn,
-						"the running daemon is a different build from " + current,
-						"pick up the new binary: switchboard daemon install"})
-				}
+			// service.StagedStale answers ok=false for the cases that are not
+			// worth a check of their own — nothing staged, or unreadable —
+			// since the exe checks above already cover those.
+			if stale, ok := service.StagedStale(); ok && stale {
+				current, _ := os.Executable()
+				checks = append(checks, Check{"service version", Warn,
+					"the running daemon is a different build from " + current,
+					"pick up the new binary: switchboard daemon install"})
 			}
 		}
 
@@ -183,45 +177,6 @@ func osChecks(cfg *config.Config, rootCertPath string) []Check {
 	}
 
 	return checks
-}
-
-// sameContents reports whether two files are byte-identical. Sizes are
-// compared first because the binary is ~64MB and differing sizes settle it
-// without reading either file — which is the common case after an upgrade.
-func sameContents(a, b string) (bool, error) {
-	fa, err := os.Stat(a)
-	if err != nil {
-		return false, err
-	}
-	fb, err := os.Stat(b)
-	if err != nil {
-		return false, err
-	}
-	if fa.Size() != fb.Size() {
-		return false, nil
-	}
-	ha, err := fileSum(a)
-	if err != nil {
-		return false, err
-	}
-	hb, err := fileSum(b)
-	if err != nil {
-		return false, err
-	}
-	return ha == hb, nil
-}
-
-func fileSum(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close() //nolint:errcheck
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // serveProcessUser reports the user running the unprivileged daemon child, or

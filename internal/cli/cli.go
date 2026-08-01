@@ -461,7 +461,10 @@ func cmdAdd(flagConfig *string) *cobra.Command {
 	c := &cobra.Command{
 		Use:   "add <domain> [port]",
 		Short: "Route a domain to a local port (e.g. `switchboard add app 3000`)",
-		Args:  cobra.RangeArgs(1, 2),
+		Long: "Route a domain to a local port.\n\n" +
+			"Adding a name that is already routed changes where it points, so moving\n" +
+			"a dev server to another port is one command rather than `rm` and `add`.",
+		Args: cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			p, err := resolvePaths(*flagConfig)
 			if err != nil {
@@ -494,22 +497,35 @@ func cmdAdd(flagConfig *string) *cobra.Command {
 			}
 			r.Domain = domain
 
-			if _, exists := cfg.FindRoute(domain); exists {
-				return fmt.Errorf("%s is already routed — remove it first: switchboard rm %s", domain, domain)
-			}
-			cfg.Routes = append(cfg.Routes, r)
+			// Re-adding a name changes where it points, rather than failing.
+			// The old behaviour was an error saying to run `rm` first, which
+			// made the most routine edit there is — my dev server moved to
+			// another port — a two-command operation with a memorised
+			// message in the middle.
+			previous, replaced := cfg.SetRoute(r)
 			if err := cfg.Save(p.configPath); err != nil {
 				return err
 			}
 
 			out := cmd.OutOrStdout()
-			fmt.Fprintf(out, "https://%s → %s\n", domain, r.UpstreamAddr())
-			if !dialable(r.UpstreamAddr()) {
+			switch {
+			case replaced && previous.UpstreamAddr() == r.UpstreamAddr():
+				// Say nothing changed rather than reporting a change that did
+				// not happen: a repeated `add` is usually someone checking.
+				fmt.Fprintf(out, "https://%s → %s (unchanged)\n", domain, r.UpstreamAddr())
+			case replaced:
+				fmt.Fprintf(out, "https://%s → %s (was %s)\n",
+					domain, r.UpstreamAddr(), previous.UpstreamAddr())
+			default:
+				fmt.Fprintf(out, "https://%s → %s\n", domain, r.UpstreamAddr())
+			}
+			if !dialProbe(r.UpstreamAddr()) {
 				fmt.Fprintf(out, "  (nothing is listening on %s yet — the route goes live when your server starts)\n", r.UpstreamAddr())
 			}
 			if !daemonRunning(cfg) {
 				fmt.Fprintln(out, "  daemon not running — start it with: switchboard start")
 			}
+			warnIfStale(out)
 			return nil
 		},
 	}
@@ -553,6 +569,7 @@ func cmdRemove(flagConfig *string) *cobra.Command {
 				return err
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "removed %s\n", domain)
+			warnIfStale(cmd.OutOrStdout())
 			return nil
 		},
 	}
@@ -582,7 +599,7 @@ func cmdList(flagConfig *string) *cobra.Command {
 				fmt.Fprintln(tw, "DOMAIN\tUPSTREAM\tSTATUS")
 				for _, r := range routes {
 					status := "down"
-					if dialable(r.UpstreamAddr()) {
+					if dialProbe(r.UpstreamAddr()) {
 						status = "up"
 					}
 					fmt.Fprintf(tw, "https://%s\t%s\t%s\n", r.Domain, r.UpstreamAddr(), status)
@@ -594,6 +611,7 @@ func cmdList(flagConfig *string) *cobra.Command {
 			} else {
 				fmt.Fprintln(out, "\ndaemon: not running — start it with: switchboard start")
 			}
+			warnIfStale(out)
 			return nil
 		},
 	}
@@ -714,6 +732,12 @@ func mustDir() string {
 	return d
 }
 
+// dialProbe is dialable, indirected so tests can answer for it. Without that
+// these commands report on whatever happens to be listening on the machine
+// running the suite, so a developer with the daemon up sees different results
+// from one without it.
+var dialProbe = dialable
+
 func dialable(addr string) bool {
 	c, err := net.DialTimeout("tcp", addr, 400*time.Millisecond)
 	if err != nil {
@@ -724,7 +748,36 @@ func dialable(addr string) bool {
 }
 
 func daemonRunning(cfg *config.Config) bool {
-	return dialable("127.0.0.1:" + strconv.Itoa(cfg.EffHTTPSPort()))
+	return dialProbe(httpsAddr(cfg))
+}
+
+func httpsAddr(cfg *config.Config) string {
+	return "127.0.0.1:" + strconv.Itoa(cfg.EffHTTPSPort())
+}
+
+// stagedStale is service.StagedStale, indirected for the same reason
+// dialProbe is: it reads the real /Library paths otherwise.
+var stagedStale = service.StagedStale
+
+// serviceStatus is service.Status, indirected because it shells out to
+// launchctl. A test that cannot say "the job is up" cannot reach the case
+// this indirection exists for: a live launchd job in front of a daemon that
+// is not serving.
+var serviceStatus = service.Status
+
+// warnIfStale prints one line when the background service is running a
+// different build from this binary.
+//
+// Called from the everyday commands rather than from a root PersistentPreRun,
+// so it stays off `daemon install` (the fix itself), `doctor` (which reports
+// it properly), and `version`. One line, because it repeats on every command
+// until the service is reinstalled, and a notice that long outstays its
+// welcome stops being read.
+func warnIfStale(out io.Writer) {
+	if stale, ok := stagedStale(); ok && stale {
+		fmt.Fprintln(out, "  note: the background service is running an older build "+
+			"— update it: switchboard daemon install")
+	}
 }
 
 func cmdDaemon(flagConfig *string) *cobra.Command {
@@ -737,7 +790,7 @@ func cmdDaemon(flagConfig *string) *cobra.Command {
 	c.AddCommand(
 		cmdDaemonInstall(flagConfig),
 		cmdDaemonUninstall(),
-		cmdDaemonStatus(),
+		cmdDaemonStatus(flagConfig),
 		cmdDaemonLogs(),
 	)
 	return c
@@ -800,12 +853,12 @@ func cmdDaemonUninstall() *cobra.Command {
 	}
 }
 
-func cmdDaemonStatus() *cobra.Command {
+func cmdDaemonStatus(flagConfig *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "status",
-		Short: "Show whether the background service is installed and running",
+		Short: "Show whether the background service is installed and serving",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			state, plistPath, err := service.Status()
+			state, plistPath, err := serviceStatus()
 			if err != nil {
 				return err
 			}
@@ -819,6 +872,33 @@ func cmdDaemonStatus() *cobra.Command {
 			if logPath := service.InstalledLogPath(); logPath != "" {
 				fmt.Fprintf(out, "  logs:  %s\n", logPath)
 			}
+
+			// Whether launchd has a live process is not the question the user
+			// is asking. Under the privileged parent, the supervisor stays up
+			// across every child restart, so a daemon crash-looping on an
+			// unreadable config reports `running` for as long as it keeps
+			// failing — the one command whose job is to say whether it works
+			// answering yes while nothing is served. Probe the port that
+			// carries the traffic, the same thing doctor asks.
+			if state == service.Running {
+				p, err := resolvePaths(*flagConfig)
+				if err != nil {
+					return err
+				}
+				cfg, err := config.Load(p.configPath)
+				if err != nil {
+					return err
+				}
+				addr := httpsAddr(cfg)
+				if dialProbe(addr) {
+					fmt.Fprintf(out, "  serving: %s\n", addr)
+				} else {
+					fmt.Fprintf(out, "  serving: nothing is listening on %s\n", addr)
+					fmt.Fprintln(out, "           the launchd job is up but the daemon is not; "+
+						"check: switchboard daemon logs")
+				}
+			}
+			warnIfStale(out)
 			return nil
 		},
 	}

@@ -23,3 +23,5 @@ func Status() (state State, plistPath string, err error) {
 func InstalledExec() string { return "" }
 
 func InstalledLogPath() string { return "" }
+
+func StagedStale() (stale, ok bool) { return false, false }
