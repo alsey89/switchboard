@@ -150,3 +150,68 @@ func TestUpstreamAddr(t *testing.T) {
 		t.Errorf("got %s", a)
 	}
 }
+
+// TestSetRouteReplacesRatherThanDuplicating.
+//
+// A domain resolves to exactly one upstream, so two routes for the same name
+// is not a state the proxy can act on. Appending blindly would produce it,
+// and which one won would depend on iteration order.
+func TestSetRouteReplacesRatherThanDuplicating(t *testing.T) {
+	c := &Config{Routes: []Route{
+		{Domain: "app.test", Port: 3000},
+		{Domain: "api.test", Port: 4000},
+	}}
+
+	prev, replaced := c.SetRoute(Route{Domain: "app.test", Port: 3001})
+
+	if !replaced {
+		t.Fatal("SetRoute did not report replacing the existing route")
+	}
+	if prev.Port != 3000 {
+		t.Errorf("previous.Port = %d, want 3000 — the caller needs this to say what changed", prev.Port)
+	}
+	if len(c.Routes) != 2 {
+		t.Fatalf("got %d routes, want 2: %+v", len(c.Routes), c.Routes)
+	}
+	got, _ := c.FindRoute("app.test")
+	if got.Port != 3001 {
+		t.Errorf("app.test still points at %d", got.Port)
+	}
+	if other, _ := c.FindRoute("api.test"); other.Port != 4000 {
+		t.Errorf("replacing one route disturbed another: api.test = %d", other.Port)
+	}
+}
+
+// TestSetRouteAppendsANewDomain: the replace path must not swallow names that
+// do not exist yet.
+func TestSetRouteAppendsANewDomain(t *testing.T) {
+	c := &Config{Routes: []Route{{Domain: "app.test", Port: 3000}}}
+
+	prev, replaced := c.SetRoute(Route{Domain: "api.test", Port: 4000})
+
+	if replaced {
+		t.Errorf("SetRoute reported replacing a route that did not exist (previous: %+v)", prev)
+	}
+	if len(c.Routes) != 2 {
+		t.Fatalf("got %d routes, want 2: %+v", len(c.Routes), c.Routes)
+	}
+}
+
+// TestSetRouteChangesTheUpstreamKind covers switching a route between a local
+// port and an --upstream host:port. Replacing the struct wholesale is what
+// makes this work; merging fields would leave the old Port set and the route
+// pointing somewhere neither value describes.
+func TestSetRouteChangesTheUpstreamKind(t *testing.T) {
+	c := &Config{Routes: []Route{{Domain: "app.test", Port: 3000}}}
+
+	c.SetRoute(Route{Domain: "app.test", Upstream: "192.168.1.5:8080"})
+
+	got, _ := c.FindRoute("app.test")
+	if got.Port != 0 {
+		t.Errorf("Port survived the switch to --upstream (%d); the route now has two "+
+			"sources of truth", got.Port)
+	}
+	if got.UpstreamAddr() != "192.168.1.5:8080" {
+		t.Errorf("UpstreamAddr() = %q, want 192.168.1.5:8080", got.UpstreamAddr())
+	}
+}

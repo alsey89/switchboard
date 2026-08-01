@@ -214,11 +214,25 @@ root's.
 
 ```console
 $ switchboard add app 3000        # https://app.test → 127.0.0.1:3000
+$ switchboard add app 3001        # same name again: changes the port
 $ switchboard ls                  # routes and whether each upstream is up
 $ switchboard doctor              # every assumption above, checked
-$ switchboard daemon status
+$ switchboard daemon status       # installed, and actually serving?
 $ switchboard daemon logs         # last 50 lines; -f to follow, --path for the path
 ```
+
+`daemon status` asks launchd whether the job is up *and* dials the HTTPS port,
+because those are different questions. Under the privileged parent the
+supervisor stays alive across every child restart, so a daemon crash-looping
+on an unreadable config leaves the job `running` for as long as it keeps
+failing. Reporting only what launchd thinks meant the one command whose job is
+to say whether Switchboard works answered yes while nothing was served.
+
+The everyday commands also print one line when the background service is
+running a different build from the binary you just ran. `brew upgrade`
+replaces the binary on your PATH and cannot touch the root-owned staged copy
+(§2), so the two drift on every upgrade, and the person who upgraded to get a
+fix is the last one who would think to run a diagnostic.
 
 Editing `~/.config/switchboard/config.toml` by hand works identically — the
 daemon watches the file.

@@ -359,6 +359,25 @@ func (c *Config) Domains() []string {
 	return out
 }
 
+// SetRoute installs r, replacing any existing route for the same domain, and
+// reports the route it replaced.
+//
+// Replacing rather than refusing: pointing a name at a different port is the
+// most common thing anyone does after adding it, and `add` used to answer
+// that with an error telling you to run `rm` first. A domain resolves to
+// exactly one upstream, so a second `add` for the same name has only one
+// possible meaning.
+func (c *Config) SetRoute(r Route) (previous Route, replaced bool) {
+	for i := range c.Routes {
+		if c.Routes[i].Domain == r.Domain {
+			previous, c.Routes[i] = c.Routes[i], r
+			return previous, true
+		}
+	}
+	c.Routes = append(c.Routes, r)
+	return Route{}, false
+}
+
 // FindRoute returns the route for domain, if any.
 func (c *Config) FindRoute(domain string) (Route, bool) {
 	for _, r := range c.Routes {
