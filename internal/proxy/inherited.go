@@ -42,9 +42,10 @@ func init() {
 			return nil, fmt.Errorf("no inherited socket for %s — the privileged parent "+
 				"did not pass this address", addr)
 		}
-		// Wrapped so Caddy's reload cycle cannot close a descriptor it did
-		// not open; see listen.KeepOpen.
-		return listen.KeepOpen(v.(net.Listener)), nil
+		// One generation per config load. The descriptor is still never
+		// closed, but the previous generation stops accepting — see
+		// listen.Handoff for why both halves are required.
+		return v.(*listen.Handoff).Next(), nil
 	})
 }
 
@@ -60,8 +61,13 @@ func registerInherited(set *listen.Set, want map[string]string) map[string]strin
 			continue
 		}
 		actual := set.Addr(name)
-		ln, _ := set.Listen(name, "") // cannot fail: it is inherited
-		inheritedByAddr.Store(actual, ln)
+		// One Handoff per socket, for the life of the process. Making a new
+		// one per reload would start a second accept loop on the same
+		// descriptor, which is the thing the Handoff exists to prevent.
+		if _, ok := inheritedByAddr.Load(actual); !ok {
+			ln, _ := set.Listen(name, "") // cannot fail: it is inherited
+			inheritedByAddr.Store(actual, listen.NewHandoff(ln))
+		}
 		addrs[name] = inheritedNetwork + "/" + actual
 	}
 	return addrs
