@@ -61,13 +61,20 @@ homebrew_casks:
           if system_command("/usr/bin/xattr", args: ["-h"]).exit_status == 0
             system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/switchboard"]
           end
-    # `brew uninstall` should not leave the launchd job that `switchboard
-    # setup` installs loaded and pointing at a deleted binary. The same label
-    # covers both shapes — the user agent and the privileged launch daemon —
-    # but Homebrew runs uninstall unprivileged, so it can only boot out the
-    # agent. `switchboard uninstall` is what removes the system daemon, and
-    # the caveats say so.
-    uninstall:
+    # zap, not uninstall. Homebrew runs the *old* version's uninstall as part
+    # of an upgrade, so a launchctl stanza there boots out the running service
+    # every time anyone upgrades — password prompt included, since Homebrew
+    # does escalate for a LaunchDaemon. That left a working install serving
+    # nothing, with no indication until a page failed to load. zap runs only
+    # on `brew uninstall --zap`.
+    #
+    # Leaving it out of uninstall costs less than it looks. The launch daemon
+    # runs the root-owned copy in /Library/PrivilegedHelperTools, which
+    # Homebrew never touches, so it keeps working after `brew uninstall` — the
+    # stanza was never protecting the shape it broke. Only the agent shape
+    # names the binary Homebrew unlinks, and `switchboard uninstall` removes
+    # that correctly in both shapes.
+    zap:
       launchctl:
         - io.github.alsey89.switchboard
     # Keep in step with README.md's quickstart. This text is a published
@@ -105,6 +112,9 @@ homebrew_casks:
       To remove everything, including the privileged launch daemon:
 
         switchboard uninstall
+
+      Run that before `brew uninstall`. Homebrew cannot remove the privileged
+      parts on its own.
 
 release:
   draft: false

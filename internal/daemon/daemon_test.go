@@ -93,6 +93,28 @@ func startEnv(t *testing.T, routes []config.Route) *testEnv {
 			t.Error("daemon did not shut down in time")
 		}
 	})
+
+	// An accepting socket is not a working TLS stack. Caddy's internal PKI
+	// finishes preparing its issuer after the listener starts accepting, so a
+	// request sent in that window loses the race and comes back
+	// `tls: internal error` — a failure that says nothing about the thing
+	// under test. Waiting on dialable() alone made this flaky in CI, where it
+	// failed on both runners while passing locally eight times running.
+	//
+	// The dashboard domain is the readiness signal because every config has
+	// one, whatever routes the caller asked for, and serving it end to end
+	// proves the one thing the port check does not: that the CA can issue.
+	gate := env.client()
+	gate.Timeout = 2 * time.Second
+	waitFor(t, func() bool {
+		resp, err := gate.Get(fmt.Sprintf("https://%s:%d/", cfg.DashboardDomain(), tHTTPSPort))
+		if err != nil {
+			return false
+		}
+		resp.Body.Close() //nolint:errcheck
+		return true
+	}, 30*time.Second, "daemon able to issue a certificate")
+
 	return env
 }
 
