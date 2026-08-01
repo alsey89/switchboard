@@ -4,6 +4,26 @@ What changed in each release, and anything you need to do about it.
 
 ## Unreleased
 
+Nothing yet.
+
+## 0.2.3 — 2026-08-01
+
+### Fixed
+
+- **Changing a route now takes effect completely.** After editing a route,
+  some requests kept going to the old destination. Not for a moment during
+  the change: for as long as the daemon kept running. You would get a working
+  page most of the time and an occasional "502 Bad Gateway" pointing at a
+  port you had already moved away from.
+
+  The intermittence was the worst part. It looked like your own dev server
+  was unreliable, because most requests were fine.
+
+  If you have been restarting Switchboard after every route change to make it
+  stick, you can stop.
+
+## 0.2.2 — 2026-08-01
+
 ### Fixed
 
 - **Upgrading no longer stops Switchboard.** `brew upgrade` was shutting down
@@ -11,10 +31,10 @@ What changed in each release, and anything you need to do about it.
   stopped loading until you reinstalled the service by hand. Upgrades now
   leave it running.
 
-  This fix only takes effect from the *next* upgrade onward, because the
-  version you upgrade away from is the one that decides what happens. So one
-  more upgrade will still stop the service. If your sites stop loading right
-  after upgrading, run `switchboard daemon install` and you are back.
+  This took effect from the *next* upgrade after this one, because the
+  version you upgrade away from is the one that decides what happens. If you
+  came from 0.2.1 or earlier and your sites stopped loading, that was the
+  last time: run `switchboard daemon install` and you are back.
 
 ### Changed
 
@@ -22,7 +42,7 @@ What changed in each release, and anything you need to do about it.
   everything Switchboard put on your machine, run `switchboard uninstall`
   first. Homebrew cannot remove the privileged parts on its own.
 
-## 0.2.1
+## 0.2.1 — 2026-08-01
 
 ### Fixed
 
@@ -47,7 +67,7 @@ What changed in each release, and anything you need to do about it.
   only `switchboard doctor` knew, so it was easy to upgrade for a fix and hit
   the same bug.
 
-## 0.2.0
+## 0.2.0 — 2026-07-31
 
 First public release. macOS only.
 
