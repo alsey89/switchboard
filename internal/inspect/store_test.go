@@ -2,6 +2,7 @@ package inspect
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -113,7 +114,13 @@ func TestTrimByRowCap(t *testing.T) {
 }
 
 func TestTrimByByteCap(t *testing.T) {
-	s := testStore(t, Limits{MaxRequests: 10000, MaxBytes: 900, MaxAge: time.Hour})
+	dir := t.TempDir()
+	path := filepath.Join(dir, "inspect.db")
+	lim := Limits{MaxRequests: 10000, MaxBytes: 900, MaxAge: time.Hour}
+	s, err := Open(path, lim)
+	if err != nil {
+		t.Fatal(err)
+	}
 	now := time.Now()
 	for i := 0; i < 40; i++ {
 		r := rec(now, fmt.Sprintf("/%d", i))
@@ -126,19 +133,47 @@ func TestTrimByByteCap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) == 0 {
-		t.Fatal("byte cap trimmed everything")
-	}
-	if len(got) >= 40 {
-		t.Fatalf("kept %d rows, byte cap did not bite", len(got))
+	// Each row costs 128 (rowOverhead) + ~18 (req header JSON) + ~31 (resp
+	// header JSON) + 100 (body) + len(path) + len("app.test") = 287 bytes.
+	// 900 bytes allows exactly 3 of those (861); a fourth would be 1148,
+	// over the cap. `> 0` / `< 40` bounds would also pass with a batch size
+	// of 2 or 4, so only an exact count pins the one-row-at-a-time eviction.
+	if len(got) != 3 {
+		t.Fatalf("kept %d rows, want exactly 3", len(got))
 	}
 	if s.Bytes() > 900 {
 		t.Errorf("running total %d exceeds the cap", s.Bytes())
 	}
+
+	// The in-memory total only proves something if it matches what is
+	// actually on disk. Close and reopen: Open recomputes both totals from
+	// a fresh SELECT COUNT(*)/SUM(size_bytes) over the table, so if they
+	// still match the pre-close values, deleteAndAccount subtracted exactly
+	// what it deleted across every trim in this test rather than drifting.
+	preRows, preBytes := s.Rows(), s.Bytes()
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := Open(path, lim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close() //nolint:errcheck
+	if s2.Rows() != preRows {
+		t.Errorf("reopened row count = %d, want %d (matches the count before close)", s2.Rows(), preRows)
+	}
+	if s2.Bytes() != preBytes {
+		t.Errorf("reopened byte total = %d, want %d (matches the total before close)", s2.Bytes(), preBytes)
+	}
 }
 
 func TestTrimByAge(t *testing.T) {
-	s := testStore(t, Limits{MaxRequests: 1000, MaxBytes: 1 << 30, MaxAge: time.Hour})
+	// MaxAge starts at zero (unbounded) so Insert's own trailing Trim cannot
+	// remove /old before this test gets to exercise anything: with a
+	// nonzero MaxAge from the start, Insert's internal trim deletes /old
+	// immediately and the explicit Trim(now) below never has anything to
+	// do, which would prove nothing about Trim's injectable `now`.
+	s := testStore(t, Limits{MaxRequests: 1000, MaxBytes: 1 << 30})
 	now := time.Now()
 	if err := s.Insert([]*Record{rec(now.Add(-3*time.Hour), "/old")}); err != nil {
 		t.Fatal(err)
@@ -146,6 +181,13 @@ func TestTrimByAge(t *testing.T) {
 	if err := s.Insert([]*Record{rec(now, "/new")}); err != nil {
 		t.Fatal(err)
 	}
+
+	// Turn age enforcement on now, via the config-reload path, and trim
+	// against the fixed `now` captured above rather than wall-clock time.
+	// This is the one place in the suite that actually exercises Trim's
+	// `now` parameter as an input rather than always trimming against
+	// whatever time.Now() happens to return.
+	s.SetLimits(Limits{MaxRequests: 1000, MaxBytes: 1 << 30, MaxAge: time.Hour})
 	if err := s.Trim(now); err != nil {
 		t.Fatal(err)
 	}
@@ -234,6 +276,86 @@ func TestListFilters(t *testing.T) {
 				t.Errorf("got %d rows, want %d", len(got), c.want)
 			}
 		})
+	}
+}
+
+func TestListBeforePaginates(t *testing.T) {
+	s := testStore(t, Limits{MaxRequests: 1000, MaxBytes: 1 << 30, MaxAge: time.Hour})
+	now := time.Now()
+	var ids []int64
+	for i := 0; i < 5; i++ {
+		r := rec(now, fmt.Sprintf("/%d", i))
+		if err := s.Insert([]*Record{r}); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, r.ID)
+	}
+	// ids[0] is the oldest row ("/0"), ids[4] the newest ("/4"); ids are
+	// strictly increasing since AUTOINCREMENT only grows.
+
+	got, err := s.List(Query{Before: ids[3], Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Before excludes the boundary row itself (ids[3], "/3") and everything
+	// newer, leaving only the three rows strictly older than it: /2, /1, /0.
+	if len(got) != 3 {
+		t.Fatalf("got %d rows, want 3", len(got))
+	}
+	for _, r := range got {
+		if r.ID >= ids[3] {
+			t.Errorf("row %s (id %d) is not older than the Before boundary (id %d)", r.Path, r.ID, ids[3])
+		}
+	}
+	if got[0].Path != "/2" {
+		t.Errorf("newest row in the page is %s, want /2", got[0].Path)
+	}
+}
+
+func TestOpenPathWithReservedURICharacters(t *testing.T) {
+	// '?' starts a query string, '#' a fragment, and '%' a percent-escape
+	// in SQLite's own URI filename syntax. A data directory containing any
+	// of them must still open as the literal path it is.
+	//
+	// This has to check more than "Open returned no error and a row round
+	// tripped": an unescaped '?' inside the path gets picked up by the
+	// driver's own naive first-'?' split as the start of the query string,
+	// which silently corrupts parsing of the real "?_pragma=..." query this
+	// package appends — the WAL/busy_timeout pragmas quietly fail to apply
+	// instead of erroring, and Open/Insert/List all still "succeed". Only
+	// asserting on the pragma's actual effect catches that: confirmed by
+	// hand that without escaping the path, this reports "delete", not
+	// "wal", with no error anywhere.
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "weird#dir%100?name")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(sub, "inspect.db")
+
+	s, err := Open(path, Limits{MaxRequests: 100, MaxBytes: 1 << 20, MaxAge: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close() //nolint:errcheck
+
+	var mode string
+	if err := s.db.QueryRow("PRAGMA journal_mode").Scan(&mode); err != nil {
+		t.Fatal(err)
+	}
+	if mode != "wal" {
+		t.Errorf("journal_mode = %q, want %q — the query string got corrupted by an unescaped path", mode, "wal")
+	}
+
+	if err := s.Insert([]*Record{rec(time.Now(), "/x")}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.List(Query{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d rows, want 1", len(got))
 	}
 }
 

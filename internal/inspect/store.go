@@ -69,7 +69,7 @@ type Store struct {
 // enforces max_age for a daemon that was shut down over a weekend: nothing
 // else runs until traffic arrives.
 func Open(path string, lim Limits) (*Store, error) {
-	dsn := "file:" + path + "?_pragma=journal_mode(wal)&_pragma=busy_timeout(5000)"
+	dsn := "file:" + escapeSQLiteURIPath(path) + "?_pragma=journal_mode(wal)&_pragma=busy_timeout(5000)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("opening %s: %w", path, err)
@@ -96,6 +96,17 @@ func Open(path string, lim Limits) (*Store, error) {
 		return nil, fmt.Errorf("trimming %s: %w", path, err)
 	}
 	return s, nil
+}
+
+// escapeSQLiteURIPath percent-encodes the characters that are significant in
+// SQLite's own URI filename syntax (https://www.sqlite.org/uri.html): '?'
+// starts the query string, '#' starts a fragment, and '%' begins a
+// percent-escape. A data directory containing any of them would otherwise
+// be silently reinterpreted instead of opened as the literal path it is.
+// Nothing else is touched — '/' path separators must survive untouched.
+func escapeSQLiteURIPath(path string) string {
+	r := strings.NewReplacer("%", "%25", "?", "%3F", "#", "%23")
+	return r.Replace(path)
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -160,9 +171,11 @@ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 		if err != nil {
 			return err
 		}
-		if id, err := res.LastInsertId(); err == nil {
-			r.ID = id
+		id, err := res.LastInsertId()
+		if err != nil {
+			return err
 		}
+		r.ID = id
 		added += r.SizeBytes
 	}
 	if err := tx.Commit(); err != nil {
@@ -186,7 +199,7 @@ func (s *Store) Trim(now time.Time) error {
 
 	if lim.MaxAge > 0 {
 		cutoff := now.Add(-lim.MaxAge).UnixMicro()
-		if err := s.deleteAndAccount(
+		if _, err := s.deleteAndAccount(
 			`DELETE FROM requests WHERE started_at < ? RETURNING size_bytes`, cutoff); err != nil {
 			return err
 		}
@@ -194,7 +207,7 @@ func (s *Store) Trim(now time.Time) error {
 
 	if lim.MaxRequests > 0 {
 		if excess := s.Rows() - lim.MaxRequests; excess > 0 {
-			if err := s.deleteAndAccount(
+			if _, err := s.deleteAndAccount(
 				`DELETE FROM requests WHERE id IN
 				 (SELECT id FROM requests ORDER BY id ASC LIMIT ?) RETURNING size_bytes`,
 				excess); err != nil {
@@ -211,23 +224,36 @@ func (s *Store) Trim(now time.Time) error {
 		// the byte cap bites deletes the entire table in one go instead of
 		// trimming it back under the limit. One row per iteration is always
 		// exactly as much eviction as the cap demands, no more.
+		//
+		// The loop also has to stop itself on zero progress, not just on
+		// the byte total dropping under the cap: if the in-memory row count
+		// ever drifted ahead of what is actually on disk (Rows() > 0 against
+		// an empty table), a DELETE that frees nothing would otherwise spin
+		// forever. This loop runs on the drain goroutine in the recorder, so
+		// a spin here would hang capture entirely.
 		for s.Bytes() > lim.MaxBytes && s.Rows() > 0 {
-			if err := s.deleteAndAccount(
+			n, err := s.deleteAndAccount(
 				`DELETE FROM requests WHERE id IN
-				 (SELECT id FROM requests ORDER BY id ASC LIMIT 1) RETURNING size_bytes`); err != nil {
+				 (SELECT id FROM requests ORDER BY id ASC LIMIT 1) RETURNING size_bytes`)
+			if err != nil {
 				return err
+			}
+			if n == 0 {
+				break
 			}
 		}
 	}
 	return nil
 }
 
-// deleteAndAccount runs a DELETE ... RETURNING size_bytes and subtracts
-// exactly what it removed from the running totals.
-func (s *Store) deleteAndAccount(query string, args ...any) error {
+// deleteAndAccount runs a DELETE ... RETURNING size_bytes, subtracts exactly
+// what it removed from the running totals, and reports how many rows it
+// deleted so a caller looping on "still over the limit" can tell that
+// apart from "deleted nothing, stop".
+func (s *Store) deleteAndAccount(query string, args ...any) (int, error) {
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer rows.Close() //nolint:errcheck
 
@@ -236,13 +262,13 @@ func (s *Store) deleteAndAccount(query string, args ...any) error {
 	for rows.Next() {
 		var size int64
 		if err := rows.Scan(&size); err != nil {
-			return err
+			return 0, err
 		}
 		n++
 		freed += size
 	}
 	if err := rows.Err(); err != nil {
-		return err
+		return 0, err
 	}
 
 	s.mu.Lock()
@@ -255,7 +281,7 @@ func (s *Store) deleteAndAccount(query string, args ...any) error {
 		s.bytes = 0
 	}
 	s.mu.Unlock()
-	return nil
+	return n, nil
 }
 
 // Clear empties the buffer.
