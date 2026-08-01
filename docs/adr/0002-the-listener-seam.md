@@ -106,6 +106,27 @@ Inherited listeners are therefore wrapped so `Close` is a no-op
 (`listen.KeepOpen`). The lifetime of a descriptor belongs to the process that
 bound it, not to the library serving on it.
 
+**That is only half the problem, and shipping the half looked like it worked.**
+Closing the listener is also how Caddy *retires* a server: it closes, waits
+for the accept loop to end, and considers the old config gone. A listener
+that ignores `Close` never ends that loop, so after every reload two servers
+were accepting from one socket and each connection went to whichever won the
+race. Route edits appeared to apply, then a fraction of requests kept hitting
+the previous config — a 502 against an upstream that no longer existed
+anywhere, mixed in with working responses. It reads as a flaky dev server,
+not as a proxy.
+
+So `listen.Handoff` owns the socket instead. Exactly one goroutine calls
+`Accept` on the real descriptor, and each config load takes a *generation*
+that receives from it; taking a new one retires the previous, whose `Accept`
+then returns `net.ErrClosed` — the signal Caddy is waiting for. The
+descriptor is still never closed.
+
+The general lesson: when you neutralise an operation a library depends on,
+find out what else that operation was for. `Close` here meant both "release
+the descriptor" and "this server is finished", and only the first was
+obviously in play.
+
 ### HTTP/3 is off
 
 Enabling h3 makes Caddy bind a UDP socket on the same port. For `:443` that
