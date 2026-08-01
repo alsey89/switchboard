@@ -13,7 +13,7 @@ through.
 ```console
 $ switchboard setup            # once, ever — resolver, trusted CA, background service
 $ switchboard add app 3000
-https://app.test → 127.0.0.1:3000
+https://app.test → localhost:3000
 $ open https://app.test        # green padlock
 ```
 

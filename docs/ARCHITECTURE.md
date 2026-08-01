@@ -213,13 +213,28 @@ root's.
 ### Day to day
 
 ```console
-$ switchboard add app 3000        # https://app.test → 127.0.0.1:3000
+$ switchboard add app 3000        # https://app.test → localhost:3000
+                                  # a name, not 127.0.0.1: see below
 $ switchboard add app 3001        # same name again: changes the port
 $ switchboard ls                  # routes and whether each upstream is up
 $ switchboard doctor              # every assumption above, checked
 $ switchboard daemon status       # installed, and actually serving?
 $ switchboard daemon logs         # last 50 lines; -f to follow, --path for the path
 ```
+
+The `<port>` shorthand becomes `localhost:<port>`, not `127.0.0.1:<port>`.
+Those are different addresses, and a dev server listening on IPv6 loopback
+only — the default for a lot of Node tooling — never answers on the IPv4 one.
+Hardcoding `127.0.0.1` produced routes that were dead the moment they were
+added and reported as `down`, which is the same word `ls` uses for a server
+that is not running, so it pointed away from the cause. A name lets the
+dialer try both families and take whichever answers, which is exactly what
+the browser does when someone checks `localhost:3000` and concludes their app
+is fine. `--upstream` is passed through untouched: naming an address is how
+you say you meant that one.
+
+This is only about the outbound connection to your dev server. Everything
+Switchboard *listens* on stays pinned to `127.0.0.1` (§1).
 
 `daemon status` asks launchd whether the job is up *and* dials the HTTPS port,
 because those are different questions. Under the privileged parent the

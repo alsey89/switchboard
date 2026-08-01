@@ -63,13 +63,13 @@ func TestAddChangesThePortOfAnExistingRoute(t *testing.T) {
 		t.Fatalf("got %d routes, want 1 — re-adding a name must replace it, not duplicate it: %+v",
 			len(cfg.Routes), cfg.Routes)
 	}
-	if cfg.Routes[0].UpstreamAddr() != "127.0.0.1:3001" {
-		t.Errorf("route points at %s, want 127.0.0.1:3001", cfg.Routes[0].UpstreamAddr())
+	if cfg.Routes[0].UpstreamAddr() != "localhost:3001" {
+		t.Errorf("route points at %s, want localhost:3001", cfg.Routes[0].UpstreamAddr())
 	}
-	if !strings.Contains(got, "127.0.0.1:3001") {
+	if !strings.Contains(got, "localhost:3001") {
 		t.Errorf("output does not name the new port:\n%s", got)
 	}
-	if !strings.Contains(got, "was 127.0.0.1:3000") {
+	if !strings.Contains(got, "was localhost:3000") {
 		t.Errorf("output does not say what it replaced, so a mistyped port looks like a "+
 			"fresh add:\n%s", got)
 	}

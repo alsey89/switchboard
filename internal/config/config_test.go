@@ -142,12 +142,27 @@ func TestLoadMissingFileYieldsDefault(t *testing.T) {
 	}
 }
 
+// TestUpstreamAddr pins the difference between the two ways of naming an
+// upstream.
+//
+// The port shorthand must resolve through a name, so the dialer tries both
+// IPv4 and IPv6 loopback. It used to hardcode 127.0.0.1, which silently
+// produced a dead route for every dev server that binds ::1 only — common
+// with Node. The user saw their app working at localhost:3000 and `ls`
+// reporting `down`, with nothing connecting the two.
+//
+// An explicit --upstream is passed through untouched: naming an address is
+// how you say you meant that address and not the other one.
 func TestUpstreamAddr(t *testing.T) {
-	if a := (&Route{Port: 3000}).UpstreamAddr(); a != "127.0.0.1:3000" {
-		t.Errorf("got %s", a)
+	if a := (&Route{Port: 3000}).UpstreamAddr(); a != "localhost:3000" {
+		t.Errorf("shorthand = %s, want localhost:3000 — an address pins one "+
+			"family and misses servers bound to the other", a)
 	}
 	if a := (&Route{Upstream: "192.168.1.5:80"}).UpstreamAddr(); a != "192.168.1.5:80" {
-		t.Errorf("got %s", a)
+		t.Errorf("explicit upstream = %s, want it unchanged", a)
+	}
+	if a := (&Route{Upstream: "[::1]:3000"}).UpstreamAddr(); a != "[::1]:3000" {
+		t.Errorf("explicit IPv6 upstream = %s, want it unchanged", a)
 	}
 }
 
