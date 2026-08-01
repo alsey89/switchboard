@@ -6,6 +6,23 @@ What changed in each release, and anything you need to do about it.
 
 Nothing yet.
 
+## 0.2.4 — 2026-08-01
+
+### Fixed
+
+- **Routes now reach dev servers that only listen on IPv6.**
+  `switchboard add app 3000` assumed your server was at `127.0.0.1`. A lot of
+  dev servers, Node ones especially, listen only on the IPv6 equivalent. The
+  route never connected, and `switchboard ls` showed it as `down` even though
+  your app was plainly running and reachable at `localhost:3000` in a browser.
+
+  Adding a route by port now finds the server either way. Nothing in your
+  config file changes and existing routes are fixed without editing anything.
+
+  If you worked around this with `--upstream '[::1]:3000'`, that still works
+  and still means exactly the address you typed. Plain `switchboard add app
+  3000` now works too.
+
 ## 0.2.3 — 2026-08-01
 
 ### Fixed
