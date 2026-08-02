@@ -120,6 +120,9 @@
     return true;
   }
 
+  const anyFilterSet = () =>
+    Object.values(filters).some((el) => el.value !== "");
+
   function cell(text, className) {
     const td = document.createElement("td");
     if (className) td.className = className;
@@ -131,7 +134,10 @@
     if (inspectorOff) return;
     const shown = rows.filter(matches).slice(0, MAX_DOM);
     if (!shown.length) {
-      empty(list, "Nothing matches yet.");
+      // An empty buffer (nothing captured yet, or a clear just ran) reads
+      // differently from a filter that happens to match nothing: only the
+      // second one is actually "yet".
+      empty(list, anyFilterSet() ? "Nothing matches yet." : "Waiting for traffic.");
       return;
     }
     const table = document.createElement("table");
@@ -198,8 +204,13 @@
     selected = id;
     render();
     const resp = await fetch("/api/inspect/requests/" + id);
+    // A faster second click may have landed while this one was in flight;
+    // whichever request resolves last must not win over a newer selection.
+    if (selected !== id) return;
+    if (resp.status === 503) { setOff(true); return; }
     if (!resp.ok) { empty(detail, "Gone. The buffer may have trimmed it."); return; }
     const r = await resp.json();
+    if (selected !== id) return; // still true after the second await
 
     detail.textContent = "";
     detail.append(heading("request"));
@@ -276,29 +287,49 @@
     };
   }
 
-  // poll() doubles as the periodic "N dropped" counter and the way the page
-  // notices the inspector went off (a config reload can flip that while
-  // this page is open), so a stream drop or a stale filter view never
-  // quietly reads as "no traffic" instead of "the inspector is off".
-  async function poll() {
-    if (inspectorOff) return;
-    const resp = await fetch("/api/inspect/requests?limit=1");
-    if (resp.status === 503) {
-      inspectorOff = true;
+  // setOff flips the page between its normal view and the inspector-off
+  // state, in either direction: a config reload can turn the inspector off
+  // or back on while this page stays open, and poll() below is what
+  // notices which way it went.
+  function setOff(off) {
+    if (inspectorOff === off) return;
+    inspectorOff = off;
+    $("pause").disabled = off;
+    $("clear").disabled = off;
+    if (off) {
       if (source) { source.close(); source = null; }
       empty(list, "The inspector is off.");
       empty(detail, "The inspector is off.");
-      $("pause").disabled = true;
-      $("clear").disabled = true;
       $("drops").textContent = "";
-      return;
+    } else {
+      selected = null;
+      render();
+      empty(detail, "Pick a request.");
+      if (live) connect();
     }
-    if (!resp.ok) return;
-    const { dropped } = await resp.json();
-    $("drops").textContent = dropped ? dropped + " dropped" : "";
   }
 
-  poll().then(() => { if (!inspectorOff) connect(); });
+  // poll() doubles as the periodic "N dropped" counter and the way the page
+  // notices the inspector turned off, or back on, while it stayed open, so
+  // a stream drop or a stale filter view never quietly reads as "no
+  // traffic" instead of "the inspector is off" — and a network failure
+  // (the daemon restarting, the machine asleep) leaves the current view
+  // alone instead of silently killing the live connection for good.
+  async function poll() {
+    try {
+      const resp = await fetch("/api/inspect/requests?limit=1");
+      if (resp.status === 503) { setOff(true); return; }
+      if (!resp.ok) return;
+      if (inspectorOff) setOff(false);
+      const { dropped } = await resp.json();
+      $("drops").textContent = dropped ? dropped + " dropped" : "";
+    } catch {
+      // Fetch rejected outright — offline, daemon mid-restart. Not the same
+      // as a clean 503, so leave the page as is and let the next tick retry.
+    }
+  }
+
+  poll().finally(() => { if (!inspectorOff) connect(); });
   setInterval(poll, 10000);
 })();
 </script>
