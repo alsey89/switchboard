@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -34,10 +35,22 @@ type Server struct {
 	version string
 	httpSrv *http.Server
 	insp    atomic.Pointer[inspect.Recorder]
+
+	// done is closed by Shutdown, before http.Server.Shutdown runs. It is
+	// how a long-lived handler learns the server wants to stop.
+	//
+	// http.Server.Shutdown waits for active requests to return and never
+	// cancels their contexts, so a handler that only watches the client
+	// (the SSE stream did) blocks shutdown for as long as the browser tab
+	// stays open. An inspector left in a background tab held the whole
+	// daemon up: no DNS teardown, no WAL checkpoint, and a second Ctrl-C
+	// does nothing because signal.NotifyContext already owns the handler.
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 func New(cfg *config.Config, version string) *Server {
-	s := &Server{version: version}
+	s := &Server{version: version, done: make(chan struct{})}
 	s.cfg.Store(cfg)
 	return s
 }
@@ -139,7 +152,11 @@ func (s *Server) guardPage(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// Shutdown stops serving. It signals long-lived handlers first, then waits
+// for http.Server to drain, so a handler that is watching s.done has already
+// been told to leave by the time the wait begins. Safe to call twice.
 func (s *Server) Shutdown(ctx context.Context) error {
+	s.closeOnce.Do(func() { close(s.done) })
 	if s.httpSrv == nil {
 		return nil
 	}

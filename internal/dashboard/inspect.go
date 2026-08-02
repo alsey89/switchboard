@@ -58,6 +58,21 @@ func toJSON(r *inspect.Record) recordJSON {
 	}
 }
 
+// withoutBodies strips the captured bodies from a wire record.
+//
+// The stream is a list feed. Its backfill comes from Store.List, which omits
+// bodies by design, so a live event that carried them made the same record
+// arrive in two different shapes depending on which path it took. It also
+// put up to max_body_bytes on the wire twice per record, for a view that
+// never renders it, and held that much per record in every subscriber's
+// 256-deep channel. The page refetches the full record from the detail
+// endpoint when a row is opened.
+func withoutBodies(j recordJSON) recordJSON {
+	j.ReqBody = ""
+	j.RespBody = ""
+	return j
+}
+
 // recorder returns the active recorder, or writes a 503 and reports false.
 func (s *Server) recorder(w http.ResponseWriter) (*inspect.Recorder, bool) {
 	rec := s.insp.Load()
@@ -264,13 +279,20 @@ func (s *Server) handleInspectStream(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 
+		case <-s.done:
+			// The server is shutting down. http.Server.Shutdown waits for
+			// this handler and will not cancel r.Context() to get it, so
+			// without this case an open inspector tab holds the daemon up
+			// forever. See the note on Server.done.
+			return
+
 		case record, open := <-ch:
 			if !open {
 				// Dropped for falling behind. Closing here is the whole
 				// point: EventSource reconnects and backfills.
 				return
 			}
-			sendEvent(w, toJSON(record))
+			sendEvent(w, withoutBodies(toJSON(record)))
 			if err := rc.Flush(); err != nil {
 				return
 			}

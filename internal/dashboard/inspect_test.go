@@ -2,6 +2,7 @@ package dashboard
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -523,4 +524,126 @@ func TestInspectEndpointsSurviveAClosedStore(t *testing.T) {
 			t.Errorf("leaked the driver error: %s", w.Body)
 		}
 	})
+}
+
+// TestShutdownReturnsWithAnOpenStream pins the daemon's shutdown path.
+//
+// http.Server.Shutdown waits for active requests to return, and it does not
+// cancel their contexts. The SSE handler used to select only on the client
+// going away, a record arriving and a 30 second ping, so it never learned
+// that the server wanted to stop: a developer with the inspector open in a
+// background tab could hold the whole daemon up indefinitely, past the DNS
+// teardown and past the WAL checkpoint.
+//
+// The server's own done channel is what closes that gap. This test drives
+// the real *http.Server the stream is running on, so it fails the same way
+// the daemon did.
+func TestShutdownReturnsWithAnOpenStream(t *testing.T) {
+	s, r := testServer(t)
+	seed(t, r, "/x")
+
+	ts := httptest.NewServer(s.mux())
+	defer ts.Close()
+	// Shutdown must drive the same server the stream is served by, which is
+	// what makes this the daemon's situation rather than a no-op.
+	s.httpSrv = ts.Config
+
+	req, err := http.NewRequest("GET", ts.URL+"/api/inspect/stream", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = "switchboard.test"
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Registered after ts.Close above so it runs first: an open stream would
+	// otherwise hold ts.Close for as long as it held Shutdown.
+	defer resp.Body.Close() //nolint:errcheck
+
+	// Read the backfill event, so the handler is past its header write and
+	// sitting in the select rather than still setting up. No sleep needed:
+	// the read itself is the synchronisation.
+	sc := bufio.NewScanner(resp.Body)
+	for sc.Scan() {
+		if strings.HasPrefix(sc.Text(), "data: ") {
+			break
+		}
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- s.Shutdown(context.Background()) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Shutdown: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Shutdown blocked on an open inspector stream")
+	}
+}
+
+// TestStreamOmitsBodiesOnLiveEvents pins the stream's payload shape. The
+// backfill comes from Store.List, which never returns bodies, so a live
+// event that carried them made the same record arrive in two shapes. It is
+// also up to max_body_bytes per record on the wire for a list view that
+// never renders one; the page refetches from the detail endpoint instead.
+func TestStreamOmitsBodiesOnLiveEvents(t *testing.T) {
+	s, r := testServer(t)
+
+	srv := httptest.NewServer(s.mux())
+	defer srv.Close()
+
+	req, err := http.NewRequest("GET", srv.URL+"/api/inspect/stream", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = "switchboard.test"
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close() //nolint:errcheck
+
+	events := make(chan string, 8)
+	go func() {
+		sc := bufio.NewScanner(resp.Body)
+		for sc.Scan() {
+			if line := sc.Text(); strings.HasPrefix(line, "data: ") {
+				events <- strings.TrimPrefix(line, "data: ")
+			}
+		}
+	}()
+
+	r.Submit(&inspect.Record{
+		StartedAt: time.Now(), Domain: "app.test", Method: "POST",
+		Path: "/with-bodies", Status: 200, Proto: "HTTP/1.1",
+		ReqBody: []byte("secret request"), RespBody: []byte("secret response"),
+	})
+
+	select {
+	case got := <-events:
+		if !strings.Contains(got, "/with-bodies") {
+			t.Fatalf("unexpected first event: %s", got)
+		}
+		var row struct {
+			ID       int64  `json:"id"`
+			ReqBody  string `json:"req_body"`
+			RespBody string `json:"resp_body"`
+		}
+		if err := json.Unmarshal([]byte(got), &row); err != nil {
+			t.Fatal(err)
+		}
+		if row.ReqBody != "" || row.RespBody != "" {
+			t.Errorf("stream carried bodies: req=%q resp=%q", row.ReqBody, row.RespBody)
+		}
+		// The bodies must still be reachable, just not over the stream.
+		w := do(s, "GET", "/api/inspect/requests/"+itoa(row.ID), nil)
+		if !strings.Contains(w.Body.String(), "secret response") {
+			t.Errorf("the detail endpoint lost the body: %s", w.Body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no live event")
+	}
 }

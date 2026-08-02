@@ -128,7 +128,17 @@ func Run(ctx context.Context, opts Options) error {
 	if err := dash.Start(dashBind); err != nil {
 		return friendlyBindError(err, "dashboard", dashBind, opts.ConfigPath)
 	}
-	defer dash.Shutdown(context.Background()) //nolint:errcheck
+	// Bounded, not context.Background(). The dashboard's own Shutdown tells
+	// its long-lived handlers to leave before it waits for them, so this
+	// deadline should never be reached — it is here so that a future handler
+	// that forgets to watch that signal costs five seconds at shutdown
+	// instead of hanging the daemon and everything registered to unwind
+	// after it.
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		dash.Shutdown(ctx) //nolint:errcheck
+	}()
 
 	// Request inspector. Every failure here is a warning, never a return:
 	// the proxy is the product, and a broken inspector must not be the
