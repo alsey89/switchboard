@@ -55,12 +55,41 @@ func (s *Server) Start(bind string) error {
 	if err != nil {
 		return err
 	}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/routes", s.handleAPIRoutes)
-	mux.HandleFunc("/", s.handleRoot)
-	s.httpSrv = &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	s.httpSrv = &http.Server{Handler: s.mux(), ReadHeaderTimeout: 10 * time.Second}
 	go s.httpSrv.Serve(ln) //nolint:errcheck // exits on Shutdown
 	return nil
+}
+
+// mux builds the routing table. Split out from Start so tests can drive the
+// real routes without binding a port.
+func (s *Server) mux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/routes", s.handleAPIRoutes)
+	mux.HandleFunc("/api/inspect/requests", s.guard(s.handleInspectRequests))
+	mux.HandleFunc("/api/inspect/requests/", s.guard(s.handleInspectRecord))
+	mux.HandleFunc("/api/inspect/clear", s.guard(s.handleInspectClear))
+	mux.HandleFunc("/api/inspect/stream", s.guard(s.handleInspectStream))
+	mux.HandleFunc("/inspect", s.guard(s.handleInspectPage))
+	mux.HandleFunc("/", s.handleRoot)
+	return mux
+}
+
+// guard rejects requests whose Host is neither the dashboard domain nor a
+// direct loopback address.
+//
+// handleRoot answers a foreign Host with the friendly "no route" page,
+// because a browser landing on an unrouted *.test name deserves an
+// explanation. An API path does not: there is no user reading it, so it gets
+// a flat 404 and no hint that anything is here.
+func (s *Server) guard(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		host := strings.ToLower(hostOnly(r.Host))
+		if host != s.cfg.Load().DashboardDomain() && !isLoopbackHost(host) {
+			http.NotFound(w, r)
+			return
+		}
+		h(w, r)
+	}
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {

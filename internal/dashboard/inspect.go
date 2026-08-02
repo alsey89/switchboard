@@ -1,0 +1,202 @@
+package dashboard
+
+import (
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+
+	"github.com/alsey89/switchboard/internal/inspect"
+)
+
+// recordJSON is the wire shape of a captured request. Bodies are strings
+// because that is what a browser can show; captured bytes that are not valid
+// UTF-8 are replaced rather than dropped, so a binary body still reads as
+// "something was here" instead of vanishing.
+type recordJSON struct {
+	ID          int64               `json:"id"`
+	StartedAt   string              `json:"started_at"`
+	DurationMS  float64             `json:"duration_ms"`
+	Domain      string              `json:"domain"`
+	Method      string              `json:"method"`
+	Path        string              `json:"path"`
+	Status      int                 `json:"status"`
+	Proto       string              `json:"proto"`
+	Upgraded    bool                `json:"upgraded"`
+	ReqBytes    int64               `json:"req_bytes"`
+	RespBytes   int64               `json:"resp_bytes"`
+	Error       string              `json:"error,omitempty"`
+	ReqHeaders  map[string][]string `json:"req_headers,omitempty"`
+	RespHeaders map[string][]string `json:"resp_headers,omitempty"`
+	ReqBody     string              `json:"req_body,omitempty"`
+	RespBody    string              `json:"resp_body,omitempty"`
+}
+
+func toJSON(r *inspect.Record) recordJSON {
+	return recordJSON{
+		ID:          r.ID,
+		StartedAt:   r.StartedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
+		DurationMS:  float64(r.Duration.Microseconds()) / 1000,
+		Domain:      r.Domain,
+		Method:      r.Method,
+		Path:        r.Path,
+		Status:      r.Status,
+		Proto:       r.Proto,
+		Upgraded:    r.Upgraded,
+		ReqBytes:    r.ReqBytes,
+		RespBytes:   r.RespBytes,
+		Error:       r.Error,
+		ReqHeaders:  r.ReqHeaders,
+		RespHeaders: r.RespHeaders,
+		ReqBody:     string(r.ReqBody),
+		RespBody:    string(r.RespBody),
+	}
+}
+
+// recorder returns the active recorder, or writes a 503 and reports false.
+func (s *Server) recorder(w http.ResponseWriter) (*inspect.Recorder, bool) {
+	rec := s.insp.Load()
+	if rec == nil {
+		http.Error(w, "the inspector is off", http.StatusServiceUnavailable)
+		return nil, false
+	}
+	return rec, true
+}
+
+// storeError answers a store failure without ever putting the raw driver or
+// filesystem text on the page.
+//
+// A reload can call SetInspector(nil) and close the store between the
+// moment a handler loads the recorder pointer and the moment its query
+// runs: that pointer swap is a bare atomic store with no barrier for a
+// reader already in flight. database/sql's own response to a query on a
+// closed *DB is "sql: database is closed" — a plain string, not an exported
+// sentinel, so it is matched by substring here. Anything else is a genuine
+// query failure and gets a generic 500; either way the operator sees a
+// clean message, not a driver string.
+func storeError(w http.ResponseWriter, err error) {
+	if strings.Contains(err.Error(), "database is closed") {
+		http.Error(w, "the inspector is off", http.StatusServiceUnavailable)
+		return
+	}
+	http.Error(w, "inspector query failed", http.StatusInternalServerError)
+}
+
+func (s *Server) handleInspectRequests(w http.ResponseWriter, r *http.Request) {
+	rec, ok := s.recorder(w)
+	if !ok {
+		return
+	}
+	q := r.URL.Query()
+	limit, _ := strconv.Atoi(q.Get("limit"))
+	before, _ := strconv.ParseInt(q.Get("before"), 10, 64)
+
+	rows, err := rec.Store().List(inspect.Query{
+		Domain: q.Get("domain"),
+		Method: q.Get("method"),
+		Status: q.Get("status"),
+		Q:      q.Get("q"),
+		Before: before,
+		Limit:  limit,
+	})
+	if err != nil {
+		storeError(w, err)
+		return
+	}
+
+	out := struct {
+		Requests []recordJSON `json:"requests"`
+		Dropped  int64        `json:"dropped"`
+	}{Requests: []recordJSON{}, Dropped: rec.Dropped()}
+	for _, row := range rows {
+		out.Requests = append(out.Requests, toJSON(row))
+	}
+	writeJSON(w, out)
+}
+
+func (s *Server) handleInspectRecord(w http.ResponseWriter, r *http.Request) {
+	rec, ok := s.recorder(w)
+	if !ok {
+		return
+	}
+	idStr := strings.TrimPrefix(r.URL.Path, "/api/inspect/requests/")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	row, err := rec.Store().Get(id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+			return
+		}
+		storeError(w, err)
+		return
+	}
+	writeJSON(w, toJSON(row))
+}
+
+// handleInspectClear empties the buffer.
+//
+// This is the dashboard's only state-changing endpoint, so it states its
+// rule rather than inheriting one. POST only, and Origin must be present and
+// match. An absent Origin is refused rather than trusted: browsers always
+// send it on fetch, so refusing absence closes the simple-request CSRF hole
+// that loopback alone does not.
+//
+// What it destroys is captured traffic. No route, no trust setting, no
+// config. When route mutation lands it will need this same check, harder.
+func (s *Server) handleInspectClear(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "use POST", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.sameOrigin(r) {
+		http.Error(w, "bad origin", http.StatusForbidden)
+		return
+	}
+	rec, ok := s.recorder(w)
+	if !ok {
+		return
+	}
+	if err := rec.Store().Clear(); err != nil {
+		storeError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// sameOrigin reports whether the request carries an Origin naming this
+// dashboard. A missing Origin is not same-origin.
+func (s *Server) sameOrigin(r *http.Request) bool {
+	o := r.Header.Get("Origin")
+	if o == "" {
+		return false
+	}
+	u, err := url.Parse(o)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(hostOnly(u.Host))
+	return host == s.cfg.Load().DashboardDomain() || isLoopbackHost(host)
+}
+
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(v) //nolint:errcheck
+}
+
+// handleInspectStream is a stub. Task 9 replaces it with the SSE feed.
+func (s *Server) handleInspectStream(w http.ResponseWriter, r *http.Request) {
+	http.Error(w, "not implemented", http.StatusNotImplemented)
+}
+
+// handleInspectPage is a stub. Task 10 replaces it with the inspector page.
+func (s *Server) handleInspectPage(w http.ResponseWriter, r *http.Request) {
+	http.Error(w, "not implemented", http.StatusNotImplemented)
+}
