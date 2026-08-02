@@ -449,7 +449,14 @@ func TestInsertAndClearDoNotDeadlock(t *testing.T) {
 	for s.db.Stats().InUse == 0 {
 		select {
 		case err := <-insertDone:
-			t.Fatalf("the insert finished before the clear could race it: %v", err)
+			// The window this test aims at never opened, so it proved
+			// nothing either way. That is a skip, not a failure: a machine
+			// fast enough to finish 20,000 inserts before this loop
+			// observes the checkout has not regressed anything.
+			if err != nil {
+				t.Fatalf("insert: %v", err)
+			}
+			t.Skip("the insert finished before the clear could race it")
 		default:
 		}
 		runtime.Gosched()

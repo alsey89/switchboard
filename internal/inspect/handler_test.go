@@ -380,3 +380,102 @@ func TestHandlerRecordsAnHTTP2ExtendedConnectWebSocketImmediately(t *testing.T) 
 			"Upgraded is what marks the row", rows[0].Status)
 	}
 }
+
+// TestHandlerUpgradeWithBodiesOnKeepsHeadersAndDropsBodies pins both spec
+// rules at once, because a fix for either one alone breaks the other.
+//
+// Bodies are never captured for an upgraded connection: what follows a 101
+// is a frame stream, not a request body with an end. But bodies-on still
+// means headers are copied as sent, and an upgraded row is not an exception
+// to that — someone debugging a handshake with bodies on is exactly the
+// person who needs Cookie and Sec-WebSocket-Protocol unredacted.
+func TestHandlerUpgradeWithBodiesOnKeepsHeadersAndDropsBodies(t *testing.T) {
+	r := withRecorder(t, Options{Bodies: true, MaxBodyBytes: 4096})
+
+	release := make(chan struct{})
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		h := Handler{}
+		req := httptest.NewRequest("GET", "http://app.test/ws",
+			strings.NewReader("handshake payload"))
+		req.Header.Set("Upgrade", "websocket")
+		req.Header.Set("Cookie", "session=abc123")
+		req.Header.Set("Sec-WebSocket-Protocol", "graphql-ws")
+		rw := httptest.NewRecorder()
+		h.ServeHTTP(rw, req, nextFunc(func(w http.ResponseWriter, r *http.Request) { //nolint:errcheck
+			io.Copy(io.Discard, r.Body) //nolint:errcheck
+			w.WriteHeader(http.StatusSwitchingProtocols)
+			io.WriteString(w, "frame data") //nolint:errcheck
+			<-release
+		}))
+	}()
+
+	waitFor(t, "the upgrade to be recorded", func() bool {
+		rows, err := r.Store().List(Query{Limit: 10})
+		return err == nil && len(rows) == 1 && rows[0].Upgraded
+	})
+	close(release)
+	<-done
+
+	rows, err := r.Store().List(Query{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := r.Store().Get(rows[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(got.ReqBody) != 0 {
+		t.Errorf("an upgraded row captured a request body: %q", got.ReqBody)
+	}
+	if len(got.RespBody) != 0 {
+		t.Errorf("an upgraded row captured a response body: %q", got.RespBody)
+	}
+	// The other half. Forcing bodies=false for the upgrade emit would also
+	// switch this row to redacted headers, which is what this checks.
+	if v := got.ReqHeaders["Cookie"]; len(v) != 1 || v[0] != "session=abc123" {
+		t.Errorf("Cookie = %v, want it as sent: bodies-on means headers are not redacted", v)
+	}
+	if v := got.ReqHeaders["Sec-Websocket-Protocol"]; len(v) != 1 || v[0] != "graphql-ws" {
+		t.Errorf("Sec-WebSocket-Protocol = %v, want it as sent", v)
+	}
+}
+
+// TestHandlerUpgradeWithBodiesOffStillRedacts is the companion: turning the
+// body suppression above into a blanket "upgraded rows are special" must not
+// quietly stop redacting when bodies are off.
+func TestHandlerUpgradeWithBodiesOffStillRedacts(t *testing.T) {
+	r := withRecorder(t, Options{})
+
+	release := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h := Handler{}
+		req := httptest.NewRequest("GET", "http://app.test/ws", nil)
+		req.Header.Set("Upgrade", "websocket")
+		req.Header.Set("Cookie", "session=abc123")
+		h.ServeHTTP(httptest.NewRecorder(), req, nextFunc(func(w http.ResponseWriter, _ *http.Request) { //nolint:errcheck
+			w.WriteHeader(http.StatusSwitchingProtocols)
+			<-release
+		}))
+	}()
+
+	waitFor(t, "the upgrade to be recorded", func() bool {
+		rows, err := r.Store().List(Query{Limit: 10})
+		return err == nil && len(rows) == 1 && rows[0].Upgraded
+	})
+	close(release)
+	<-done
+
+	rows, err := r.Store().List(Query{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := rows[0].ReqHeaders["Cookie"]; len(v) != 1 || v[0] != Redacted {
+		t.Errorf("Cookie = %v, want %q with bodies off", v, Redacted)
+	}
+}

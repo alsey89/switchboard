@@ -76,18 +76,15 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 			return
 		}
 		ww.emitted = true
-		// bodies is false here whatever the live flag says: an upgraded
-		// connection never has its payload captured. What follows a 101 is a
-		// websocket frame stream, not a request body with an end, and the
-		// spec says so. Passing the live flag through let buildRecord attach
-		// whatever the cap readers happened to be holding at the moment of
-		// the upgrade.
-		//
-		// It also means an upgraded row keeps redacted headers even with
-		// bodies on, which is the coherent answer rather than an accident:
-		// the reason bodies-on drops redaction is that the secret is already
-		// on disk in the body next to it, and for this row no body ever is.
-		rec.Submit(buildRecord(r, ww, reqBody, start, time.Now(), false, true, nil))
+		// The live bodies flag is passed through, not forced to false.
+		// buildRecord suppresses the body itself for an upgraded row, which
+		// keeps both spec rules true at once: no body is ever captured for
+		// an upgraded connection, and bodies-on still means headers are
+		// copied as sent. Forcing false here satisfied the first rule by
+		// breaking the second, and the person it broke it for — someone
+		// debugging a handshake with bodies on — is exactly the person who
+		// needs Cookie and Sec-WebSocket-Protocol unredacted.
+		rec.Submit(buildRecord(r, ww, reqBody, start, time.Now(), bodies, true, nil))
 	}
 
 	err := next.ServeHTTP(ww, r)
@@ -159,13 +156,24 @@ func buildRecord(r *http.Request, ww *watcher, reqBody *capReader,
 	if err != nil {
 		out.Error = err.Error()
 	}
+	// An upgraded connection never has its payload captured, whatever the
+	// bodies flag says. What follows a 101 is a websocket frame stream, not
+	// a request body with an end, and this record is written the moment the
+	// upgrade lands — so anything the cap readers happen to be holding at
+	// that instant is a fragment of a handshake, not a body.
+	//
+	// Only the body is suppressed. Header copying above still follows the
+	// bodies flag, because the reason bodies-on drops redaction has nothing
+	// to do with whether this particular row is an upgrade.
+	captureBodies := bodies && !upgraded
+
 	if reqBody != nil {
 		out.ReqBytes = reqBody.total()
-		if bodies {
+		if captureBodies {
 			out.ReqBody = reqBody.captured()
 		}
 	}
-	if bodies && ww.body != nil {
+	if captureBodies && ww.body != nil {
 		out.RespBody = ww.body.captured()
 	}
 	return out
