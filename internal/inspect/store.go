@@ -1,6 +1,7 @@
 package inspect
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -122,6 +123,28 @@ func escapeSQLiteURIPath(path string) string {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+// conn checks a connection out of the pool.
+//
+// It exists to name a rule, not to save a line: the store runs on a single
+// connection, so a connection and s.mu are two locks, and every method that
+// wants both must take them in the same order — connection first, mutex
+// second, always.
+//
+// The other order deadlocks, and it did. Insert begins its transaction
+// (taking the connection) and only then locks the mutex to commit and update
+// the counters. Clear used to lock the mutex and only then run its DELETE,
+// which needs the connection Insert's open transaction is holding. Insert
+// waits for the mutex, Clear waits for the connection, and neither ever
+// returns: the drain goroutine is gone for the life of the process, capture
+// stops, every read blocks behind the connection, and Recorder.Close hangs
+// on it at shutdown.
+//
+// Taking the connection first cannot deadlock, because a goroutine that
+// blocks here holds nothing.
+func (s *Store) conn() (*sql.Conn, error) {
+	return s.db.Conn(context.Background())
+}
+
 // SetLimits swaps the limits, for a config reload. The next trim applies
 // them.
 func (s *Store) SetLimits(lim Limits) {
@@ -194,6 +217,9 @@ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	// was in Clear, where the rows are already durable on disk but a
 	// concurrent Bytes()/Rows()/Trim() reads the pre-commit totals against
 	// a table that has already changed underneath them.
+	//
+	// The transaction above already owns the connection, so this is the
+	// connection-then-mutex order every other method follows. See conn().
 	s.mu.Lock()
 	if err := tx.Commit(); err != nil {
 		s.mu.Unlock()
@@ -274,11 +300,20 @@ func (s *Store) Trim(now time.Time) error {
 // after it, for the same reason as Insert and Clear: releasing it in
 // between would let a concurrent Bytes()/Rows() observe the pre-delete
 // totals against a table the delete has already changed.
+//
+// The connection is checked out before the mutex, never after. See the
+// note on connFirst below.
 func (s *Store) deleteAndAccount(query string, args ...any) (int, error) {
+	conn, err := s.conn()
+	if err != nil {
+		return 0, err
+	}
+	defer conn.Close() //nolint:errcheck
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rows, err := s.db.Query(query, args...)
+	rows, err := conn.QueryContext(context.Background(), query, args...)
 	if err != nil {
 		return 0, err
 	}
@@ -317,9 +352,15 @@ func (s *Store) deleteAndAccount(query string, args ...any) (int, error) {
 // totals — visible to a concurrent Bytes()/Rows() call, and exactly the
 // drift TestTrimStopsOnDriftedCounters guards Trim's byte-cap loop against.
 func (s *Store) Clear() error {
+	conn, err := s.conn()
+	if err != nil {
+		return err
+	}
+	defer conn.Close() //nolint:errcheck
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, err := s.db.Exec(`DELETE FROM requests`); err != nil {
+	if _, err := conn.ExecContext(context.Background(), `DELETE FROM requests`); err != nil {
 		return err
 	}
 	s.rows, s.bytes = 0, 0

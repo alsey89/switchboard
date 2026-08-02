@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -411,5 +412,68 @@ func TestClearEmptiesTheBuffer(t *testing.T) {
 	}
 	if s.Bytes() != 0 {
 		t.Errorf("running byte total = %d after Clear, want 0", s.Bytes())
+	}
+}
+
+// TestInsertAndClearDoNotDeadlock pins the lock ordering between the drain
+// goroutine and the dashboard's clear endpoint.
+//
+// The store runs on a single connection, so "hold a connection, then take
+// s.mu" and "hold s.mu, then take a connection" are a classic inversion:
+// each side owns what the other is waiting for and neither ever returns.
+// Insert is the first order (it begins a transaction, then locks) and Clear
+// used to be the second. Every DB-touching method must now take the
+// connection first.
+//
+// The test does not sleep into the window. It starts a batch big enough that
+// its transaction stays open for a while, waits for the pool to report the
+// connection checked out, and only then clears.
+func TestInsertAndClearDoNotDeadlock(t *testing.T) {
+	// Zero limits so Trim is a no-op: this test is about the lock order, and
+	// a trim pass would only add unrelated work inside the same window.
+	s := testStore(t, Limits{})
+
+	const n = 20000
+	recs := make([]*Record, n)
+	now := time.Now()
+	for i := range recs {
+		recs[i] = rec(now, fmt.Sprintf("/deadlock/%d", i))
+	}
+
+	insertDone := make(chan error, 1)
+	go func() { insertDone <- s.Insert(recs) }()
+
+	// Wait until the insert is inside its transaction, which is exactly when
+	// it owns the store's only connection. DBStats is how the test observes
+	// that instead of guessing at it with a sleep.
+	for s.db.Stats().InUse == 0 {
+		select {
+		case err := <-insertDone:
+			t.Fatalf("the insert finished before the clear could race it: %v", err)
+		default:
+		}
+		runtime.Gosched()
+	}
+
+	clearDone := make(chan error, 1)
+	go func() { clearDone <- s.Clear() }()
+
+	ins, clr := insertDone, clearDone
+	deadline := time.After(30 * time.Second)
+	for ins != nil || clr != nil {
+		select {
+		case err := <-ins:
+			if err != nil {
+				t.Errorf("insert: %v", err)
+			}
+			ins = nil
+		case err := <-clr:
+			if err != nil {
+				t.Errorf("clear: %v", err)
+			}
+			clr = nil
+		case <-deadline:
+			t.Fatalf("deadlock: insert done=%v, clear done=%v", ins == nil, clr == nil)
+		}
 	}
 }
