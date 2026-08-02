@@ -76,7 +76,18 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 			return
 		}
 		ww.emitted = true
-		rec.Submit(buildRecord(r, ww, reqBody, start, time.Now(), bodies, true, nil))
+		// bodies is false here whatever the live flag says: an upgraded
+		// connection never has its payload captured. What follows a 101 is a
+		// websocket frame stream, not a request body with an end, and the
+		// spec says so. Passing the live flag through let buildRecord attach
+		// whatever the cap readers happened to be holding at the moment of
+		// the upgrade.
+		//
+		// It also means an upgraded row keeps redacted headers even with
+		// bodies on, which is the coherent answer rather than an accident:
+		// the reason bodies-on drops redaction is that the secret is already
+		// on disk in the body next to it, and for this row no body ever is.
+		rec.Submit(buildRecord(r, ww, reqBody, start, time.Now(), false, true, nil))
 	}
 
 	err := next.ServeHTTP(ww, r)

@@ -65,6 +65,28 @@ type Recorder struct {
 	closeOnce sync.Once
 	done      chan struct{}
 	wg        sync.WaitGroup
+
+	// Last time each store-failure warning was logged. Touched only by the
+	// drain goroutine, so they need no lock. See logEvery.
+	lastWriteErrLog time.Time
+	lastTrimErrLog  time.Time
+}
+
+// storeErrLogEvery is how often a repeating store failure is allowed to say
+// so. A store that fails every batch fails ten times a second, and a log
+// line per failure buries everything else in the daemon's log for as long as
+// the condition lasts. The magnitude is not lost by suppressing the repeats:
+// Dropped() counts every record either way.
+const storeErrLogEvery = time.Minute
+
+// logEvery reports whether a warning is due, and records that it was taken.
+// Called only from the drain goroutine.
+func logEvery(last *time.Time, now time.Time) bool {
+	if !last.IsZero() && now.Sub(*last) < storeErrLogEvery {
+		return false
+	}
+	*last = now
+	return true
 }
 
 // New starts a recorder writing into store.
@@ -250,12 +272,18 @@ func (r *Recorder) drain(batchSize int, flush time.Duration, tick <-chan time.Ti
 			// the store, so subscribers can still be told about them —
 			// treating this the same as a real write failure would hide a
 			// live update for rows that are not actually missing.
-			r.log.Warn("inspector trim failed after a successful insert", "err", err)
+			if logEvery(&r.lastTrimErrLog, time.Now()) {
+				r.log.Warn("inspector trim failed after a successful insert", "err", err)
+			}
 			r.publish(batch)
 		default:
 			// Nothing committed. This has to be as visible as a full-buffer
-			// drop, or Dropped() understates how much was actually lost.
-			r.log.Warn("inspector could not write a batch", "err", err, "records", len(batch))
+			// drop, or Dropped() understates how much was actually lost —
+			// which is why the count is added on every failure and only the
+			// log line is throttled.
+			if logEvery(&r.lastWriteErrLog, time.Now()) {
+				r.log.Warn("inspector could not write a batch", "err", err, "records", len(batch))
+			}
 			r.dropped.Add(int64(len(batch)))
 		}
 		batch = batch[:0]

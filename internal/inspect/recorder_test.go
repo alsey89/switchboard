@@ -284,3 +284,25 @@ func TestCurrentPointerRoundTrips(t *testing.T) {
 		t.Error("SetCurrent(nil) must clear it; the handler relies on nil meaning pass-through")
 	}
 }
+
+// TestStoreErrorLoggingIsThrottled covers the suppression itself rather than
+// driving a failing store: a store that fails every batch fails ten times a
+// second, and the point of the fix is that the second failure inside the
+// interval is silent while Dropped() keeps counting it.
+func TestStoreErrorLoggingIsThrottled(t *testing.T) {
+	var last time.Time
+	now := time.Now()
+
+	if !logEvery(&last, now) {
+		t.Fatal("the first failure must be logged")
+	}
+	if logEvery(&last, now.Add(30*time.Second)) {
+		t.Error("a second failure inside the interval must be suppressed")
+	}
+	if !logEvery(&last, now.Add(2*time.Minute)) {
+		t.Error("a failure after the interval must be logged again")
+	}
+	if logEvery(&last, now.Add(2*time.Minute).Add(time.Second)) {
+		t.Error("the interval must restart from the last line logged")
+	}
+}
