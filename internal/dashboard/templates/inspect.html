@@ -108,6 +108,8 @@
   let refreshing = false;
   let pending = [];     // live records that arrived while a refresh was in flight
   let filterTimer = null;
+  let table = null, tbody = null;   // kept across renders, never rebuilt
+  const nodes = new Map();          // record id -> its <tr>
 
   const statusClass = (s) => "s" + String(s).charAt(0);
 
@@ -186,40 +188,107 @@
     return td;
   }
 
+  function rowNode(r) {
+    const tr = document.createElement("tr");
+    tr.dataset.id = String(r.id);
+    tr.append(
+      cell(r.started_at.slice(11, 23), "m"),
+      cell(r.method, "m"),
+      cell(r.path, "path"),
+      cell(r.upgraded ? "101 ws" : String(r.status), statusClass(r.status)),
+      cell(r.duration_ms.toFixed(1) + "ms", "m"),
+    );
+    return tr;
+  }
+
+  // The load older button is one element for the life of the page, so a
+  // render cannot detach the thing the user is reaching for.
+  const moreBtn = document.createElement("button");
+  moreBtn.className = "more";
+  moreBtn.addEventListener("click", loadMore);
+
+  // anchorRow returns the topmost row still in view, along with where it sat
+  // on screen, so a render can put the user back on the same record rather
+  // than the same pixel — which is what rows arriving above them invalidate.
+  //
+  // Binary search, not a scan: the rows are in document order, and this runs
+  // on every live event against a list that can hold thousands.
+  function anchorRow() {
+    if (list.scrollTop <= 0 || !tbody || !tbody.children.length) return null;
+    const kids = tbody.children;
+    const top = list.getBoundingClientRect().top;
+    let lo = 0, hi = kids.length - 1, found = null;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (kids[mid].getBoundingClientRect().bottom > top) { found = kids[mid]; hi = mid - 1; }
+      else lo = mid + 1;
+    }
+    return found ? { el: found, top: found.getBoundingClientRect().top } : null;
+  }
+
+  // render reconciles the table against rows. It does not rebuild it.
+  //
+  // Clearing #list and building every row again did two things that matter
+  // here. It reset scrollTop to 0, and it ran from the stream's onmessage
+  // handler, so any traffic through the proxy yanked the user back to the
+  // top — which made load older unusable except while paused, with nothing
+  // on the page saying so. And it rebuilt every row on every event, up to
+  // MAX_ROWS of them, on the hot path of the one view this feature exists
+  // to serve.
+  //
+  // Keying on the record id means an unchanged row is never touched. A live
+  // record inserts one <tr> and moves nothing else; a load older appends and
+  // disturbs nothing above it.
   function render() {
     if (inspectorOff) return;
-    list.textContent = "";
+    const anchor = anchorRow();
+
     if (!rows.length) {
       // An empty buffer (nothing captured yet, or a clear just ran) reads
       // differently from a filter that happens to match nothing: only the
       // second one is actually "yet".
+      table = tbody = null;
+      nodes.clear();
       empty(list, anyFilterSet() ? "Nothing matches yet." : "Waiting for traffic.");
-      if (!more) return;
-    }
-    if (rows.length) {
-      const table = document.createElement("table");
-      for (const r of rows) {
-        const tr = document.createElement("tr");
-        tr.className = "row" + (r.id === selected ? " sel" : "");
-        tr.dataset.id = String(r.id);
-        tr.append(
-          cell(r.started_at.slice(11, 23), "m"),
-          cell(r.method, "m"),
-          cell(r.path, "path"),
-          cell(r.upgraded ? "101 ws" : String(r.status), statusClass(r.status)),
-          cell(r.duration_ms.toFixed(1) + "ms", "m"),
-        );
-        table.appendChild(tr);
+    } else {
+      if (!tbody) {
+        list.textContent = "";
+        table = document.createElement("table");
+        tbody = document.createElement("tbody");
+        table.appendChild(tbody);
+        list.appendChild(table);
+        nodes.clear();
       }
-      list.appendChild(table);
+      for (let i = 0; i < rows.length; i++) {
+        const r = rows[i];
+        let tr = nodes.get(r.id);
+        if (!tr) { tr = rowNode(r); nodes.set(r.id, tr); }
+        const at = tbody.children[i];
+        if (at !== tr) tbody.insertBefore(tr, at || null);
+        tr.className = "row" + (r.id === selected ? " sel" : "");
+      }
+      // Whatever is left past the end is a row that was evicted, trimmed or
+      // filtered out. Anything still in nodes is still in the table.
+      while (tbody.children.length > rows.length) {
+        const gone = tbody.lastElementChild;
+        nodes.delete(Number(gone.dataset.id));
+        gone.remove();
+      }
     }
-    if (more) {
-      const btn = document.createElement("button");
-      btn.className = "more";
-      btn.textContent = loading ? "loading…" : "load older";
-      btn.disabled = loading;
-      btn.addEventListener("click", loadMore);
-      list.appendChild(btn);
+
+    // Guarded on rows.length as well as more, because loadMore refuses to
+    // page from an empty list: a button that does nothing is worse than no
+    // button.
+    if (more && rows.length) {
+      moreBtn.textContent = loading ? "loading…" : "load older";
+      moreBtn.disabled = loading;
+      if (moreBtn.parentNode !== list) list.appendChild(moreBtn);
+    } else {
+      moreBtn.remove();
+    }
+
+    if (anchor && anchor.el.isConnected) {
+      list.scrollTop += anchor.el.getBoundingClientRect().top - anchor.top;
     }
   }
 

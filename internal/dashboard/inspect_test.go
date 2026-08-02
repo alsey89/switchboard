@@ -324,14 +324,20 @@ func TestInspectPageRenders(t *testing.T) {
 		t.Fatalf("status %d", w.Code)
 	}
 	body := w.Body.String()
-	// The last three are the history API the page must actually use. Its
-	// only data source used to be the stream, whose backfill is 200 rows, so
-	// the filters ran over an in-memory array and the other ~96% of a default
-	// buffer was unreachable — a filter that matched nothing on screen looked
-	// identical to no matching traffic at all.
+	// The history API the page must actually use. Its only data source used
+	// to be the stream, whose backfill is 200 rows, so the filters ran over
+	// an in-memory array and the other ~96% of a default buffer was
+	// unreachable — a filter that matched nothing on screen looked identical
+	// to no matching traffic at all.
+	//
+	// The last two are the render path. render() used to clear #list and
+	// rebuild every row, which reset scrollTop to 0 on every live event and
+	// so made load older unusable on a proxy with any traffic through it.
+	// It now reconciles by record id and restores the scroll anchor.
 	for _, want := range []string{
 		"EventSource", "/api/inspect/stream", "id=\"list\"",
 		"/api/inspect/requests?", "p.set(\"domain\"", "{ before:", "load older",
+		"tbody.insertBefore", "list.scrollTop +=",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("page is missing %q", want)
