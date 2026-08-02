@@ -2,9 +2,11 @@ package dashboard
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -181,26 +183,27 @@ func TestInspectEndpointsRefuseForeignHosts(t *testing.T) {
 	}
 }
 
-// TestEveryInspectRouteIsGuarded checks each guarded route individually,
-// not just one of them: guard() is applied per mux.HandleFunc call, so a
-// route added without the wrapper would pass this suite's other tests (they
-// all use the dashboard Host) and only show up here, against a foreign Host.
-func TestEveryInspectRouteIsGuarded(t *testing.T) {
-	routes := []struct {
-		method, path string
-	}{
-		{"GET", "/api/inspect/requests"},
-		{"GET", "/api/inspect/requests/1"},
-		{"POST", "/api/inspect/clear"},
-		{"GET", "/api/inspect/stream"},
-		{"GET", "/inspect"},
-	}
-	for _, rt := range routes {
-		t.Run(rt.method+" "+rt.path, func(t *testing.T) {
-			s, r := testServer(t)
-			seed(t, r, "/x")
+// TestEveryGuardedRouteRejectsAForeignHost walks s.routes(), the same table
+// mux() registers from, rather than a hand-maintained list of paths: a
+// route added to routes() without a guard/guardPage wrapper fails this test
+// by construction. That is exactly how /api/routes escaped the guard in an
+// earlier version of this file — mux()'s route list and this test's route
+// list were two separate hand-maintained things, and only one of them got
+// updated.
+func TestEveryGuardedRouteRejectsAForeignHost(t *testing.T) {
+	s, r := testServer(t)
+	seed(t, r, "/x")
 
-			req := httptest.NewRequest(rt.method, rt.path, nil)
+	for _, rt := range s.routes() {
+		if !rt.guarded {
+			continue
+		}
+		t.Run(rt.pattern, func(t *testing.T) {
+			target := rt.pattern
+			if strings.HasSuffix(target, "/") {
+				target += "1" // land inside the subtree, not just on its root
+			}
+			req := httptest.NewRequest("GET", target, nil)
 			req.Host = "evil.example"
 			req.Header.Set("Origin", "https://evil.example")
 			w := httptest.NewRecorder()
@@ -213,10 +216,101 @@ func TestEveryInspectRouteIsGuarded(t *testing.T) {
 	}
 }
 
+// TestInspectPageForeignHostGetsTheNoRoutePage checks guardPage's actual
+// behavior, not just its status code: /inspect is a page a user navigates
+// to, so a foreign Host should render the same friendly no-route page
+// handleRoot uses, not an empty flat 404 body.
+func TestInspectPageForeignHostGetsTheNoRoutePage(t *testing.T) {
+	s, _ := testServer(t)
+	req := httptest.NewRequest("GET", "/inspect", nil)
+	req.Host = "evil.example"
+	w := httptest.NewRecorder()
+	s.mux().ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status %d, want 404", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "evil.example") {
+		t.Errorf("expected the no-route page naming the host, got: %s", w.Body)
+	}
+}
+
 func TestInspectEndpointsAre503WithNoRecorder(t *testing.T) {
-	s := New(&config.Config{Suffix: "test"}, "test")
-	if w := do(s, "GET", "/api/inspect/requests", nil); w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status %d, want 503", w.Code)
+	cases := []struct {
+		name, method, path string
+		origin             map[string]string
+	}{
+		{"list", "GET", "/api/inspect/requests", nil},
+		{"detail", "GET", "/api/inspect/requests/1", nil},
+		{"clear", "POST", "/api/inspect/clear", map[string]string{"Origin": "https://switchboard.test"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := New(&config.Config{Suffix: "test"}, "test")
+			if w := do(s, c.method, c.path, c.origin); w.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status %d, want 503", w.Code)
+			}
+		})
+	}
+}
+
+// TestInspectRequestsAppliesEachQueryParameter guards against the query
+// parameters in handleInspectRequests getting transposed — domain into
+// Method, before into Limit, and so on — which the single q= test above
+// cannot catch, since transposing any of the untested fields would still
+// leave that one test green.
+func TestInspectRequestsAppliesEachQueryParameter(t *testing.T) {
+	s, r := testServer(t)
+	mk := func(domain, method, path string, status int) *inspect.Record {
+		rec := &inspect.Record{
+			StartedAt: time.Now(), Duration: time.Millisecond,
+			Domain: domain, Method: method, Path: path, Status: status,
+			Proto: "HTTP/1.1",
+		}
+		if err := r.Store().Insert([]*inspect.Record{rec}); err != nil {
+			t.Fatal(err)
+		}
+		return rec
+	}
+	mk("a.test", "GET", "/a", 200)
+	mk("b.test", "POST", "/b", 404)
+	recC := mk("a.test", "POST", "/c", 500)
+
+	cases := []struct {
+		name      string
+		query     string
+		wantPaths []string
+	}{
+		{"domain filters", "domain=a.test", []string{"/c", "/a"}},
+		{"method filters", "method=post", []string{"/c", "/b"}},
+		{"status filters", "status=4xx", []string{"/b"}},
+		{"domain and method intersect, not either alone", "domain=a.test&method=post", []string{"/c"}},
+		{"limit caps the result count", "limit=1", []string{"/c"}},
+		{"before paginates past a given id", fmt.Sprintf("before=%d", recC.ID), []string{"/b", "/a"}},
+		{"before and limit combine, not swap", fmt.Sprintf("before=%d&limit=1", recC.ID), []string{"/b"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			w := do(s, "GET", "/api/inspect/requests?"+c.query, nil)
+			if w.Code != 200 {
+				t.Fatalf("status %d: %s", w.Code, w.Body)
+			}
+			var out struct {
+				Requests []struct {
+					Path string `json:"path"`
+				} `json:"requests"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+				t.Fatal(err)
+			}
+			var got []string
+			for _, req := range out.Requests {
+				got = append(got, req.Path)
+			}
+			if !reflect.DeepEqual(got, c.wantPaths) {
+				t.Errorf("%s: got %v, want %v", c.query, got, c.wantPaths)
+			}
+		})
 	}
 }
 

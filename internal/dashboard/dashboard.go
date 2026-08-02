@@ -60,32 +60,79 @@ func (s *Server) Start(bind string) error {
 	return nil
 }
 
+// routeEntry pairs a mux pattern with its handler and whether the handler
+// enforces the Host guard. mux() registers this table, and
+// TestEveryGuardedRouteRejectsAForeignHost walks the same table, so a route
+// that forgets the guard fails that test by construction. That is exactly
+// how /api/routes escaped the guard in the first place: it lived only in
+// mux()'s hand-written list, and the equivalent hand-written test list
+// never had a reason to know it existed.
+type routeEntry struct {
+	pattern string
+	handler http.HandlerFunc
+	guarded bool
+}
+
+func (s *Server) routes() []routeEntry {
+	return []routeEntry{
+		{"/api/routes", s.guard(s.handleAPIRoutes), true},
+		{"/api/inspect/requests", s.guard(s.handleInspectRequests), true},
+		{"/api/inspect/requests/", s.guard(s.handleInspectRecord), true},
+		{"/api/inspect/clear", s.guard(s.handleInspectClear), true},
+		{"/api/inspect/stream", s.guard(s.handleInspectStream), true},
+		{"/inspect", s.guardPage(s.handleInspectPage), true},
+		// handleRoot is its own guard: it needs the "/" vs any-other-path
+		// split alongside the host check, and it answers a foreign Host
+		// with the no-route page rather than delegating to guardPage.
+		{"/", s.handleRoot, false},
+	}
+}
+
 // mux builds the routing table. Split out from Start so tests can drive the
 // real routes without binding a port.
 func (s *Server) mux() *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/routes", s.handleAPIRoutes)
-	mux.HandleFunc("/api/inspect/requests", s.guard(s.handleInspectRequests))
-	mux.HandleFunc("/api/inspect/requests/", s.guard(s.handleInspectRecord))
-	mux.HandleFunc("/api/inspect/clear", s.guard(s.handleInspectClear))
-	mux.HandleFunc("/api/inspect/stream", s.guard(s.handleInspectStream))
-	mux.HandleFunc("/inspect", s.guard(s.handleInspectPage))
-	mux.HandleFunc("/", s.handleRoot)
+	for _, rt := range s.routes() {
+		mux.HandleFunc(rt.pattern, rt.handler)
+	}
 	return mux
 }
 
-// guard rejects requests whose Host is neither the dashboard domain nor a
-// direct loopback address.
+// hostAllowed reports whether hostport (an HTTP Host header, with or
+// without a port) names this dashboard: either its own domain or a direct
+// loopback address. guard, guardPage and handleRoot all defer to this one
+// predicate instead of each repeating the comparison.
+func (s *Server) hostAllowed(hostport string) bool {
+	host := strings.ToLower(hostOnly(hostport))
+	return host == s.cfg.Load().DashboardDomain() || isLoopbackHost(host)
+}
+
+// guard rejects requests whose Host fails hostAllowed with a flat 404: API
+// paths have no user reading them, so there is no one for a friendlier
+// answer to be for.
 //
-// handleRoot answers a foreign Host with the friendly "no route" page,
-// because a browser landing on an unrouted *.test name deserves an
-// explanation. An API path does not: there is no user reading it, so it gets
-// a flat 404 and no hint that anything is here.
+// guard is necessary for a mutating route but not sufficient by itself —
+// see the note on isLoopbackHost below. A route that changes state must
+// also check sameOrigin (inspect.go), the way handleInspectClear does;
+// guard alone only proves the Host header matched, and a Host header is
+// something an attacker's page gets to send too.
 func (s *Server) guard(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		host := strings.ToLower(hostOnly(r.Host))
-		if host != s.cfg.Load().DashboardDomain() && !isLoopbackHost(host) {
+		if !s.hostAllowed(r.Host) {
 			http.NotFound(w, r)
+			return
+		}
+		h(w, r)
+	}
+}
+
+// guardPage is guard's counterpart for a page a user navigates to directly
+// rather than a script fetching JSON: a foreign Host renders the same
+// friendly no-route page handleRoot uses, instead of guard's flat 404.
+func (s *Server) guardPage(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.hostAllowed(r.Host) {
+			s.renderNoRoute(w, s.cfg.Load(), strings.ToLower(hostOnly(r.Host)))
 			return
 		}
 		h(w, r)
@@ -112,15 +159,19 @@ func hostOnly(hostport string) string {
 // resolver file or the CA trust is broken, http://127.0.0.1:8484 is the only
 // way in — which is exactly when you need to read the diagnostics.
 //
-// This is safe for read-only endpoints because the listener is bound to
-// 127.0.0.1: nothing off-box can reach it. It stops being sufficient the
-// moment the dashboard grows state-changing endpoints. At that point, two
-// attack vectors open: any web page can simply fetch("http://127.0.0.1:port/...")
-// and have the browser send the Host header and cookies — a direct CSRF attack
-// that requires no DNS cooperation — or it can rebind its own domain name to
-// 127.0.0.1 and point the browser there. Both require an Origin check on
-// mutations. Foreign Host values are rejected below to keep the attack surface
-// small today; the check is necessary but not sufficient once mutations land.
+// A Host check alone was sufficient while every endpoint was read-only,
+// because the listener is bound to 127.0.0.1 and nothing off-box can reach
+// it directly. It stopped being sufficient the moment the dashboard grew
+// its first state-changing endpoint: any web page can simply
+// fetch("http://127.0.0.1:port/...") and have the browser send the Host
+// header — a CSRF attack that needs no DNS cooperation — or it can rebind
+// its own domain name to 127.0.0.1 and point the browser there. Either way,
+// a POST from an attacker's page sails through a Host check by itself.
+//
+// That endpoint landed in inspect.go: handleInspectClear pairs guard with
+// sameOrigin, which requires an Origin header that is present and matches.
+// Any future mutating route must do the same — a Host check is necessary
+// for one but was never sufficient on its own.
 func isLoopbackHost(host string) bool {
 	if host == "localhost" {
 		return true
@@ -135,10 +186,9 @@ func isLoopbackHost(host string) bool {
 
 func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 	cfg := s.cfg.Load()
-	host := strings.ToLower(hostOnly(r.Host))
 
-	if host != cfg.DashboardDomain() && !isLoopbackHost(host) {
-		s.renderNoRoute(w, cfg, host)
+	if !s.hostAllowed(r.Host) {
+		s.renderNoRoute(w, cfg, strings.ToLower(hostOnly(r.Host)))
 		return
 	}
 	if r.URL.Path != "/" {

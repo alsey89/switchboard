@@ -173,6 +173,18 @@ func (s *Server) handleInspectClear(w http.ResponseWriter, r *http.Request) {
 
 // sameOrigin reports whether the request carries an Origin naming this
 // dashboard. A missing Origin is not same-origin.
+//
+// Loopback is trusted at any port and any scheme: http://localhost:3000
+// passes exactly as well as https://switchboard.test does. That is
+// deliberate, not an oversight — the whole premise of switchboard is
+// sitting in front of whatever dev servers are already running on
+// loopback, and pinning to one port would defeat it. But it means every
+// process listening on 127.0.0.1 sits inside the trust boundary for
+// whatever calls sameOrigin. Today the only caller is handleInspectClear,
+// so the blast radius is "can clear captured traffic" — tolerable. If a
+// future mutating route (the "harder" case handleInspectClear's comment
+// above anticipates) reuses sameOrigin for something with a bigger blast
+// radius, this port-and-scheme-blind trust needs revisiting first.
 func (s *Server) sameOrigin(r *http.Request) bool {
 	o := r.Header.Get("Origin")
 	if o == "" {
