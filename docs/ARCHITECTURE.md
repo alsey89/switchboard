@@ -103,7 +103,7 @@ let anything running as you replace the binary and get root at the next boot.
 | `~/.config/switchboard/data/pki/root.key` | Its private key | `0600`. The most sensitive file here |
 | `~/.config/switchboard/data/caddy/pki/…` | Intermediate cert + key | Managed and rotated by Caddy |
 | `~/.config/switchboard/data/caddy/certificates/…` | Per-host leaf certs | Issued on demand, auto-renewed |
-| `~/.config/switchboard/data/inspect.db` | Captured request history | Bounded by count, size and age; survives `bodies`/`enabled` toggles, gone only if you delete it |
+| `~/.config/switchboard/data/inspect.db` | Captured request history | Bounded by count, size and age; survives `bodies`/`enabled` toggles, gone only if you delete it (plus `inspect.db-wal` and `inspect.db-shm`, which WAL mode creates; both are normally present while the daemon runs and can survive an unclean exit — delete all three together) |
 
 `rm -rf ~/.config/switchboard` is a complete reset of everything unprivileged.
 

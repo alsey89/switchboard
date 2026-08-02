@@ -127,6 +127,10 @@ With bodies off, the values of `Authorization`, `Proxy-Authorization`,
 anything is written. That list is fixed, so it reduces what ends up on disk
 but does not promise to catch a custom token header of your own.
 
+Nothing outside that list is touched. URLs are stored as sent, query string
+included, so a request to `/v1/data?api_key=…` writes that key to disk with
+redaction on. Redaction reduces exposure. It does not prevent it.
+
 The buffer is bounded three ways and trims itself: 5,000 requests, 64 MiB,
 and 7 days. All of it is configurable.
 
