@@ -353,6 +353,148 @@ func TestEndToEnd(t *testing.T) {
 	})
 }
 
+// TestInspectorCapturesProxiedTraffic is the one test in this package that
+// spans the whole inspector chain rather than one layer of it: a real
+// request through the real Caddy handler, batched by the real recorder,
+// landing in the real SQLite store, read back off the real dashboard API.
+// Every other inspector test in this file or in internal/inspect exercises
+// one of those pieces in isolation; this is the one that would catch a seam
+// between them.
+func TestInspectorCapturesProxiedTraffic(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+
+	// This test verifies a certificate, so it needs a suffix none of the
+	// other cert-verifying tests in this package use — see
+	// tSuffixInternal/tSuffixLocalhost above for why a shared suffix would
+	// let a second daemon boot in this same process get served the first
+	// boot's stale cert out of Caddy's package-level on-demand cert cache.
+	// A multi-label suffix passes config's validateSuffix unconditionally.
+	const suffix = "capture.test"
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(201)
+		io.WriteString(w, "captured me") //nolint:errcheck
+	}))
+	defer upstream.Close()
+
+	domain := "app." + suffix
+	env := startEnvOpts(t, []config.Route{{
+		Domain:   domain,
+		Upstream: strings.TrimPrefix(upstream.URL, "http://"),
+	}}, startOpts{suffix: suffix})
+	client := env.client()
+
+	resp, err := client.Get(fmt.Sprintf("https://%s:%d/inspected?x=1", domain, tHTTPSPort))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close() //nolint:errcheck
+
+	// The dashboard's own loopback port, the same door the browser uses when
+	// TLS or DNS is broken.
+	api := fmt.Sprintf("http://127.0.0.1:%d/api/inspect/requests", tDashPort)
+
+	type row struct {
+		Domain string `json:"domain"`
+		Method string `json:"method"`
+		Path   string `json:"path"`
+		Status int    `json:"status"`
+	}
+	var got []row
+	waitFor(t, func() bool {
+		r, err := http.Get(api) //nolint:noctx
+		if err != nil {
+			return false
+		}
+		defer r.Body.Close() //nolint:errcheck
+		var out struct {
+			Requests []row `json:"requests"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&out); err != nil {
+			return false
+		}
+		got = out.Requests
+		return len(out.Requests) > 0
+	}, 15*time.Second, "the proxied request to be captured")
+
+	if got[0].Path != "/inspected?x=1" {
+		t.Errorf("path = %q, want the full request URI", got[0].Path)
+	}
+	if got[0].Status != 201 {
+		t.Errorf("status = %d, want 201 from the upstream", got[0].Status)
+	}
+	if got[0].Domain != domain {
+		t.Errorf("domain = %q, want %q", got[0].Domain, domain)
+	}
+	if got[0].Method != http.MethodGet {
+		t.Errorf("method = %q, want GET", got[0].Method)
+	}
+
+	t.Run("dashboard traffic is not captured", func(t *testing.T) {
+		before := len(got)
+
+		// Load the dashboard itself several times through the proxy.
+		for i := 0; i < 3; i++ {
+			r, err := client.Get(fmt.Sprintf("https://%s:%d/", env.cfg.DashboardDomain(), tHTTPSPort))
+			if err != nil {
+				t.Fatal(err)
+			}
+			r.Body.Close() //nolint:errcheck
+		}
+
+		// A real synchronization point rather than a sleep: a follow-up
+		// request to the actual route always gets captured, so once it shows
+		// up the recorder has drained everything submitted before it —
+		// including the three dashboard loads above, sent from this same
+		// goroutine immediately before it.
+		marker := fmt.Sprintf("https://%s:%d/sync-marker?done=1", domain, tHTTPSPort)
+		mresp, err := client.Get(marker)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mresp.Body.Close() //nolint:errcheck
+
+		var out struct {
+			Requests []row `json:"requests"`
+		}
+		waitFor(t, func() bool {
+			r, err := http.Get(api) //nolint:noctx
+			if err != nil {
+				return false
+			}
+			defer r.Body.Close() //nolint:errcheck
+			var o struct {
+				Requests []row `json:"requests"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&o); err != nil {
+				return false
+			}
+			out = o
+			for _, rr := range o.Requests {
+				if rr.Path == "/sync-marker?done=1" {
+					return true
+				}
+			}
+			return false
+		}, 15*time.Second, "the synchronization marker request to be captured")
+
+		// Only the marker should have added a row. Any extra means a
+		// dashboard load got recorded too.
+		if len(out.Requests) != before+1 {
+			t.Fatalf("row count went %d -> %d, want %d; the inspector is recording the dashboard itself",
+				before, len(out.Requests), before+1)
+		}
+	})
+
+	t.Run("the database lands in the data dir", func(t *testing.T) {
+		if _, err := os.Stat(filepath.Join(env.dataDir, "inspect.db")); err != nil {
+			t.Errorf("inspect.db: %v", err)
+		}
+	})
+}
+
 // TestInspectorFailureNeverBlocksTheDaemon proves the daemon's central
 // promise about the inspector: a broken inspector is a warning, never a
 // reason the proxy does not start.
