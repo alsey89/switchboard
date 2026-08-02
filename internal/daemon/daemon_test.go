@@ -457,6 +457,101 @@ func TestReloadAppliesNewInspectorLimits(t *testing.T) {
 	}, 15*time.Second, "row count trimmed to the reloaded max_requests")
 }
 
+// TestReloadDisablingInspectorTearsDownButKeepsTheFile guards the owner
+// decision on the finding raised in review: reloading `enabled` from true
+// to false used to leave the recorder running forever — inspect.Current()
+// stayed non-nil, the dashboard's stored recorder stayed non-nil, and the
+// SQLite handle stayed open — even though proxy.Generate had already
+// stopped putting the handler on any route. Once Tasks 8/9 land, that would
+// have meant a user who turns capture off still sees the dashboard serving
+// previously captured requests, headers and bodies included, out of a
+// database nothing ever closes.
+//
+// The fix must not go too far the other way: turning it off must not
+// delete inspect.db. This test proves both halves — the teardown on
+// disable, and that the file (and its data) survives to be picked back up
+// on the next enable.
+func TestReloadDisablingInspectorTearsDownButKeepsTheFile(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+
+	// A multi-label suffix passes config's validateSuffix unconditionally
+	// (it is read as "a domain you own"), so it needs no entry in the
+	// three-suffix rotation the other cert-verifying tests share, and
+	// cannot collide with any of them over Caddy's package-level cert
+	// cache (see tSuffixInternal/tSuffixLocalhost above for why that
+	// matters).
+	const suffix = "toggle.test"
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, "ok") //nolint:errcheck
+	}))
+	defer upstream.Close()
+
+	env := startEnvOpts(t, []config.Route{{Domain: "app." + suffix, Upstream: strings.TrimPrefix(upstream.URL, "http://")}},
+		startOpts{suffix: suffix})
+	client := env.client()
+
+	resp, err := client.Get(fmt.Sprintf("https://app.%s:%d/hello", suffix, tHTTPSPort))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close() //nolint:errcheck
+
+	waitFor(t, func() bool {
+		r := inspect.Current()
+		return r != nil && r.Store().Rows() >= 1
+	}, 15*time.Second, "the request to be captured")
+
+	// Keep a handle to the live recorder before disabling it: Trim against
+	// it after the reload is a direct check that *this* store's *sql.DB was
+	// actually closed, not just that some new state looks right.
+	before := inspect.Current()
+
+	disabled := false
+	env.cfg.Inspect = &config.InspectConfig{Enabled: &disabled}
+	if err := env.cfg.Save(env.cfgPath); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, func() bool { return inspect.Current() == nil }, 15*time.Second,
+		"the recorder to be torn down once the reload disables it")
+
+	if err := before.Store().Trim(time.Now()); err == nil {
+		t.Error("the old recorder's store should be closed once the inspector is disabled by a reload")
+	}
+
+	// The file must still be there, with the row intact: open it directly,
+	// the way the daemon would on its next start.
+	dbPath := filepath.Join(env.dataDir, "inspect.db")
+	st, err := inspect.Open(dbPath, inspect.Limits{})
+	if err != nil {
+		t.Fatalf("inspect.db should still be on disk and openable after being disabled: %v", err)
+	}
+	rows := st.Rows()
+	if err := st.Close(); err != nil {
+		t.Errorf("closing the reopened store: %v", err)
+	}
+	if rows < 1 {
+		t.Fatalf("disabling the inspector must not delete captured rows, got %d rows", rows)
+	}
+
+	// Re-enable: the daemon should pick the same file back up, history
+	// included, through the running recorder — not just via a side-channel
+	// open like the check above.
+	enabled := true
+	env.cfg.Inspect = &config.InspectConfig{Enabled: &enabled}
+	if err := env.cfg.Save(env.cfgPath); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, func() bool {
+		r := inspect.Current()
+		return r != nil && r.Store().Rows() >= 1
+	}, 15*time.Second, "the inspector to come back with its history intact")
+}
+
 // TestShutdownClosesInspectorStoreAfterEverythingElse guards the ordering
 // hazard found in review: Recorder.Close() closes the same SQLite handle
 // the dashboard's history endpoints read from (Store()), so the daemon

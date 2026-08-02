@@ -137,6 +137,24 @@ func Run(ctx context.Context, opts Options) error {
 	// config, and the handler reads inspect.Current() on its first request.
 	ensureInspector := func(c *config.Config) {
 		if !c.InspectEnabled() {
+			if insp != nil {
+				// Tear down in the same order as shutdown, and for the
+				// same reason: stop the handler submitting and stop the
+				// dashboard reading before the store closes, so neither
+				// can touch it once it does.
+				//
+				// inspect.db stays on disk — this only closes the handle,
+				// it does not delete the file. "Off" stops capture and
+				// stops the UI serving what was captured; it must not
+				// destroy what the user already recorded. Re-enabling and
+				// reloading reopens the same file and brings the history
+				// back.
+				inspect.SetCurrent(nil)
+				dash.SetInspector(nil)
+				insp.Close() //nolint:errcheck
+				insp = nil
+				log.Info("inspector down", "reason", "disabled by config reload")
+			}
 			return
 		}
 		if insp != nil {
@@ -242,9 +260,12 @@ func Run(ctx context.Context, opts Options) error {
 			}
 			cfg = next
 			dash.SetConfig(next)
-			// enabled can flip either way in a reload. ensureInspector opens
-			// the store the first time it is turned on, so a user who starts
-			// with it off does not have to restart the daemon to use it.
+			// enabled can flip either way in a reload, and ensureInspector
+			// handles both: it opens the store the first time it is turned
+			// on, so a user who starts with it off does not have to
+			// restart the daemon to use it, and it tears the recorder
+			// down (without deleting inspect.db) the moment it is turned
+			// off, so the dashboard stops serving what was captured.
 			ensureInspector(next)
 			log.Info("config reloaded", "routes", len(cfg.Routes))
 
