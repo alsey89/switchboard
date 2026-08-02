@@ -324,7 +324,15 @@ func TestInspectPageRenders(t *testing.T) {
 		t.Fatalf("status %d", w.Code)
 	}
 	body := w.Body.String()
-	for _, want := range []string{"EventSource", "/api/inspect/stream", "id=\"list\""} {
+	// The last three are the history API the page must actually use. Its
+	// only data source used to be the stream, whose backfill is 200 rows, so
+	// the filters ran over an in-memory array and the other ~96% of a default
+	// buffer was unreachable — a filter that matched nothing on screen looked
+	// identical to no matching traffic at all.
+	for _, want := range []string{
+		"EventSource", "/api/inspect/stream", "id=\"list\"",
+		"/api/inspect/requests?", "p.set(\"domain\"", "{ before:", "load older",
+	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("page is missing %q", want)
 		}

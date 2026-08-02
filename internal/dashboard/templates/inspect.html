@@ -53,6 +53,8 @@
   dt { color: var(--muted); }
   dd { margin: 0; font-family: ui-monospace, monospace; word-break: break-all; }
   .empty { color: var(--muted); padding: 2rem 1rem; }
+  .note { color: var(--warn); padding: .6rem 1rem; font-size: .85rem; }
+  .more { display: block; width: calc(100% - 1.6rem); margin: .6rem .8rem 1rem; }
   @media (max-width: 700px) { main { grid-template-columns: 1fr; }
     #list { border-right: 0; border-bottom: 1px solid var(--line); max-height: 45vh; } }
 </style>
@@ -87,12 +89,25 @@
   const list = $("list"), detail = $("detail");
   const filters = { q: $("q"), domain: $("domain"), method: $("method"), status: $("status") };
 
-  let rows = [];        // newest first
+  // PAGE matches the history API's own default page size. Asking for more
+  // than 500 is pointless — the server caps it there.
+  const PAGE = 200;
+  // A page left open all day must not grow without bound. This is the
+  // default max_requests, so in the normal configuration nothing the buffer
+  // holds is out of reach; a bigger buffer needs the filters.
+  const MAX_ROWS = 5000;
+
+  let rows = [];        // newest first, already matching the active filters
   let live = true;
   let selected = null;
   let source = null;
   let inspectorOff = false;
-  const MAX_DOM = 500;
+  let more = false;     // the last page came back full, so older rows exist
+  let loading = false;
+  let generation = 0;   // a stale in-flight refresh must not overwrite a newer one
+  let refreshing = false;
+  let pending = [];     // live records that arrived while a refresh was in flight
+  let filterTimer = null;
 
   const statusClass = (s) => "s" + String(s).charAt(0);
 
@@ -110,10 +125,38 @@
     el.appendChild(p);
   }
 
+  function note(el, msg) {
+    const p = document.createElement("p");
+    p.className = "note";
+    p.textContent = msg;
+    el.textContent = "";
+    el.appendChild(p);
+  }
+
+  // query builds the filter parameters the history API already understands.
+  // The filters are applied by the store, not by this page: filtering an
+  // array of the last 200 records meant "by domain" silently meant "by
+  // domain, within the last 200", while the rest of the buffer sat on disk.
+  function query(extra) {
+    const p = new URLSearchParams();
+    if (filters.domain.value) p.set("domain", filters.domain.value);
+    if (filters.method.value) p.set("method", filters.method.value);
+    if (filters.status.value) p.set("status", filters.status.value);
+    if (filters.q.value) p.set("q", filters.q.value);
+    p.set("limit", String(PAGE));
+    for (const k in extra) p.set(k, String(extra[k]));
+    return "/api/inspect/requests?" + p.toString();
+  }
+
+  // matches mirrors the store's filter semantics for records that arrive on
+  // the live stream, which never went through a query. It has to agree with
+  // the SQL: domain and method are exact (method case-insensitively, since
+  // the store upper-cases it), q is a case-insensitive substring of the path
+  // the way SQLite's LIKE is, and a status filter is a leading digit.
   function matches(r) {
     const f = filters;
     if (f.domain.value && r.domain !== f.domain.value) return false;
-    if (f.method.value && r.method !== f.method.value) return false;
+    if (f.method.value && r.method.toUpperCase() !== f.method.value.toUpperCase()) return false;
     if (f.q.value && !r.path.toLowerCase().includes(f.q.value.toLowerCase())) return false;
     const s = f.status.value;
     if (s && String(r.status).charAt(0) !== s.charAt(0)) return false;
@@ -122,6 +165,19 @@
 
   const anyFilterSet = () =>
     Object.values(filters).some((el) => el.value !== "");
+
+  // insert places a record at its position by id rather than assuming where
+  // it belongs. Ids are assigned in arrival order, so descending id is
+  // newest first, and an id already present is the same record arriving
+  // twice — a stream reconnect replays the last 200, and the backfill
+  // overlaps whatever the first fetch already returned.
+  function insert(r) {
+    let i = 0;
+    while (i < rows.length && rows[i].id > r.id) i++;
+    if (i < rows.length && rows[i].id === r.id) return false;
+    rows.splice(i, 0, r);
+    return true;
+  }
 
   function cell(text, className) {
     const td = document.createElement("td");
@@ -132,30 +188,95 @@
 
   function render() {
     if (inspectorOff) return;
-    const shown = rows.filter(matches).slice(0, MAX_DOM);
-    if (!shown.length) {
+    list.textContent = "";
+    if (!rows.length) {
       // An empty buffer (nothing captured yet, or a clear just ran) reads
       // differently from a filter that happens to match nothing: only the
       // second one is actually "yet".
       empty(list, anyFilterSet() ? "Nothing matches yet." : "Waiting for traffic.");
-      return;
+      if (!more) return;
     }
-    const table = document.createElement("table");
-    for (const r of shown) {
-      const tr = document.createElement("tr");
-      tr.className = "row" + (r.id === selected ? " sel" : "");
-      tr.dataset.id = String(r.id);
-      tr.append(
-        cell(r.started_at.slice(11, 23), "m"),
-        cell(r.method, "m"),
-        cell(r.path, "path"),
-        cell(r.upgraded ? "101 ws" : String(r.status), statusClass(r.status)),
-        cell(r.duration_ms.toFixed(1) + "ms", "m"),
-      );
-      table.appendChild(tr);
+    if (rows.length) {
+      const table = document.createElement("table");
+      for (const r of rows) {
+        const tr = document.createElement("tr");
+        tr.className = "row" + (r.id === selected ? " sel" : "");
+        tr.dataset.id = String(r.id);
+        tr.append(
+          cell(r.started_at.slice(11, 23), "m"),
+          cell(r.method, "m"),
+          cell(r.path, "path"),
+          cell(r.upgraded ? "101 ws" : String(r.status), statusClass(r.status)),
+          cell(r.duration_ms.toFixed(1) + "ms", "m"),
+        );
+        table.appendChild(tr);
+      }
+      list.appendChild(table);
     }
-    list.textContent = "";
-    list.appendChild(table);
+    if (more) {
+      const btn = document.createElement("button");
+      btn.className = "more";
+      btn.textContent = loading ? "loading…" : "load older";
+      btn.disabled = loading;
+      btn.addEventListener("click", loadMore);
+      list.appendChild(btn);
+    }
+  }
+
+  // refresh replaces the view from the server. Any live record that arrives
+  // while the query is in flight is held in pending and merged afterwards,
+  // so changing a filter mid-traffic cannot silently swallow a request that
+  // landed between the query running and its answer arriving.
+  async function refresh() {
+    const mine = ++generation;
+    refreshing = true;
+    pending = [];
+    try {
+      let resp;
+      try {
+        resp = await fetch(query({}));
+      } catch {
+        return; // offline or the daemon is restarting; poll() retries
+      }
+      if (mine !== generation) return;
+      if (resp.status === 503) { setOff(true); return; }
+      if (!resp.ok) return;
+      const data = await resp.json();
+      if (mine !== generation) return;
+
+      rows = data.requests;
+      more = data.requests.length >= PAGE;
+      for (const r of pending) if (matches(r)) insert(r);
+      render();
+    } finally {
+      // Only the newest refresh owns these. An older one losing the race
+      // must not hand the live stream back to a query still in flight.
+      if (mine === generation) { refreshing = false; pending = []; }
+    }
+  }
+
+  // loadMore pages backwards with the cursor the API was built for. It only
+  // ever asks for rows older than the oldest one on screen, and the live
+  // stream only ever delivers rows newer than every one on screen, so the
+  // two can never fetch the same record — and insert() would reject it if
+  // they somehow did.
+  async function loadMore() {
+    if (loading || !rows.length) return;
+    loading = true;
+    render();
+    try {
+      const resp = await fetch(query({ before: rows[rows.length - 1].id }));
+      if (resp.status === 503) { setOff(true); return; }
+      if (!resp.ok) return;
+      const data = await resp.json();
+      for (const r of data.requests) insert(r);
+      more = data.requests.length >= PAGE;
+    } catch {
+      // Leave what is on screen and let the user try again.
+    } finally {
+      loading = false;
+      render();
+    }
   }
 
   function headerList(h) {
@@ -200,6 +321,9 @@
     return frag;
   }
 
+  // show refetches the whole record. Neither the list nor the stream carries
+  // bodies — they would be dead weight on every row — so this is the only
+  // place they come from.
   async function show(id) {
     selected = id;
     render();
@@ -239,7 +363,13 @@
     if (tr) show(Number(tr.dataset.id));
   });
 
-  Object.values(filters).forEach((el) => el.addEventListener("input", render));
+  // Typing is debounced because every change is now a query, not an array
+  // filter. The delay is short enough to feel immediate and long enough that
+  // a typed word is one request rather than five.
+  Object.values(filters).forEach((el) => el.addEventListener("input", () => {
+    if (filterTimer) clearTimeout(filterTimer);
+    filterTimer = setTimeout(refresh, 250);
+  }));
 
   $("pause").addEventListener("click", () => {
     live = !live;
@@ -250,19 +380,28 @@
 
   $("clear").addEventListener("click", async () => {
     if (!confirm("Clear all captured requests? This cannot be undone.")) return;
-    const resp = await fetch("/api/inspect/clear", { method: "POST" });
-    if (resp.ok) {
-      rows = [];
-      selected = null;
-      empty(detail, "Pick a request.");
-      render();
+    let resp;
+    try {
+      resp = await fetch("/api/inspect/clear", { method: "POST" });
+    } catch {
+      note(detail, "Could not reach the daemon. Nothing was cleared.");
+      return;
     }
+    // A 503 means the inspector went off between the page loading and the
+    // click; a 403 means the origin check refused it. Either way the buffer
+    // still holds everything, and saying nothing would leave the user
+    // believing it did not.
+    if (resp.status === 503) { setOff(true); return; }
+    if (!resp.ok) {
+      note(detail, "Clear failed (" + resp.status + "). Nothing was removed.");
+      return;
+    }
+    rows = [];
+    more = false;
+    selected = null;
+    empty(detail, "Pick a request.");
+    render();
   });
-
-  function add(r) {
-    rows.unshift(r);
-    if (rows.length > 2000) rows.length = 2000;
-  }
 
   function connect() {
     if (source) source.close();
@@ -270,13 +409,21 @@
     // subscriber for falling behind. Each connection replays the last 200,
     // so a reconnect fills the gap. Replayed and live copies of the same
     // record share an id, since the store assigns it before publishing to
-    // either path, so the id check below is what keeps rows from doubling
+    // either path, so insert()'s id check is what keeps rows from doubling
     // up regardless of which copy happens to arrive first.
     source = new EventSource("/api/inspect/stream");
     source.onmessage = (e) => {
       const r = JSON.parse(e.data);
-      if (rows.some((x) => x.id === r.id)) return;
-      add(r);
+      // The stream is unfiltered — it is a fan-out of everything the store
+      // accepted. Filtering here is what keeps a live record from appearing
+      // under a filter it does not match, while still letting one that does
+      // match show up immediately instead of waiting for a refresh.
+      if (!matches(r)) return;
+      if (refreshing) { pending.push(r); return; }
+      if (!insert(r)) return;
+      // Only the live path trims: a user who paged backwards asked for those
+      // older rows and should keep them.
+      if (rows.length > MAX_ROWS) { rows.length = MAX_ROWS; more = true; }
       render();
     };
     source.onerror = () => {
@@ -303,8 +450,11 @@
       $("drops").textContent = "";
     } else {
       selected = null;
+      rows = [];
+      more = false;
       render();
       empty(detail, "Pick a request.");
+      refresh();
       if (live) connect();
     }
   }
@@ -329,7 +479,9 @@
     }
   }
 
-  poll().finally(() => { if (!inspectorOff) connect(); });
+  poll()
+    .then(() => { if (!inspectorOff) return refresh(); })
+    .finally(() => { if (!inspectorOff && live) connect(); });
   setInterval(poll, 10000);
 })();
 </script>
