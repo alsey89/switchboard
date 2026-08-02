@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Switchboard inspector</title>
+<style>
+  :root { color-scheme: light dark;
+    --fg: #1a1a1a; --bg: #ffffff; --muted: #6b7280; --line: #e5e7eb;
+    --ok: #16a34a; --bad: #dc2626; --warn: #d97706; --accent: #4f46e5;
+    --panel: #fafafa; }
+  @media (prefers-color-scheme: dark) { :root {
+    --fg: #e5e7eb; --bg: #111318; --muted: #9ca3af; --line: #2a2e37;
+    --panel: #171a21; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); height: 100vh;
+    display: flex; flex-direction: column;
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif; }
+  header { padding: .8rem 1rem; border-bottom: 1px solid var(--line);
+    display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; }
+  header h1 { font-size: 1rem; margin: 0 .6rem 0 0; font-weight: 600; }
+  header h1 a { color: var(--fg); text-decoration: none; }
+  input, select, button { font: inherit; color: var(--fg); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 6px; padding: .3rem .5rem; }
+  button { cursor: pointer; }
+  button.on { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
+  .spacer { flex: 1; }
+  .drops { color: var(--warn); font-size: .8rem; }
+  main { flex: 1; display: grid; grid-template-columns: minmax(280px, 40%) 1fr;
+    min-height: 0; }
+  #list { overflow-y: auto; border-right: 1px solid var(--line); }
+  #detail { overflow-y: auto; padding: 1rem; background: var(--panel); }
+  table { width: 100%; border-collapse: collapse; }
+  tr.row { cursor: pointer; border-bottom: 1px solid var(--line); }
+  tr.row:hover { background: var(--panel); }
+  tr.row.sel { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  td { padding: .35rem .5rem; white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis; }
+  td.path { max-width: 1px; width: 100%; font-family: ui-monospace, monospace;
+    font-size: .85em; }
+  .m { color: var(--muted); font-size: .8rem; }
+  .s2 { color: var(--ok); } .s3 { color: var(--accent); }
+  .s4, .s5 { color: var(--bad); }
+  h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .05em;
+    color: var(--muted); margin: 1.2rem 0 .4rem; font-weight: 500; }
+  h2:first-child { margin-top: 0; }
+  pre { background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
+    padding: .6rem; overflow-x: auto; font-size: .8rem; margin: 0;
+    white-space: pre-wrap; word-break: break-all; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: .1rem .8rem;
+    margin: 0; font-size: .85rem; }
+  dt { color: var(--muted); }
+  dd { margin: 0; font-family: ui-monospace, monospace; word-break: break-all; }
+  .empty { color: var(--muted); padding: 2rem 1rem; }
+  @media (max-width: 700px) { main { grid-template-columns: 1fr; }
+    #list { border-right: 0; border-bottom: 1px solid var(--line); max-height: 45vh; } }
+</style>
+</head>
+<body>
+<header>
+  <h1><a href="/">Switchboard</a> inspector</h1>
+  <input id="q" type="search" placeholder="filter path" size="14">
+  <input id="domain" type="search" placeholder="domain" size="12">
+  <select id="method">
+    <option value="">any method</option>
+    <option>GET</option><option>POST</option><option>PUT</option>
+    <option>PATCH</option><option>DELETE</option>
+  </select>
+  <select id="status">
+    <option value="">any status</option>
+    <option value="2xx">2xx</option><option value="3xx">3xx</option>
+    <option value="4xx">4xx</option><option value="5xx">5xx</option>
+  </select>
+  <button id="pause" class="on">live</button>
+  <span class="spacer"></span>
+  <span id="drops" class="drops"></span>
+  <button id="clear">clear</button>
+</header>
+<main>
+  <div id="list"><p class="empty">Waiting for traffic.</p></div>
+  <div id="detail"><p class="empty">Pick a request.</p></div>
+</main>
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const list = $("list"), detail = $("detail");
+  const filters = { q: $("q"), domain: $("domain"), method: $("method"), status: $("status") };
+
+  let rows = [];        // newest first
+  let live = true;
+  let selected = null;
+  let source = null;
+  let inspectorOff = false;
+  const MAX_DOM = 500;
+
+  const statusClass = (s) => "s" + String(s).charAt(0);
+
+  // Every record field below is attacker-influenced: it comes straight from
+  // whatever traffic hit the proxy, including a request a hostile page the
+  // developer visited could have sent through it. Nothing here goes near
+  // innerHTML — every value lands as textContent, a data-* value, or a
+  // className built from a fixed set of literals, so there is no markup
+  // context for it to break out of.
+  function empty(el, msg) {
+    el.textContent = "";
+    const p = document.createElement("p");
+    p.className = "empty";
+    p.textContent = msg;
+    el.appendChild(p);
+  }
+
+  function matches(r) {
+    const f = filters;
+    if (f.domain.value && r.domain !== f.domain.value) return false;
+    if (f.method.value && r.method !== f.method.value) return false;
+    if (f.q.value && !r.path.toLowerCase().includes(f.q.value.toLowerCase())) return false;
+    const s = f.status.value;
+    if (s && String(r.status).charAt(0) !== s.charAt(0)) return false;
+    return true;
+  }
+
+  function cell(text, className) {
+    const td = document.createElement("td");
+    if (className) td.className = className;
+    td.textContent = text;
+    return td;
+  }
+
+  function render() {
+    if (inspectorOff) return;
+    const shown = rows.filter(matches).slice(0, MAX_DOM);
+    if (!shown.length) {
+      empty(list, "Nothing matches yet.");
+      return;
+    }
+    const table = document.createElement("table");
+    for (const r of shown) {
+      const tr = document.createElement("tr");
+      tr.className = "row" + (r.id === selected ? " sel" : "");
+      tr.dataset.id = String(r.id);
+      tr.append(
+        cell(r.started_at.slice(11, 23), "m"),
+        cell(r.method, "m"),
+        cell(r.path, "path"),
+        cell(r.upgraded ? "101 ws" : String(r.status), statusClass(r.status)),
+        cell(r.duration_ms.toFixed(1) + "ms", "m"),
+      );
+      table.appendChild(tr);
+    }
+    list.textContent = "";
+    list.appendChild(table);
+  }
+
+  function headerList(h) {
+    const names = h ? Object.keys(h).sort() : [];
+    if (!names.length) {
+      const p = document.createElement("p");
+      p.className = "m";
+      p.textContent = "none";
+      return p;
+    }
+    const dl = document.createElement("dl");
+    for (const k of names) {
+      const dt = document.createElement("dt");
+      dt.textContent = k;
+      const dd = document.createElement("dd");
+      dd.textContent = h[k].join(", ");
+      dl.append(dt, dd);
+    }
+    return dl;
+  }
+
+  function heading(text) {
+    const h2 = document.createElement("h2");
+    h2.textContent = text;
+    return h2;
+  }
+
+  function field(dl, label, value) {
+    const dt = document.createElement("dt");
+    dt.textContent = label;
+    const dd = document.createElement("dd");
+    dd.textContent = value;
+    dl.append(dt, dd);
+  }
+
+  function body(label, text) {
+    const frag = document.createDocumentFragment();
+    frag.append(heading(label));
+    const pre = document.createElement("pre");
+    pre.textContent = text;
+    frag.append(pre);
+    return frag;
+  }
+
+  async function show(id) {
+    selected = id;
+    render();
+    const resp = await fetch("/api/inspect/requests/" + id);
+    if (!resp.ok) { empty(detail, "Gone. The buffer may have trimmed it."); return; }
+    const r = await resp.json();
+
+    detail.textContent = "";
+    detail.append(heading("request"));
+
+    const dl = document.createElement("dl");
+    field(dl, "when", r.started_at);
+    field(dl, "host", r.domain);
+    field(dl, "method", r.method);
+    field(dl, "path", r.path);
+    field(dl, "proto", r.proto + (r.upgraded ? " (upgraded)" : ""));
+    field(dl, "status", String(r.status));
+    field(dl, "took", r.duration_ms.toFixed(1) + " ms");
+    field(dl, "sent", r.req_bytes + " bytes");
+    field(dl, "received", r.resp_bytes + " bytes");
+    if (r.error) field(dl, "error", r.error);
+    detail.append(dl);
+
+    detail.append(heading("request headers"), headerList(r.req_headers));
+    if (r.req_body) detail.append(body("request body", r.req_body));
+    detail.append(heading("response headers"), headerList(r.resp_headers));
+    if (r.resp_body) detail.append(body("response body", r.resp_body));
+  }
+
+  list.addEventListener("click", (e) => {
+    const tr = e.target.closest("tr.row");
+    if (tr) show(Number(tr.dataset.id));
+  });
+
+  Object.values(filters).forEach((el) => el.addEventListener("input", render));
+
+  $("pause").addEventListener("click", () => {
+    live = !live;
+    $("pause").textContent = live ? "live" : "paused";
+    $("pause").classList.toggle("on", live);
+    if (live) connect(); else if (source) { source.close(); source = null; }
+  });
+
+  $("clear").addEventListener("click", async () => {
+    if (!confirm("Clear all captured requests? This cannot be undone.")) return;
+    const resp = await fetch("/api/inspect/clear", { method: "POST" });
+    if (resp.ok) {
+      rows = [];
+      selected = null;
+      empty(detail, "Pick a request.");
+      render();
+    }
+  });
+
+  function add(r) {
+    rows.unshift(r);
+    if (rows.length > 2000) rows.length = 2000;
+  }
+
+  function connect() {
+    if (source) source.close();
+    // EventSource reconnects on its own, including after the server drops a
+    // subscriber for falling behind. Each connection replays the last 200,
+    // so a reconnect fills the gap. Replayed and live copies of the same
+    // record share an id, since the store assigns it before publishing to
+    // either path, so the id check below is what keeps rows from doubling
+    // up regardless of which copy happens to arrive first.
+    source = new EventSource("/api/inspect/stream");
+    source.onmessage = (e) => {
+      const r = JSON.parse(e.data);
+      if (rows.some((x) => x.id === r.id)) return;
+      add(r);
+      render();
+    };
+    source.onerror = () => {
+      // A closed source here means the inspector went off mid-session (a
+      // reload can do that); the next poll() call below will notice and
+      // switch the page into the off state. Anything else is transient and
+      // EventSource is already retrying on its own.
+    };
+  }
+
+  // poll() doubles as the periodic "N dropped" counter and the way the page
+  // notices the inspector went off (a config reload can flip that while
+  // this page is open), so a stream drop or a stale filter view never
+  // quietly reads as "no traffic" instead of "the inspector is off".
+  async function poll() {
+    if (inspectorOff) return;
+    const resp = await fetch("/api/inspect/requests?limit=1");
+    if (resp.status === 503) {
+      inspectorOff = true;
+      if (source) { source.close(); source = null; }
+      empty(list, "The inspector is off.");
+      empty(detail, "The inspector is off.");
+      $("pause").disabled = true;
+      $("clear").disabled = true;
+      $("drops").textContent = "";
+      return;
+    }
+    if (!resp.ok) return;
+    const { dropped } = await resp.json();
+    $("drops").textContent = dropped ? dropped + " dropped" : "";
+  }
+
+  poll().then(() => { if (!inspectorOff) connect(); });
+  setInterval(poll, 10000);
+})();
+</script>
+</body>
+</html>

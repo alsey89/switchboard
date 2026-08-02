@@ -294,7 +294,11 @@ func sendEvent(w http.ResponseWriter, v recordJSON) {
 	io.WriteString(w, "\n\n")   //nolint:errcheck
 }
 
-// handleInspectPage is a stub. Task 10 replaces it with the inspector page.
+// handleInspectPage serves the split-pane inspector UI. The page itself
+// carries no server-rendered record data — it fetches everything from the
+// JSON and SSE endpoints above, client side — so there is nothing here for
+// html/template to escape.
 func (s *Server) handleInspectPage(w http.ResponseWriter, r *http.Request) {
-	http.Error(w, "not implemented", http.StatusNotImplemented)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	tmpl.ExecuteTemplate(w, "inspect.html", nil) //nolint:errcheck
 }

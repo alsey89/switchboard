@@ -316,6 +316,20 @@ func TestInspectRequestsAppliesEachQueryParameter(t *testing.T) {
 	}
 }
 
+func TestInspectPageRenders(t *testing.T) {
+	s, _ := testServer(t)
+	w := do(s, "GET", "/inspect", nil)
+	if w.Code != 200 {
+		t.Fatalf("status %d", w.Code)
+	}
+	body := w.Body.String()
+	for _, want := range []string{"EventSource", "/api/inspect/stream", "id=\"list\""} {
+		if !strings.Contains(body, want) {
+			t.Errorf("page is missing %q", want)
+		}
+	}
+}
+
 func itoa(n int64) string {
 	return strconv.FormatInt(n, 10)
 }
