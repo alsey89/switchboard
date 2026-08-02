@@ -1,6 +1,7 @@
 package dashboard
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -318,6 +320,149 @@ func itoa(n int64) string {
 	return strconv.FormatInt(n, 10)
 }
 
+func TestStreamBackfillsThenPushes(t *testing.T) {
+	s, r := testServer(t)
+	seed(t, r, "/backfilled")
+
+	srv := httptest.NewServer(s.mux())
+	defer srv.Close()
+
+	req, err := http.NewRequest("GET", srv.URL+"/api/inspect/stream", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = "switchboard.test"
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close() //nolint:errcheck
+
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
+		t.Fatalf("Content-Type = %q", ct)
+	}
+
+	events := make(chan string, 8)
+	go func() {
+		sc := bufio.NewScanner(resp.Body)
+		for sc.Scan() {
+			if line := sc.Text(); strings.HasPrefix(line, "data: ") {
+				events <- strings.TrimPrefix(line, "data: ")
+			}
+		}
+	}()
+
+	// The backfill must arrive without anyone making a new request.
+	select {
+	case got := <-events:
+		if !strings.Contains(got, "/backfilled") {
+			t.Errorf("first event = %s, want the backfilled row", got)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no backfill")
+	}
+
+	// A record submitted after the subscription must be pushed.
+	r.Submit(&inspect.Record{
+		StartedAt: time.Now(), Domain: "app.test", Method: "GET",
+		Path: "/pushed", Status: 200, Proto: "HTTP/1.1",
+	})
+	select {
+	case got := <-events:
+		if !strings.Contains(got, "/pushed") {
+			t.Errorf("second event = %s, want the pushed row", got)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no live event")
+	}
+}
+
+func TestStreamIs503WithNoRecorder(t *testing.T) {
+	s := New(&config.Config{Suffix: "test"}, "test")
+	if w := do(s, "GET", "/api/inspect/stream", nil); w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status %d, want 503", w.Code)
+	}
+}
+
+// TestStreamSubscribesBeforeBackfill races a continuous burst of submissions
+// against connection setup: it exercises the same concurrent path a
+// query-before-subscribe bug would corrupt, under -race, and checks that
+// every submitted path eventually surfaces on the stream via the backfill,
+// the live push, or both.
+//
+// It is not a reliable trigger for that specific bug by itself: the gap
+// between the query and the subscription is two fast, local, in-process
+// calls, order of microseconds, while this recorder flushes to the store
+// every 5ms — so the odds of a given publish landing in that exact window
+// are low, and this test can pass even against a handler that queries
+// before it subscribes; catching that specific bug on purpose would need a
+// delay hook inside the recorder, which is outside what Subscribe/List
+// expose. The guarantee that the order is right is that
+// handleInspectStream calls Subscribe before Store().List, visible by
+// inspection in inspect.go.
+func TestStreamSubscribesBeforeBackfill(t *testing.T) {
+	s, r := testServer(t)
+
+	const n = 200
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < n; i++ {
+			r.Submit(&inspect.Record{
+				StartedAt: time.Now(), Domain: "app.test", Method: "GET",
+				Path: fmt.Sprintf("/race-%d", i), Status: 200, Proto: "HTTP/1.1",
+			})
+		}
+	}()
+
+	srv := httptest.NewServer(s.mux())
+	defer srv.Close()
+
+	req, err := http.NewRequest("GET", srv.URL+"/api/inspect/stream", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = "switchboard.test"
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close() //nolint:errcheck
+
+	events := make(chan string, n*2)
+	go func() {
+		sc := bufio.NewScanner(resp.Body)
+		for sc.Scan() {
+			if line := sc.Text(); strings.HasPrefix(line, "data: ") {
+				events <- strings.TrimPrefix(line, "data: ")
+			}
+		}
+		close(events)
+	}()
+
+	wg.Wait()
+
+	seen := make(map[string]bool, n)
+	deadline := time.After(10 * time.Second)
+	for len(seen) < n {
+		select {
+		case ev, ok := <-events:
+			if !ok {
+				t.Fatalf("stream closed early with %d/%d records seen", len(seen), n)
+			}
+			var row struct {
+				Path string `json:"path"`
+			}
+			if err := json.Unmarshal([]byte(ev), &row); err == nil {
+				seen[row.Path] = true
+			}
+		case <-deadline:
+			t.Fatalf("timed out with %d/%d records seen, a race dropped one", len(seen), n)
+		}
+	}
+}
+
 // TestInspectEndpointsSurviveAClosedStore reproduces the reload race: the
 // pointer swap in SetInspector has no barrier for a reader already in
 // flight, so a handler can hold a *Recorder whose *Store a concurrent
@@ -353,6 +498,20 @@ func TestInspectEndpointsSurviveAClosedStore(t *testing.T) {
 	t.Run("clear", func(t *testing.T) {
 		w := do(s, "POST", "/api/inspect/clear",
 			map[string]string{"Origin": "https://switchboard.test"})
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status %d, want 503", w.Code)
+		}
+		if strings.Contains(w.Body.String(), "database is closed") {
+			t.Errorf("leaked the driver error: %s", w.Body)
+		}
+	})
+
+	// stream's backfill query runs before any header is written, so a
+	// closed store must turn into the same clean 503 as the other
+	// endpoints rather than an SSE response that silently opens with no
+	// backfill.
+	t.Run("stream", func(t *testing.T) {
+		w := do(s, "GET", "/api/inspect/stream", nil)
 		if w.Code != http.StatusServiceUnavailable {
 			t.Fatalf("status %d, want 503", w.Code)
 		}

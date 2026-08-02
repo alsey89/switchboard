@@ -4,10 +4,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/alsey89/switchboard/internal/inspect"
 )
@@ -203,9 +205,85 @@ func writeJSON(w http.ResponseWriter, v any) {
 	json.NewEncoder(w).Encode(v) //nolint:errcheck
 }
 
-// handleInspectStream is a stub. Task 9 replaces it with the SSE feed.
+// handleInspectStream is the live feed.
+//
+// Server-sent events, not a websocket. The feed only ever goes one way, so a
+// bidirectional protocol would buy nothing and cost a dependency. SSE also
+// reconnects on its own, which is what makes dropping a slow subscriber a
+// safe thing to do: the browser comes back and backfills.
 func (s *Server) handleInspectStream(w http.ResponseWriter, r *http.Request) {
-	http.Error(w, "not implemented", http.StatusNotImplemented)
+	rec, ok := s.recorder(w)
+	if !ok {
+		return
+	}
+	rc := http.NewResponseController(w)
+
+	// Subscribe before backfilling. The other order has a hole: a request
+	// arriving between the query and the subscription is in neither.
+	ch, cancel := rec.Subscribe()
+	defer cancel()
+
+	// Query before writing any header, so a closed store (a reload raced
+	// this request) still gets a clean storeError response instead of a
+	// stream that opened and then silently skipped the backfill.
+	backfill, err := rec.Store().List(inspect.Query{Limit: 200})
+	if err != nil {
+		storeError(w, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	if err := rc.Flush(); err != nil {
+		return
+	}
+
+	// List is newest first; replay oldest first so the client can append.
+	for i := len(backfill) - 1; i >= 0; i-- {
+		sendEvent(w, toJSON(backfill[i]))
+	}
+	if err := rc.Flush(); err != nil {
+		return
+	}
+
+	ping := time.NewTicker(30 * time.Second)
+	defer ping.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+
+		case rec, open := <-ch:
+			if !open {
+				// Dropped for falling behind. Closing here is the whole
+				// point: EventSource reconnects and backfills.
+				return
+			}
+			sendEvent(w, toJSON(rec))
+			if err := rc.Flush(); err != nil {
+				return
+			}
+
+		case <-ping.C:
+			io.WriteString(w, ": ping\n\n") //nolint:errcheck
+			if err := rc.Flush(); err != nil {
+				return
+			}
+		}
+	}
+}
+
+func sendEvent(w http.ResponseWriter, v recordJSON) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return
+	}
+	io.WriteString(w, "data: ") //nolint:errcheck
+	w.Write(b)                  //nolint:errcheck
+	io.WriteString(w, "\n\n")   //nolint:errcheck
 }
 
 // handleInspectPage is a stub. Task 10 replaces it with the inspector page.
