@@ -105,6 +105,41 @@ parent that binds `:443` and `:80` and immediately drops to your user — see
 [ADR 0001](docs/adr/0001-binding-privileged-ports-on-macos.md). Everything in
 the list above runs as you.
 
+### Inspector
+
+Every request through a route is recorded and shown live at
+`https://switchboard.test/inspect`. Method, URL, status, timing and headers.
+No setup. It is on as soon as you upgrade.
+
+Bodies are not recorded unless you ask for them:
+
+```toml
+[inspect]
+bodies = true
+```
+
+Two things worth knowing before you turn that on. Bodies are written to
+`inspect.db` in the data directory. And turning bodies on also stops header
+redaction, so `Authorization` and `Cookie` values are stored as sent.
+
+With bodies off, the values of `Authorization`, `Proxy-Authorization`,
+`Cookie`, `Set-Cookie`, `X-Api-Key` and `X-Auth-Token` are replaced before
+anything is written. That list is fixed, so it reduces what ends up on disk
+but does not promise to catch a custom token header of your own.
+
+The buffer is bounded three ways and trims itself: 5,000 requests, 64 MiB,
+and 7 days. All of it is configurable.
+
+```toml
+[inspect]
+enabled        = true
+bodies         = false
+max_requests   = 5000
+max_bytes      = 67108864
+max_body_bytes = 65536
+max_age        = "168h"
+```
+
 ## Choosing a domain suffix
 
 The default is `.test` — RFC 6761 reserves it for exactly this, and nothing
@@ -161,8 +196,8 @@ Early. **v0.1 targets macOS** (it has the cleanest OS story — see
 (systemd-resolved/dnsmasq) automation are next; on those platforms `setup`
 currently prints exact manual steps instead.
 
-Roadmap (details in [DESIGN.md](DESIGN.md)): traffic inspector →
-dashboard/GUI → Windows → Linux → self-hostable tunnels.
+Roadmap (details in [DESIGN.md](DESIGN.md)): dashboard/GUI → Windows → Linux
+→ self-hostable tunnels.
 
 What changed in each release, and anything you need to do about it, is in
 [CHANGELOG.md](CHANGELOG.md).

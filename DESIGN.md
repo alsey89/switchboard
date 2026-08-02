@@ -224,7 +224,7 @@ switchboard doctor             # port conflicts, resolver state, CA trust state
 | CLI | `spf13/cobra` | |
 | Config | TOML (`BurntSushi/toml`), `fsnotify` for hot reload | |
 | (v0.2) storage | `modernc.org/sqlite` (CGo-free) | Inspector log, ring-buffer semantics |
-| (v0.2) live feed | WebSocket (`nhooyr.io/websocket`) from the dashboard handler | |
+| (v0.3) live feed | Server-sent events from the dashboard handler | The feed only goes one way, so a websocket would add a dependency and buy nothing. SSE also reconnects on its own, which is what makes dropping a slow subscriber safe |
 | (v0.3?) native shell | Wails | Only if the web dashboard proves insufficient |
 
 ### Certificate handling (all Caddy)
@@ -354,7 +354,7 @@ binder rather than the daemon with a `UserName` key in a plist.
 |---|---|
 | **v0.1** | macOS. CLI + daemon: DNS, embedded Caddy (proxy + HTTPS + trust), `setup`/`add`/`rm`/`ls`/`doctor`, hot-reload config. **The whole point, shippable alone.** |
 | **v0.2** | Apache-2.0 license; `.internal` and user-owned domain suffixes; dashboard reachable on loopback; websocket/HMR integration test; **launchd agent (`switchboard daemon install`)**; Homebrew distribution. |
-| **v0.3** | Inspector: custom Caddy handler module captures method/URL/headers/bodies → SQLite ring buffer → live WS feed. Dashboard matured (inspector split-pane, route add/remove). Best demo material. **Constraint, decided now rather than after the schema exists: request and response bodies are captured only when explicitly enabled, never by default.** The inspector records the user's own dev traffic — auth headers, session cookies, request payloads — to disk, and a ring buffer means it persists past the moment they were looking at it. Metadata by default is useful; bodies by default is a credential store nobody asked for. |
+| **v0.3** | Inspector: custom Caddy handler module captures method/URL/headers/bodies → SQLite ring buffer → live feed. Dashboard matured (inspector split-pane). Route add/remove moved out: it turns the dashboard into a write surface and needs its own origin and auth design. Best demo material. **Constraint, decided now rather than after the schema exists: request and response bodies are captured only when explicitly enabled, never by default.** The inspector records the user's own dev traffic — auth headers, session cookies, request payloads — to disk, and a ring buffer means it persists past the moment they were looking at it. Metadata by default is useful; bodies by default is a credential store nobody asked for. |
 | **v0.4** | Windows (NRPT + hosts-block fallback). |
 | **v0.5** | Linux (resolved/dnsmasq + setcap). |
 | **v1.x** | Tunnels: OSS self-hostable relay first (candidates to embed or crib: `frp`, `chisel` — embeddable Go lib — or custom on `yamux`); hosted paid tier only on traction. mDNS/Bonjour LAN sharing (`myapp.local` to your phone) as a separate opt-in feature — note mDNS can't do wildcards and only `.local`. |

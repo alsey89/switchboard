@@ -24,6 +24,7 @@ launchd
               reverse proxy      the two inherited sockets
               TLS termination    + certificate authority
               dashboard          127.0.0.1:8484
+              inspector          records to inspect.db, served via the dashboard
               config watcher     hot-reloads on change
 ```
 
@@ -102,6 +103,7 @@ let anything running as you replace the binary and get root at the next boot.
 | `~/.config/switchboard/data/pki/root.key` | Its private key | `0600`. The most sensitive file here |
 | `~/.config/switchboard/data/caddy/pki/…` | Intermediate cert + key | Managed and rotated by Caddy |
 | `~/.config/switchboard/data/caddy/certificates/…` | Per-host leaf certs | Issued on demand, auto-renewed |
+| `~/.config/switchboard/data/inspect.db` | Captured request history | Bounded by count, size and age; survives `bodies`/`enabled` toggles, gone only if you delete it |
 
 `rm -rf ~/.config/switchboard` is a complete reset of everything unprivileged.
 
@@ -345,7 +347,15 @@ take effect on nothing.
 
 - **Loopback is the security boundary for the dashboard.** It is unauthenticated
   and bound to `127.0.0.1`. Anything already running on your machine as you can
-  reach it.
+  reach it, and that now includes everything the inspector has captured. The
+  one endpoint that changes state, clearing the buffer, additionally requires
+  a matching `Origin`.
+
+- **The inspector records your own traffic to disk.** Metadata for every
+  proxied request goes into `inspect.db` in the data directory, bounded by
+  count, size and age. Header redaction is a fixed deny-list, so it reduces
+  exposure rather than preventing it. Bodies are off unless you turn them
+  on, and turning them on also turns redaction off.
 
 - **Release binaries are not notarized.** The Homebrew cask strips the
   quarantine attribute on install. A binary downloaded through a browser needs
