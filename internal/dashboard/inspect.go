@@ -216,10 +216,18 @@ func (s *Server) handleInspectStream(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if _, ok := w.(http.Flusher); !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
 	rc := http.NewResponseController(w)
 
 	// Subscribe before backfilling. The other order has a hole: a request
-	// arriving between the query and the subscription is in neither.
+	// arriving between the query and the subscription is in neither. The
+	// trade this makes is a duplicate, not a drop: a record that lands
+	// exactly in that window arrives once in the backfill and once on the
+	// channel, and a client can de-duplicate on id, since Insert assigns
+	// the id before publish hands the same record to both paths.
 	ch, cancel := rec.Subscribe()
 	defer cancel()
 
@@ -256,13 +264,13 @@ func (s *Server) handleInspectStream(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 
-		case rec, open := <-ch:
+		case record, open := <-ch:
 			if !open {
 				// Dropped for falling behind. Closing here is the whole
 				// point: EventSource reconnects and backfills.
 				return
 			}
-			sendEvent(w, toJSON(rec))
+			sendEvent(w, toJSON(record))
 			if err := rc.Flush(); err != nil {
 				return
 			}

@@ -384,26 +384,16 @@ func TestStreamIs503WithNoRecorder(t *testing.T) {
 	}
 }
 
-// TestStreamSubscribesBeforeBackfill races a continuous burst of submissions
-// against connection setup: it exercises the same concurrent path a
-// query-before-subscribe bug would corrupt, under -race, and checks that
-// every submitted path eventually surfaces on the stream via the backfill,
-// the live push, or both.
-//
-// It is not a reliable trigger for that specific bug by itself: the gap
-// between the query and the subscription is two fast, local, in-process
-// calls, order of microseconds, while this recorder flushes to the store
-// every 5ms — so the odds of a given publish landing in that exact window
-// are low, and this test can pass even against a handler that queries
-// before it subscribes; catching that specific bug on purpose would need a
-// delay hook inside the recorder, which is outside what Subscribe/List
-// expose. The guarantee that the order is right is that
-// handleInspectStream calls Subscribe before Store().List, visible by
-// inspection in inspect.go.
-func TestStreamSubscribesBeforeBackfill(t *testing.T) {
+// TestStreamDeliversUnderConcurrentSubmits races a burst of submissions
+// against connection setup, under -race, and checks every submitted path
+// eventually surfaces on the stream via the backfill, the live push, or
+// both. n stays under the test store's 100-record cap (inspect_test.go's
+// testServer) and the subscriber's 256-slot buffer, so nothing here is
+// expected to be evicted or dropped.
+func TestStreamDeliversUnderConcurrentSubmits(t *testing.T) {
 	s, r := testServer(t)
 
-	const n = 200
+	const n = 50
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
