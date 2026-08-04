@@ -2,7 +2,7 @@
 
 What changed in each release, and anything you need to do about it.
 
-## Unreleased
+## 0.3.0 — 2026-08-04
 
 ### Added
 
