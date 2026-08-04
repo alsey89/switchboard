@@ -9,7 +9,7 @@ import (
 	"github.com/alsey89/switchboard/internal/config"
 )
 
-func testServer() *Server {
+func newBasicServer() *Server {
 	return New(&config.Config{
 		Suffix: "test",
 		Routes: []config.Route{{Domain: "app.test", Port: 3000}},
@@ -26,7 +26,7 @@ func get(t *testing.T, s *Server, host string) *httptest.ResponseRecorder {
 }
 
 func TestDashboardServedOnItsOwnDomain(t *testing.T) {
-	rec := get(t, testServer(), "switchboard.test")
+	rec := get(t, newBasicServer(), "switchboard.test")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("got %d, want 200", rec.Code)
 	}
@@ -41,7 +41,7 @@ func TestDashboardServedOnLoopback(t *testing.T) {
 		"127.0.0.1:8484", "localhost:8484", "[::1]:8484", "127.0.0.1",
 		"LOCALHOST:8484", "::ffff:127.0.0.1", "[::1]",
 	} {
-		rec := get(t, testServer(), host)
+		rec := get(t, newBasicServer(), host)
 		if rec.Code != http.StatusOK {
 			t.Errorf("host %q: got %d, want 200", host, rec.Code)
 		}
@@ -52,7 +52,7 @@ func TestDashboardServedOnLoopback(t *testing.T) {
 }
 
 func TestUnroutedHostGetsNoRoutePage(t *testing.T) {
-	rec := get(t, testServer(), "whoops.test")
+	rec := get(t, newBasicServer(), "whoops.test")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("got %d, want 404", rec.Code)
 	}
@@ -75,7 +75,7 @@ func TestNonLoopbackHostIsNotTreatedAsDashboard(t *testing.T) {
 		"notlocalhost",          // substring trap: looks like localhost
 		"localhost.localdomain", // localhost with TLD suffix
 	} {
-		rec := get(t, testServer(), host)
+		rec := get(t, newBasicServer(), host)
 		if rec.Code != http.StatusNotFound {
 			t.Errorf("host %q: got %d, want 404 for a foreign Host", host, rec.Code)
 		}

@@ -27,6 +27,7 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy"
 
 	"github.com/alsey89/switchboard/internal/config"
+	"github.com/alsey89/switchboard/internal/inspect"
 	"github.com/alsey89/switchboard/internal/listen"
 )
 
@@ -77,9 +78,19 @@ func Generate(cfg *config.Config, dataDir string, set *listen.Set) (*caddy.Confi
 	// which renders the "no route" page for unknown hosts.
 	var routes caddyhttp.RouteList
 	for _, r := range cfg.Routes {
+		// The inspector goes on user routes only. The dashboard catch-all
+		// below is deliberately left alone: instrumenting it would make the
+		// inspector record itself, live feed included, and the buffer would
+		// fill with its own traffic.
+		var handlers []json.RawMessage
+		if cfg.InspectEnabled() {
+			handlers = append(handlers, inspectHandler())
+		}
+		handlers = append(handlers, reverseProxyTo(r.UpstreamAddr()))
+
 		routes = append(routes, caddyhttp.Route{
 			MatcherSetsRaw: hostMatcher(r.Domain),
-			HandlersRaw:    []json.RawMessage{reverseProxyTo(r.UpstreamAddr())},
+			HandlersRaw:    handlers,
 			Terminal:       true,
 		})
 	}
@@ -203,6 +214,10 @@ func reverseProxyTo(dial string) json.RawMessage {
 	return caddyconfig.JSONModuleObject(reverseproxy.Handler{
 		Upstreams: reverseproxy.UpstreamPool{{Dial: dial}},
 	}, "handler", "reverse_proxy", nil)
+}
+
+func inspectHandler() json.RawMessage {
+	return caddyconfig.JSONModuleObject(inspect.Handler{}, "handler", "switchboard_inspect", nil)
 }
 
 // Load generates and (re)loads the Caddy config in-process. Safe to call

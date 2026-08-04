@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/alsey89/switchboard/internal/config"
+	"github.com/alsey89/switchboard/internal/inspect"
 	"github.com/alsey89/switchboard/internal/listen"
 	"github.com/alsey89/switchboard/internal/proxy"
 )
@@ -35,22 +37,83 @@ const (
 	tDashPort  = 18484
 )
 
+// tSuffixInternal and tSuffixLocalhost are the two other reserved suffixes
+// (see config.ReservedSuffixes), reserved here for any test that verifies a
+// certificate against the daemon's minted root CA.
+//
+// This is not bureaucracy for its own sake. Caddy's on-demand certificate
+// cache (certCache in modules/caddytls/tls.go) is a package-level variable,
+// not scoped to one *caddy.Config or one daemon.Run call. caddy.Stop() only
+// evicts entries that were under explicit certificate management; an
+// on-demand-issued cert never was, so it survives in that global cache
+// after Stop() returns. A second daemon boot in the same test process that
+// requests a certificate for a domain name it has seen before gets served
+// the *first* boot's cert — signed by the *first* boot's root — verified
+// against the *second* boot's root pool, which fails with something like
+// "x509: certificate signed by unknown authority". Confirmed with a
+// minimal repro: two sequential proxy.Load/proxy.Stop cycles with the same
+// suffix reproduce the exact failure; giving the second one a different
+// suffix (and therefore different domain names) does not.
+//
+// This is issue #25. It is a real defect, but it lives in vendored Caddy
+// and only manifests when more than one full daemon boots in one OS
+// process — something that only ever happens in this test binary, never in
+// production, where one process serves for the whole life of the daemon.
+// Patching it out is out of scope here; giving each cert-verifying test in
+// this package its own domain names is enough to stop the cache from ever
+// serving a stale cert to the wrong root, and it is the fix that keeps
+// every test running under a plain `go test ./...` rather than gating any
+// of them out.
+const (
+	tSuffixInternal  = "internal"
+	tSuffixLocalhost = "localhost"
+)
+
 type testEnv struct {
 	cfgPath string
 	cfg     *config.Config
+	dataDir string
 	rootCAs *x509.CertPool
 	cancel  context.CancelFunc
 	done    chan error
 }
 
+// startOpts customizes startEnv for tests that need to observe the daemon's
+// logs, tamper with the data directory before the daemon starts, or use a
+// suffix other than the shared default.
+type startOpts struct {
+	// poisonDataDir, when set, runs after the data directory is created but
+	// before the daemon starts. It exists to break one thing the data
+	// directory holds (e.g. the inspector's database file) without
+	// disturbing the rest (the proxy's PKI files), which is the only way to
+	// prove a broken inspector does not take the proxy down with it.
+	poisonDataDir func(t *testing.T, dataDir string)
+	log           *slog.Logger
+
+	// suffix overrides the default "test" suffix. Any test that verifies a
+	// certificate against the minted root CA (as opposed to just booting
+	// the daemon) must use a suffix no other such test in this package
+	// uses — see the comment on tSuffixInternal/tSuffixLocalhost for why.
+	suffix string
+}
+
 func startEnv(t *testing.T, routes []config.Route) *testEnv {
+	t.Helper()
+	return startEnvOpts(t, routes, startOpts{})
+}
+
+func startEnvOpts(t *testing.T, routes []config.Route, o startOpts) *testEnv {
 	t.Helper()
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.toml")
 	dataDir := filepath.Join(dir, "data")
 
+	suffix := o.suffix
+	if suffix == "" {
+		suffix = "test"
+	}
 	cfg := &config.Config{
-		Suffix:        "test",
+		Suffix:        suffix,
 		HTTPPort:      tHTTPPort,
 		HTTPSPort:     tHTTPSPort,
 		DNSPort:       tDNSPort,
@@ -61,10 +124,17 @@ func startEnv(t *testing.T, routes []config.Route) *testEnv {
 		t.Fatal(err)
 	}
 
+	if o.poisonDataDir != nil {
+		if err := os.MkdirAll(dataDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		o.poisonDataDir(t, dataDir)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- Run(ctx, Options{ConfigPath: cfgPath, DataDir: dataDir, Version: "test"})
+		done <- Run(ctx, Options{ConfigPath: cfgPath, DataDir: dataDir, Version: "test", Log: o.log})
 	}()
 
 	// Wait for the HTTPS listener, then load the root CA it minted.
@@ -81,7 +151,7 @@ func startEnv(t *testing.T, routes []config.Route) *testEnv {
 		t.Fatal("root CA PEM did not parse")
 	}
 
-	env := &testEnv{cfgPath: cfgPath, cfg: cfg, rootCAs: pool, cancel: cancel, done: done}
+	env := &testEnv{cfgPath: cfgPath, cfg: cfg, dataDir: dataDir, rootCAs: pool, cancel: cancel, done: done}
 	t.Cleanup(func() {
 		cancel()
 		select {
@@ -281,6 +351,422 @@ func TestEndToEnd(t *testing.T) {
 			return resp.StatusCode == 200 && strings.Contains(string(body), "second upstream")
 		}, 15*time.Second, "hot-reloaded route to answer")
 	})
+}
+
+// TestInspectorCapturesProxiedTraffic is the one test in this package that
+// spans the whole inspector chain rather than one layer of it: a real
+// request through the real Caddy handler, batched by the real recorder,
+// landing in the real SQLite store, read back off the real dashboard API.
+// Every other inspector test in this file or in internal/inspect exercises
+// one of those pieces in isolation; this is the one that would catch a seam
+// between them.
+func TestInspectorCapturesProxiedTraffic(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+
+	// This test verifies a certificate, so it needs a suffix none of the
+	// other cert-verifying tests in this package use — see
+	// tSuffixInternal/tSuffixLocalhost above for why a shared suffix would
+	// let a second daemon boot in this same process get served the first
+	// boot's stale cert out of Caddy's package-level on-demand cert cache.
+	// A multi-label suffix passes config's validateSuffix unconditionally.
+	const suffix = "capture.test"
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(201)
+		io.WriteString(w, "captured me") //nolint:errcheck
+	}))
+	defer upstream.Close()
+
+	domain := "app." + suffix
+	env := startEnvOpts(t, []config.Route{{
+		Domain:   domain,
+		Upstream: strings.TrimPrefix(upstream.URL, "http://"),
+	}}, startOpts{suffix: suffix})
+	client := env.client()
+
+	resp, err := client.Get(fmt.Sprintf("https://%s:%d/inspected?x=1", domain, tHTTPSPort))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close() //nolint:errcheck
+
+	// The dashboard's own loopback port, the same door the browser uses when
+	// TLS or DNS is broken.
+	api := fmt.Sprintf("http://127.0.0.1:%d/api/inspect/requests", tDashPort)
+
+	type row struct {
+		Domain string `json:"domain"`
+		Method string `json:"method"`
+		Path   string `json:"path"`
+		Status int    `json:"status"`
+	}
+	var got []row
+	waitFor(t, func() bool {
+		r, err := http.Get(api) //nolint:noctx
+		if err != nil {
+			return false
+		}
+		defer r.Body.Close() //nolint:errcheck
+		var out struct {
+			Requests []row `json:"requests"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&out); err != nil {
+			return false
+		}
+		got = out.Requests
+		return len(out.Requests) > 0
+	}, 15*time.Second, "the proxied request to be captured")
+
+	if got[0].Path != "/inspected?x=1" {
+		t.Errorf("path = %q, want the full request URI", got[0].Path)
+	}
+	if got[0].Status != 201 {
+		t.Errorf("status = %d, want 201 from the upstream", got[0].Status)
+	}
+	if got[0].Domain != domain {
+		t.Errorf("domain = %q, want %q", got[0].Domain, domain)
+	}
+	if got[0].Method != http.MethodGet {
+		t.Errorf("method = %q, want GET", got[0].Method)
+	}
+
+	t.Run("dashboard traffic is not captured", func(t *testing.T) {
+		before := len(got)
+
+		// Load the dashboard itself several times through the proxy.
+		for i := 0; i < 3; i++ {
+			r, err := client.Get(fmt.Sprintf("https://%s:%d/", env.cfg.DashboardDomain(), tHTTPSPort))
+			if err != nil {
+				t.Fatal(err)
+			}
+			r.Body.Close() //nolint:errcheck
+		}
+
+		// A real synchronization point rather than a sleep: a follow-up
+		// request to the actual route always gets captured, so once it shows
+		// up the recorder has drained everything submitted before it —
+		// including the three dashboard loads above, sent from this same
+		// goroutine immediately before it.
+		marker := fmt.Sprintf("https://%s:%d/sync-marker?done=1", domain, tHTTPSPort)
+		mresp, err := client.Get(marker)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mresp.Body.Close() //nolint:errcheck
+
+		var out struct {
+			Requests []row `json:"requests"`
+		}
+		waitFor(t, func() bool {
+			r, err := http.Get(api) //nolint:noctx
+			if err != nil {
+				return false
+			}
+			defer r.Body.Close() //nolint:errcheck
+			var o struct {
+				Requests []row `json:"requests"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&o); err != nil {
+				return false
+			}
+			out = o
+			for _, rr := range o.Requests {
+				if rr.Path == "/sync-marker?done=1" {
+					return true
+				}
+			}
+			return false
+		}, 15*time.Second, "the synchronization marker request to be captured")
+
+		// Only the marker should have added a row. Any extra means a
+		// dashboard load got recorded too.
+		if len(out.Requests) != before+1 {
+			t.Fatalf("row count went %d -> %d, want %d; the inspector is recording the dashboard itself",
+				before, len(out.Requests), before+1)
+		}
+	})
+
+	t.Run("the database lands in the data dir", func(t *testing.T) {
+		if _, err := os.Stat(filepath.Join(env.dataDir, "inspect.db")); err != nil {
+			t.Errorf("inspect.db: %v", err)
+		}
+	})
+}
+
+// TestInspectorFailureNeverBlocksTheDaemon proves the daemon's central
+// promise about the inspector: a broken inspector is a warning, never a
+// reason the proxy does not start.
+//
+// The inspector's database path is pre-occupied by a directory, which
+// fails inspect.Open exactly like an unwritable data directory or a
+// corrupt file would. Nothing else in the data directory is touched, so
+// the proxy's own use of it (the PKI files) still succeeds — this is what
+// isolates "the inspector broke" from "the whole data directory broke",
+// and proves the failure is contained rather than merely unexercised.
+func TestInspectorFailureNeverBlocksTheDaemon(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, "ok") //nolint:errcheck
+	}))
+	defer upstream.Close()
+
+	var logs bytes.Buffer
+	env := startEnvOpts(t, []config.Route{{Domain: "app." + tSuffixInternal, Upstream: strings.TrimPrefix(upstream.URL, "http://")}},
+		startOpts{
+			suffix: tSuffixInternal,
+			log:    slog.New(slog.NewTextHandler(&logs, nil)),
+			poisonDataDir: func(t *testing.T, dataDir string) {
+				t.Helper()
+				// inspect.Open will try to create/open a file here; a
+				// directory in its place makes that fail without touching
+				// dataDir/pki, which the proxy needs to start at all.
+				if err := os.MkdirAll(filepath.Join(dataDir, "inspect.db"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			},
+		})
+
+	resp, err := env.client().Get(fmt.Sprintf("https://app.%s:%d/hello", tSuffixInternal, tHTTPSPort))
+	if err != nil {
+		t.Fatalf("the proxy must still serve traffic with capture off: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 || string(body) != "ok" {
+		t.Errorf("status = %d, body = %q, want 200 and the upstream body", resp.StatusCode, body)
+	}
+
+	if inspect.Current() != nil {
+		t.Error("capture should be off when the inspector's database cannot be opened")
+	}
+	if !strings.Contains(logs.String(), "inspector disabled") {
+		t.Errorf("expected a warning naming the inspector disabled, got log:\n%s", logs.String())
+	}
+}
+
+// TestReloadAppliesNewInspectorLimits proves a config reload actually
+// reaches the store, not just the recorder's in-memory options. It sends
+// real traffic through the proxy (rather than calling Recorder.Submit
+// directly) so the assertion covers the whole path: handler to recorder to
+// store.
+func TestReloadAppliesNewInspectorLimits(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, "ok") //nolint:errcheck
+	}))
+	defer upstream.Close()
+
+	env := startEnvOpts(t, []config.Route{{Domain: "app." + tSuffixLocalhost, Upstream: strings.TrimPrefix(upstream.URL, "http://")}},
+		startOpts{suffix: tSuffixLocalhost})
+	client := env.client()
+
+	get := func() {
+		resp, err := client.Get(fmt.Sprintf("https://app.%s:%d/x", tSuffixLocalhost, tHTTPSPort))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close() //nolint:errcheck
+	}
+
+	for i := 0; i < 10; i++ {
+		get()
+	}
+	waitFor(t, func() bool {
+		r := inspect.Current()
+		return r != nil && r.Store().Rows() >= 10
+	}, 15*time.Second, "10 requests captured")
+
+	env.cfg.Inspect = &config.InspectConfig{MaxRequests: 3}
+	if err := env.cfg.Save(env.cfgPath); err != nil {
+		t.Fatal(err)
+	}
+
+	// Each poll sends one more request: the first one to land after the
+	// reload actually applies triggers the store's insert-then-trim and
+	// should bring the row count down to the new cap in one step.
+	waitFor(t, func() bool {
+		get()
+		r := inspect.Current()
+		return r != nil && r.Store().Rows() <= 3
+	}, 15*time.Second, "row count trimmed to the reloaded max_requests")
+}
+
+// TestReloadDisablingInspectorTearsDownButKeepsTheFile guards the owner
+// decision on the finding raised in review: reloading `enabled` from true
+// to false used to leave the recorder running forever — inspect.Current()
+// stayed non-nil, the dashboard's stored recorder stayed non-nil, and the
+// SQLite handle stayed open — even though proxy.Generate had already
+// stopped putting the handler on any route. Once Tasks 8/9 land, that would
+// have meant a user who turns capture off still sees the dashboard serving
+// previously captured requests, headers and bodies included, out of a
+// database nothing ever closes.
+//
+// The fix must not go too far the other way: turning it off must not
+// delete inspect.db. This test proves both halves — the teardown on
+// disable, and that the file (and its data) survives to be picked back up
+// on the next enable.
+func TestReloadDisablingInspectorTearsDownButKeepsTheFile(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+
+	// A multi-label suffix passes config's validateSuffix unconditionally
+	// (it is read as "a domain you own"), so it needs no entry in the
+	// three-suffix rotation the other cert-verifying tests share, and
+	// cannot collide with any of them over Caddy's package-level cert
+	// cache (see tSuffixInternal/tSuffixLocalhost above for why that
+	// matters).
+	const suffix = "toggle.test"
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, "ok") //nolint:errcheck
+	}))
+	defer upstream.Close()
+
+	env := startEnvOpts(t, []config.Route{{Domain: "app." + suffix, Upstream: strings.TrimPrefix(upstream.URL, "http://")}},
+		startOpts{suffix: suffix})
+	client := env.client()
+
+	resp, err := client.Get(fmt.Sprintf("https://app.%s:%d/hello", suffix, tHTTPSPort))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close() //nolint:errcheck
+
+	waitFor(t, func() bool {
+		r := inspect.Current()
+		return r != nil && r.Store().Rows() >= 1
+	}, 15*time.Second, "the request to be captured")
+
+	// Keep a handle to the live recorder before disabling it: Trim against
+	// it after the reload is a direct check that *this* store's *sql.DB was
+	// actually closed, not just that some new state looks right.
+	before := inspect.Current()
+
+	disabled := false
+	env.cfg.Inspect = &config.InspectConfig{Enabled: &disabled}
+	if err := env.cfg.Save(env.cfgPath); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, func() bool { return inspect.Current() == nil }, 15*time.Second,
+		"the recorder to be torn down once the reload disables it")
+
+	if err := before.Store().Trim(time.Now()); err == nil {
+		t.Error("the old recorder's store should be closed once the inspector is disabled by a reload")
+	}
+
+	// The file must still be there, with the row intact: open it directly,
+	// the way the daemon would on its next start.
+	dbPath := filepath.Join(env.dataDir, "inspect.db")
+	st, err := inspect.Open(dbPath, inspect.Limits{})
+	if err != nil {
+		t.Fatalf("inspect.db should still be on disk and openable after being disabled: %v", err)
+	}
+	rows := st.Rows()
+	if err := st.Close(); err != nil {
+		t.Errorf("closing the reopened store: %v", err)
+	}
+	if rows < 1 {
+		t.Fatalf("disabling the inspector must not delete captured rows, got %d rows", rows)
+	}
+
+	// Re-enable: the daemon should pick the same file back up, history
+	// included, through the running recorder — not just via a side-channel
+	// open like the check above.
+	enabled := true
+	env.cfg.Inspect = &config.InspectConfig{Enabled: &enabled}
+	if err := env.cfg.Save(env.cfgPath); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, func() bool {
+		r := inspect.Current()
+		return r != nil && r.Store().Rows() >= 1
+	}, 15*time.Second, "the inspector to come back with its history intact")
+}
+
+// TestShutdownClosesInspectorStoreAfterEverythingElse guards the ordering
+// hazard found in review: Recorder.Close() closes the same SQLite handle
+// the dashboard's history endpoints read from (Store()), so the daemon
+// must stop serving before it closes the store — otherwise a request
+// racing shutdown could query a closed database. It also guards
+// SetCurrent(nil) running before Close(): skip that and a record submitted
+// in the shutdown window sits in the channel forever, counted by nothing.
+//
+// This does not yet have a dashboard endpoint to race against (Tasks 8/9
+// add those), so it checks what is observable now: that Current() is nil
+// before Run returns, and that the store is fully closed and safely
+// reopenable the instant Run returns — proving Close() ran to completion
+// rather than mid-flight or not at all.
+func TestShutdownClosesInspectorStoreAfterEverythingElse(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	t.Setenv(listen.EnvFDs, "")
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	dataDir := filepath.Join(dir, "data")
+	// Suffix "test" is safe to share with TestEndToEnd here: this test never
+	// verifies a certificate (it shuts down before making any HTTPS
+	// request), so it never touches Caddy's cross-process cert cache and
+	// cannot collide with it. See tSuffixInternal/tSuffixLocalhost above for
+	// the tests that do need to care.
+	cfg := &config.Config{
+		Suffix:        "test",
+		HTTPPort:      tHTTPPort,
+		HTTPSPort:     tHTTPSPort,
+		DNSPort:       tDNSPort,
+		DashboardPort: tDashPort,
+	}
+	if err := cfg.Save(cfgPath); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, Options{
+			ConfigPath: cfgPath,
+			DataDir:    dataDir,
+			Version:    "test",
+			Log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		})
+	}()
+
+	waitFor(t, func() bool { return inspect.Current() != nil }, 15*time.Second, "inspector up")
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("daemon exited with error: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("daemon did not shut down in time")
+	}
+
+	if inspect.Current() != nil {
+		t.Error("SetCurrent(nil) must run before Close(), or a submit racing shutdown " +
+			"would sit in the channel forever")
+	}
+
+	st, err := inspect.Open(filepath.Join(dataDir, "inspect.db"), inspect.Limits{})
+	if err != nil {
+		t.Fatalf("the store should be cleanly closed and reopenable once Run returns: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Errorf("closing the reopened store: %v", err)
+	}
 }
 
 func waitFor(t *testing.T, cond func() bool, timeout time.Duration, what string) {

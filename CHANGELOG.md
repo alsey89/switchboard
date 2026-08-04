@@ -4,7 +4,23 @@ What changed in each release, and anything you need to do about it.
 
 ## Unreleased
 
-Nothing yet.
+### Added
+
+- **Request inspector.** Every request through a route now shows up live at
+  `https://switchboard.test/inspect`. Method, URL, status, timing, headers.
+  Filter by domain, method or status, search the path, click a row for the
+  detail. Nothing to turn on.
+
+  Bodies are not recorded by default. Set `bodies = true` under `[inspect]`
+  if you want them. That also stops header redaction, so `Authorization` and
+  `Cookie` get stored as sent.
+
+  With bodies off, the values of the usual credential headers are replaced
+  before anything hits disk. The list is fixed, so it cuts down what is
+  stored without promising to catch a token header you invented.
+
+  History lives in `inspect.db` in the data directory and trims itself at
+  5,000 requests, 64 MiB, or 7 days, whichever comes first. All configurable.
 
 ## 0.2.4 — 2026-08-01
 

@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 )
@@ -44,6 +45,10 @@ type Config struct {
 	DNSPort       int `toml:"dns_port,omitzero"`
 	DashboardPort int `toml:"dashboard_port,omitzero"`
 
+	// Inspect configures the request inspector. Absent means defaults,
+	// which is metadata capture on and bodies off.
+	Inspect *InspectConfig `toml:"inspect,omitempty"`
+
 	Routes []Route `toml:"routes"`
 }
 
@@ -55,6 +60,29 @@ type Route struct {
 	Upstream string `toml:"upstream,omitempty"`
 }
 
+// InspectConfig configures the request inspector. A nil *InspectConfig and a
+// zero-valued one both mean "all defaults", so the accessors below are the
+// only supported way to read these.
+type InspectConfig struct {
+	// Enabled turns metadata capture on or off. Pointer, not bool: the
+	// default is true, and a plain bool cannot tell "unset" from "off".
+	Enabled *bool `toml:"enabled,omitempty"`
+
+	// Bodies captures request and response bodies. It also stops header
+	// redaction. Both effects, not one: someone who asked for the payload
+	// has already asked for the credentials in it, and a redacted Cookie
+	// next to a full session body is a confusing half measure.
+	Bodies bool `toml:"bodies,omitzero"`
+
+	MaxRequests  int   `toml:"max_requests,omitzero"`
+	MaxBytes     int64 `toml:"max_bytes,omitzero"`
+	MaxBodyBytes int   `toml:"max_body_bytes,omitzero"`
+
+	// MaxAge is a Go duration string. It is the one knob here that is not a
+	// number, because "168h" is checkable at a glance and 604800 is not.
+	MaxAge string `toml:"max_age,omitempty"`
+}
+
 // Defaults, exported for use in docs/tests.
 const (
 	DefaultSuffix        = "test"
@@ -62,7 +90,16 @@ const (
 	DefaultHTTPSPort     = 443
 	DefaultDNSPort       = 53535
 	DefaultDashboardPort = 8484
+
+	DefaultInspectMaxRequests  = 5000
+	DefaultInspectMaxBytes     = 64 << 20 // 64 MiB
+	DefaultInspectMaxBodyBytes = 64 << 10 // 64 KiB
 )
+
+// DefaultInspectMaxAge bounds how long captured traffic sits on disk. The
+// row and byte caps cannot catch the quiet case: a lightly used route
+// leaves a handful of rows that nothing ever pushes out.
+const DefaultInspectMaxAge = 7 * 24 * time.Hour
 
 func Default() *Config {
 	return &Config{Suffix: DefaultSuffix}
@@ -197,6 +234,9 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("route %s: %w", norm, err)
 		}
 	}
+	if err := c.Inspect.validate(); err != nil {
+		return fmt.Errorf("inspect: %w", err)
+	}
 	return nil
 }
 
@@ -221,6 +261,31 @@ func (r *Route) validateUpstream() error {
 		}
 	default:
 		return errors.New("missing port or upstream")
+	}
+	return nil
+}
+
+func (i *InspectConfig) validate() error {
+	if i == nil {
+		return nil
+	}
+	if i.MaxRequests < 0 {
+		return fmt.Errorf("max_requests %d cannot be negative", i.MaxRequests)
+	}
+	if i.MaxBytes < 0 {
+		return fmt.Errorf("max_bytes %d cannot be negative", i.MaxBytes)
+	}
+	if i.MaxBodyBytes < 0 {
+		return fmt.Errorf("max_body_bytes %d cannot be negative", i.MaxBodyBytes)
+	}
+	if i.MaxAge != "" {
+		d, err := time.ParseDuration(i.MaxAge)
+		if err != nil {
+			return fmt.Errorf("max_age %q is not a duration (try \"168h\"): %w", i.MaxAge, err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("max_age %q must be positive", i.MaxAge)
+		}
 	}
 	return nil
 }
@@ -359,6 +424,55 @@ func orDefault(v, d int) int {
 		return d
 	}
 	return v
+}
+
+// Inspector settings. Read these, never the struct: the zero value of every
+// field means "default", and Enabled defaults to true.
+
+func (c *Config) InspectEnabled() bool {
+	if c.Inspect == nil || c.Inspect.Enabled == nil {
+		return true
+	}
+	return *c.Inspect.Enabled
+}
+
+func (c *Config) InspectBodies() bool {
+	return c.Inspect != nil && c.Inspect.Bodies
+}
+
+func (c *Config) InspectMaxRequests() int {
+	if c.Inspect == nil {
+		return DefaultInspectMaxRequests
+	}
+	return orDefault(c.Inspect.MaxRequests, DefaultInspectMaxRequests)
+}
+
+func (c *Config) InspectMaxBytes() int64 {
+	if c.Inspect == nil || c.Inspect.MaxBytes == 0 {
+		return DefaultInspectMaxBytes
+	}
+	return c.Inspect.MaxBytes
+}
+
+func (c *Config) InspectMaxBodyBytes() int {
+	if c.Inspect == nil {
+		return DefaultInspectMaxBodyBytes
+	}
+	return orDefault(c.Inspect.MaxBodyBytes, DefaultInspectMaxBodyBytes)
+}
+
+// InspectMaxAge returns the parsed max_age. Validate has already proved the
+// string parses, so a bad value here can only come from a Config built in
+// code, and falling back to the default beats panicking in the daemon.
+func (c *Config) InspectMaxAge() time.Duration {
+	if c.Inspect == nil || c.Inspect.MaxAge == "" {
+		return DefaultInspectMaxAge
+	}
+	d, err := time.ParseDuration(c.Inspect.MaxAge)
+	if err != nil || d <= 0 {
+		return DefaultInspectMaxAge
+	}
+	return d
 }
 
 // DashboardDomain returns the reserved dashboard host for this config.

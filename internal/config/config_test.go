@@ -1,9 +1,11 @@
 package config
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNormalizeDomain(t *testing.T) {
@@ -228,5 +230,73 @@ func TestSetRouteChangesTheUpstreamKind(t *testing.T) {
 	}
 	if got.UpstreamAddr() != "192.168.1.5:8080" {
 		t.Errorf("UpstreamAddr() = %q, want 192.168.1.5:8080", got.UpstreamAddr())
+	}
+}
+
+func TestInspectDefaults(t *testing.T) {
+	c := Default()
+	if !c.InspectEnabled() {
+		t.Error("metadata capture should default to on")
+	}
+	if c.InspectBodies() {
+		t.Error("bodies must default to off")
+	}
+	if got := c.InspectMaxRequests(); got != DefaultInspectMaxRequests {
+		t.Errorf("max_requests = %d, want %d", got, DefaultInspectMaxRequests)
+	}
+	if got := c.InspectMaxBytes(); got != DefaultInspectMaxBytes {
+		t.Errorf("max_bytes = %d, want %d", got, DefaultInspectMaxBytes)
+	}
+	if got := c.InspectMaxBodyBytes(); got != DefaultInspectMaxBodyBytes {
+		t.Errorf("max_body_bytes = %d, want %d", got, DefaultInspectMaxBodyBytes)
+	}
+	if got := c.InspectMaxAge(); got != DefaultInspectMaxAge {
+		t.Errorf("max_age = %s, want %s", got, DefaultInspectMaxAge)
+	}
+}
+
+func TestInspectExplicitlyDisabled(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	body := "suffix = \"test\"\n\n[inspect]\nenabled = false\nbodies = true\nmax_requests = 10\nmax_age = \"1h\"\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.InspectEnabled() {
+		t.Error("enabled = false must survive the load")
+	}
+	if !c.InspectBodies() {
+		t.Error("bodies = true must survive the load")
+	}
+	if got := c.InspectMaxRequests(); got != 10 {
+		t.Errorf("max_requests = %d, want 10", got)
+	}
+	if got := c.InspectMaxAge(); got != time.Hour {
+		t.Errorf("max_age = %s, want 1h", got)
+	}
+}
+
+func TestInspectRejectsBadSettings(t *testing.T) {
+	cases := map[string]string{
+		"unparseable age": "max_age = \"soon\"",
+		"negative rows":   "max_requests = -1",
+		"negative bytes":  "max_bytes = -1",
+	}
+	for name, line := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.toml")
+			body := "suffix = \"test\"\n\n[inspect]\n" + line + "\n"
+			if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(path); err == nil {
+				t.Fatal("expected an error, got none")
+			}
+		})
 	}
 }
