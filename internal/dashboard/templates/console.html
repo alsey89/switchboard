@@ -77,6 +77,8 @@
   h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .05em;
     color: var(--muted); margin: 1.2rem 0 .4rem; font-weight: 500; }
   h2:first-child { margin-top: 0; }
+  .actions { display: flex; gap: .4rem; margin-bottom: .8rem; }
+  .actions .copy { font-size: .78rem; padding: .18rem .45rem; }
   pre { background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
     padding: .6rem; overflow-x: auto; font-size: .8rem; margin: 0;
     white-space: pre-wrap; word-break: break-all; }
@@ -197,6 +199,10 @@
 </main>
 <script>
 (function () {
+  // REDACTED is the sentinel internal/inspect writes in place of a
+  // credential header's value.
+  const REDACTED = "[redacted]";
+
   const $ = (id) => document.getElementById(id);
   const list = $("list"), detail = $("detail");
   const filters = { q: $("q"), domain: $("domain"), method: $("method"), status: $("status") };
@@ -535,6 +541,51 @@
     return frag;
   }
 
+  // shellQuote wraps a value for a POSIX shell in single quotes, which quote
+  // everything except a single quote itself. There is no escape for one
+  // inside single quotes, so the string is closed, an escaped quote is
+  // added, and the string is reopened.
+  function shellQuote(s) {
+    return "'" + String(s).replaceAll("'", `'\\''`) + "'";
+  }
+
+  // asCurl rebuilds the request as a command. Redacted header values are
+  // dropped rather than emitted: pasting `-H 'authorization: [redacted]'`
+  // produces a command that looks right and fails, which is worse than one
+  // that is visibly missing its credentials.
+  function asCurl(r) {
+    const parts = ["curl", "-i", "-X", r.method];
+    const headers = r.req_headers || {};
+    for (const k of Object.keys(headers).sort()) {
+      for (const v of headers[k]) {
+        if (v === REDACTED) continue;
+        parts.push("-H", shellQuote(k + ": " + v));
+      }
+    }
+    if (r.req_body) parts.push("--data-raw", shellQuote(r.req_body));
+    parts.push(shellQuote("https://" + r.domain + r.path));
+    return parts.join(" ");
+  }
+
+  // copyButton is a button whose label reports what happened. The clipboard
+  // API can reject (no permission, an insecure context) and a button that
+  // silently did nothing is the worst version of this.
+  function copyButton(label, text) {
+    const b = document.createElement("button");
+    b.className = "copy";
+    b.textContent = label;
+    b.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(text);
+        b.textContent = "copied";
+      } catch {
+        b.textContent = "copy failed";
+      }
+      setTimeout(() => { b.textContent = label; }, 1500);
+    });
+    return b;
+  }
+
   // show refetches the whole record. Neither the list nor the stream carries
   // bodies — they would be dead weight on every row — so this is the only
   // place they come from.
@@ -552,6 +603,15 @@
     if (selected !== id) return; // still true after the second await
 
     detail.textContent = "";
+
+    const actions = document.createElement("div");
+    actions.className = "actions";
+    actions.append(
+      copyButton("copy as curl", asCurl(r)),
+      copyButton("copy url", "https://" + r.domain + r.path),
+    );
+    detail.append(actions);
+
     detail.append(heading("request"));
 
     const dl = document.createElement("dl");

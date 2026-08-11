@@ -361,6 +361,16 @@ func TestConsoleListHasColumnHeaders(t *testing.T) {
 	}
 }
 
+func TestConsoleOffersCopyAsCurl(t *testing.T) {
+	s, _ := testServer(t)
+	body := do(s, "GET", "/", nil).Body.String()
+	for _, want := range []string{"copy as curl", "navigator.clipboard"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("detail pane is missing %q", want)
+		}
+	}
+}
+
 // TestInspectRedirectsToTheConsole keeps the v0.3 URL working. The README,
 // the CHANGELOG and the 0.3.0 release notes all name it, and people have
 // bookmarked it.
