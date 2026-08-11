@@ -108,8 +108,10 @@ the list above runs as you.
 ### Inspector
 
 Every request through a route is recorded and shown live at
-`https://switchboard.test/inspect`. Method, URL, status, timing and headers.
-No setup. It is on as soon as you upgrade.
+`https://switchboard.test`. Method, URL, status, timing and headers. No
+setup. Routes sit in a rail on the left. Click one to see only its traffic.
+
+The old `/inspect` URL still works. It redirects.
 
 Bodies are not recorded unless you ask for them:
 
