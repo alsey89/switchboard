@@ -1030,35 +1030,46 @@
   poll()
     .then(() => { if (!inspectorOff) return refresh(); })
     .finally(() => { if (!inspectorOff && live) connect(); });
-  // An hour in ms. Past it rel() returns a clock time, which never changes
-  // again, and rows is newest first, so the first row past the hour ends the
-  // walk: every row below it is older still.
-  const HOUR = 3600000;
-
   // restamp rewrites the age column. It skips the whole walk while capture
   // is off, where the table is hidden and rows is whatever was on screen
   // when it went off, and it writes only the cells whose label actually
   // changed. textContent does not dirty check, so an unconditional write to
-  // thousands of cells invalidates the whole table's style for nothing.
+  // thousands of cells invalidates the whole table's style for nothing. The
+  // dirty check is where the saving is: an unchanged row costs a string
+  // compare instead of a DOM write and a style invalidation.
   //
-  // The dirty check is per row on purpose. It cannot stop at the first
-  // unchanged label: in the minutes band a row's label flips when its own
-  // age crosses a multiple of 60 seconds, and rows do not share a phase, so
-  // a 2m10s row can be unchanged while a 3m05s row below it just flipped.
+  // It walks all of rows, and it has to. There is no row it can stop at.
+  //
+  // Rows are ordered by record id, and internal/inspect assigns the id when
+  // a request *completes*, not when it starts: the middleware submits the
+  // record after the next handler returns, carrying the start time it saved
+  // on the way in. So the list is ordered by completion and the label is
+  // computed from the start, and age is not monotone down the list. A slow
+  // request — SSE, a long poll, a hung backend, a large download — lands at
+  // the top of the list carrying a start time older than everything under
+  // it. (The one case that is handled is an upgraded connection, which
+  // inspect records at the handshake rather than at close, and that covers
+  // only 101 and h2 extended CONNECT.)
+  //
+  // Two stopping rules were tried and both are wrong. Stopping at the first
+  // unchanged label fails because in the minutes band a row flips when its
+  // own age crosses a multiple of 60 seconds and rows do not share a phase,
+  // so a 2m10s row is unchanged while a 3m05s row below it just flipped.
+  // Stopping at the first row past the hour, where rel() returns a fixed
+  // clock time, fails on the ordering above: one long-running request at the
+  // top freezes every label beneath it for the life of the page, because
+  // nothing else ever rewrites those cells.
   function restamp() {
     if (inspectorOff) return;
-    const now = Date.now();
     // Walk rows and look the node up, not the other way around. rows can
     // hold 5000 records, and scanning rows once per node would be 25
     // million comparisons every ten seconds.
     for (const r of rows) {
       const tr = nodes.get(r.id);
-      if (tr) {
-        const td = tr.firstElementChild;
-        const label = rel(r.started_at);
-        if (td.textContent !== label) td.textContent = label;
-      }
-      if (now - Date.parse(r.started_at) >= HOUR) return;
+      if (!tr) continue;
+      const td = tr.firstElementChild;
+      const label = rel(r.started_at);
+      if (td.textContent !== label) td.textContent = label;
     }
   }
 
