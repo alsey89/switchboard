@@ -670,6 +670,38 @@
   }
   $("sheetclose").addEventListener("click", closeSheet);
 
+  // step moves the selection by n rows and opens what it lands on. rows is
+  // newest first, so down is older, which is the direction the eye travels.
+  function step(n) {
+    if (!rows.length) return;
+    let i = rows.findIndex((r) => r.id === selected);
+    if (i < 0) i = n > 0 ? -1 : rows.length;
+    const next = rows[Math.min(rows.length - 1, Math.max(0, i + n))];
+    if (!next) return;
+    show(next.id);
+    nodes.get(next.id)?.scrollIntoView({ block: "nearest" });
+  }
+
+  // typing is true when the key belongs to a field the user is filling in.
+  // Arrow keys inside a search box move the caret, and stealing that would
+  // be worse than not having the shortcut.
+  function typing(el) {
+    return el instanceof HTMLInputElement || el instanceof HTMLSelectElement;
+  }
+
+  document.addEventListener("keydown", (e) => {
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key === "Escape") {
+      closeSheet();
+      if (typing(e.target)) e.target.blur();
+      return;
+    }
+    if (typing(e.target)) return;
+    if (e.key === "ArrowDown" || e.key === "j") { e.preventDefault(); step(1); }
+    else if (e.key === "ArrowUp" || e.key === "k") { e.preventDefault(); step(-1); }
+    else if (e.key === "/") { e.preventDefault(); $("q").focus(); }
+  });
+
   // railNode builds one rail row. An empty domain is the "All traffic"
   // entry, which is a filter rather than a route and so has no dot or addr.
   // A route can never have an empty domain, so that is a safe sentinel.
