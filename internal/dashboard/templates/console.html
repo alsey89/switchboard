@@ -34,7 +34,10 @@
   #rail { overflow-y: auto; border-right: 1px solid var(--line); padding: .6rem 0; }
   #rail h2 { margin: 0 .7rem .3rem; }
   #rail ul { list-style: none; margin: 0; padding: 0; }
-  #rail li { display: flex; align-items: baseline; gap: .35rem; }
+  /* center, not baseline: the row's two children are a nested flex button
+     and a link, and a flex container's baseline is whatever its own first
+     item hands up, which here is an empty dot. */
+  #rail li { display: flex; align-items: center; }
   #rail li:hover { background: var(--panel); }
   #rail li.sel { background: color-mix(in srgb, var(--accent) 12%, transparent);
     font-weight: 600; }
@@ -43,13 +46,14 @@
      reachable by keyboard and .open can be middle-clicked. .pick carries the
      row's padding so the whole left side is its hit area. */
   #rail .pick { flex: 1; min-width: 0; display: flex; align-items: baseline;
-    gap: .35rem; padding: .3rem .7rem; text-align: left; border: 0;
-    border-radius: 0; background: none; color: inherit; font: inherit; }
+    gap: .35rem; padding: .3rem .4rem .3rem .7rem; text-align: left;
+    border: 0; border-radius: 0; background: none; color: inherit;
+    font: inherit; }
   /* Capture off disables .pick, and the routes are the whole page then, so
      the generic dimming would fade the one thing left to read. */
   #rail .pick:disabled { opacity: 1; }
-  #rail .open { flex: none; padding: .3rem .6rem .3rem 0; font-size: .8rem;
-    color: var(--muted); text-decoration: none; }
+  #rail .open { flex: none; padding: .3rem .7rem .3rem .2rem; font-size: .8rem;
+    line-height: 1; color: var(--muted); text-decoration: none; }
   #rail .open:hover, #rail .open:focus-visible { color: var(--accent); }
   #rail .addr { color: var(--muted); font-size: .75rem;
     font-family: ui-monospace, monospace; margin-left: auto;
@@ -67,7 +71,13 @@
     background: var(--bad); }
   .dot.up { background: var(--ok); }
   table { width: 100%; border-collapse: collapse; }
-  tr.row { cursor: pointer; border-bottom: 1px solid var(--line); }
+  /* scroll-margin-top clears the sticky thead. Without it, arrowing up
+     through a scrolled list parks the selected row underneath the header,
+     because scrollIntoView aligns to the top of the scrollport and the
+     header is floating over it. The header is a .7rem line box plus .3rem
+     of padding top and bottom plus its border, so about 1.75rem. */
+  tr.row { cursor: pointer; border-bottom: 1px solid var(--line);
+    scroll-margin-top: 1.8rem; }
   tr.row:hover { background: var(--panel); }
   tr.row.sel { background: color-mix(in srgb, var(--accent) 12%, transparent); }
   td { padding: .35rem .5rem; white-space: nowrap; overflow: hidden;
@@ -130,7 +140,7 @@
     #rail h2 { display: none; }
     #rail ul { display: flex; gap: .35rem; flex-wrap: wrap; }
     #rail li { border: 1px solid var(--line); border-radius: 999px;
-      padding: .12rem .55rem; font-size: .8rem; }
+      padding: .12rem .55rem; font-size: .8rem; gap: .3rem; }
     /* The pill is the li here, so the row's padding moves out to it. */
     #rail .pick, #rail .open { padding: 0; }
     #rail li.sel { border-color: var(--accent); color: var(--accent); }
@@ -156,7 +166,9 @@
       border-top: 2px solid var(--accent);
       box-shadow: 0 -8px 24px rgb(0 0 0 / .18); display: none; }
     body.sheet-open #detail { display: block; }
-    #sheetclose { display: none; position: fixed; right: .6rem; top: 35%;
+    /* No display here: the base rule above already hides it at every width,
+       and body.sheet-open below outranks both. */
+    #sheetclose { position: fixed; right: .6rem; top: 35%;
       margin-top: .4rem; z-index: 11; }
     body.sheet-open #sheetclose { display: block; }
     /* Capture off must win the tie with sheet-open (both (1,1,1)): if a
@@ -612,20 +624,54 @@
     return b;
   }
 
+  // select moves the highlight and opens the sheet. It touches the two rows
+  // that changed rather than calling render(), because holding an arrow key
+  // makes this run at the OS repeat rate and a reconcile walks every row.
+  function select(id) {
+    if (selected !== null) nodes.get(selected)?.classList.remove("sel");
+    selected = id;
+    nodes.get(id)?.classList.add("sel");
+    document.body.classList.add("sheet-open");
+  }
+
+  // DETAIL_DELAY holds the detail fetch back until a held key settles. Long
+  // enough that one press of an arrow key repeating at the OS rate is one
+  // request, short enough that a single deliberate press still feels like it
+  // answered immediately.
+  const DETAIL_DELAY = 120;
+  let detailTimer = null;
+
+  function cancelDetail() {
+    if (detailTimer) { clearTimeout(detailTimer); detailTimer = null; }
+  }
+
+  function showLater(id) {
+    cancelDetail();
+    detailTimer = setTimeout(() => { detailTimer = null; show(id); }, DETAIL_DELAY);
+  }
+
   // show refetches the whole record. Neither the list nor the stream carries
   // bodies — they would be dead weight on every row — so this is the only
   // place they come from.
   async function show(id) {
-    selected = id;
-    document.body.classList.add("sheet-open");
-    render();
-    const resp = await fetch("/api/inspect/requests/" + id);
-    // A faster second click may have landed while this one was in flight;
-    // whichever request resolves last must not win over a newer selection.
-    if (selected !== id) return;
-    if (resp.status === 503) { setOff(true); return; }
-    if (!resp.ok) { empty(detail, "Gone. The buffer may have trimmed it."); return; }
-    const r = await resp.json();
+    cancelDetail(); // a click beats a keyboard step that has not fired yet
+    select(id);
+    let r;
+    try {
+      const resp = await fetch("/api/inspect/requests/" + id);
+      // A faster second click may have landed while this one was in flight;
+      // whichever request resolves last must not win over a newer selection.
+      if (selected !== id) return;
+      if (resp.status === 503) { setOff(true); return; }
+      if (!resp.ok) { empty(detail, "Gone. The buffer may have trimmed it."); return; }
+      r = await resp.json();
+    } catch {
+      // The daemon restarting mid-session used to throw out of here, leaving
+      // the row highlighted and the pane still showing the last request. The
+      // pane has to say it is not the row you just picked.
+      if (selected === id) note(detail, "Could not load this request. The daemon may be restarting.");
+      return;
+    }
     if (selected !== id) return; // still true after the second await
 
     detail.textContent = "";
@@ -705,14 +751,21 @@
 
   // step moves the selection by n rows and opens what it lands on. rows is
   // newest first, so down is older, which is the direction the eye travels.
+  //
+  // The move is immediate and the fetch is deferred. A held arrow key
+  // repeats at the OS rate, and every repeat used to be a request the daemon
+  // had to answer and a detail pane nobody saw.
   function step(n) {
     if (!rows.length) return;
     let i = rows.findIndex((r) => r.id === selected);
     if (i < 0) i = n > 0 ? -1 : rows.length;
     const next = rows[Math.min(rows.length - 1, Math.max(0, i + n))];
-    if (!next) return;
-    show(next.id);
+    // Landing where you already are is a no-op, not a refetch. Both ends of
+    // the list clamp to the row you are on.
+    if (!next || next.id === selected) return;
+    select(next.id);
     nodes.get(next.id)?.scrollIntoView({ block: "nearest" });
+    showLater(next.id);
   }
 
   // typing is true when the key belongs to a field the user is filling in.
@@ -879,6 +932,8 @@
     rows = [];
     more = false;
     selected = null;
+    cancelDetail();
+    closeSheet();
     empty(detail, "Pick a request.");
     render();
   });
@@ -925,8 +980,17 @@
     if (inspectorOff === off) return;
     inspectorOff = off;
     document.body.classList.toggle("inspector-off", off);
-    $("pause").disabled = off;
-    $("clear").disabled = off;
+    // Every header control, not just the two buttons. A live #q still fired
+    // the debounced refresh, which then 503s, and the two selects filtered a
+    // list that is not on screen.
+    for (const el of [$("pause"), $("clear"), $("q"), $("method"), $("status")]) {
+      el.disabled = off;
+    }
+    // Selection is dropped in both directions, so the sheet has to go with
+    // it. Off hides it by CSS; turning capture back on would un-hide a sheet
+    // that reads "Pick a request." over a list you have not picked from.
+    cancelDetail();
+    closeSheet();
     if (off) {
       if (source) { source.close(); source = null; }
       $("drops").textContent = "";
@@ -966,16 +1030,42 @@
   poll()
     .then(() => { if (!inspectorOff) return refresh(); })
     .finally(() => { if (!inspectorOff && live) connect(); });
-  setInterval(() => {
-    poll();
-    refreshRoutes();
+  // An hour in ms. Past it rel() returns a clock time, which never changes
+  // again, and rows is newest first, so the first row past the hour ends the
+  // walk: every row below it is older still.
+  const HOUR = 3600000;
+
+  // restamp rewrites the age column. It skips the whole walk while capture
+  // is off, where the table is hidden and rows is whatever was on screen
+  // when it went off, and it writes only the cells whose label actually
+  // changed. textContent does not dirty check, so an unconditional write to
+  // thousands of cells invalidates the whole table's style for nothing.
+  //
+  // The dirty check is per row on purpose. It cannot stop at the first
+  // unchanged label: in the minutes band a row's label flips when its own
+  // age crosses a multiple of 60 seconds, and rows do not share a phase, so
+  // a 2m10s row can be unchanged while a 3m05s row below it just flipped.
+  function restamp() {
+    if (inspectorOff) return;
+    const now = Date.now();
     // Walk rows and look the node up, not the other way around. rows can
     // hold 5000 records, and scanning rows once per node would be 25
     // million comparisons every ten seconds.
     for (const r of rows) {
       const tr = nodes.get(r.id);
-      if (tr) tr.firstElementChild.textContent = rel(r.started_at);
+      if (tr) {
+        const td = tr.firstElementChild;
+        const label = rel(r.started_at);
+        if (td.textContent !== label) td.textContent = label;
+      }
+      if (now - Date.parse(r.started_at) >= HOUR) return;
     }
+  }
+
+  setInterval(() => {
+    poll();
+    refreshRoutes();
+    restamp();
   }, 10000);
 })();
 </script>
