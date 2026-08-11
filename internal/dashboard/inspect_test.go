@@ -345,6 +345,22 @@ func TestConsolePageRenders(t *testing.T) {
 	}
 }
 
+func TestConsoleListHasColumnHeaders(t *testing.T) {
+	s, _ := testServer(t)
+	body := do(s, "GET", "/", nil).Body.String()
+	// Five unlabeled columns is a puzzle, not a table. The header row is
+	// built client side, so this asserts the code that builds it. Asserting
+	// "<thead>" would never match: it is never in the served source.
+	for _, want := range []string{
+		`createElement("thead")`,
+		`["time", "method", "path", "status", "took"]`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("list is missing %q", want)
+		}
+	}
+}
+
 // TestInspectRedirectsToTheConsole keeps the v0.3 URL working. The README,
 // the CHANGELOG and the 0.3.0 release notes all name it, and people have
 // bookmarked it.

@@ -61,9 +61,17 @@
   tr.row.sel { background: color-mix(in srgb, var(--accent) 12%, transparent); }
   td { padding: .35rem .5rem; white-space: nowrap; overflow: hidden;
     text-overflow: ellipsis; }
+  thead th { position: sticky; top: 0; z-index: 1; background: var(--bg);
+    text-align: left; padding: .3rem .5rem; font-size: .7rem; font-weight: 500;
+    color: var(--muted); text-transform: uppercase; letter-spacing: .05em;
+    border-bottom: 1px solid var(--line); }
   td.path { max-width: 1px; width: 100%; font-family: ui-monospace, monospace;
     font-size: .85em; }
   .m { color: var(--muted); font-size: .8rem; }
+  .pill { display: inline-block; padding: .02rem .35rem; border-radius: 4px;
+    font-size: .78rem; font-variant-numeric: tabular-nums;
+    background: color-mix(in srgb, currentColor 12%, transparent); }
+  .s1 { color: var(--accent); }
   .s2 { color: var(--ok); } .s3 { color: var(--accent); }
   .s4, .s5 { color: var(--bad); }
   h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .05em;
@@ -292,14 +300,39 @@
     return td;
   }
 
+  // rel renders a recent timestamp as an age, because "4s ago" answers the
+  // question the clock time is standing in for. Anything older than an hour
+  // is back to a clock time, where the age stops being the useful part.
+  function rel(iso) {
+    const then = Date.parse(iso);
+    if (Number.isNaN(then)) return iso.slice(11, 23);
+    const secs = Math.max(0, (Date.now() - then) / 1000);
+    if (secs < 60) return Math.floor(secs) + "s ago";
+    if (secs < 3600) return Math.floor(secs / 60) + "m ago";
+    return iso.slice(11, 19);
+  }
+
+  function statusCell(r) {
+    const td = document.createElement("td");
+    const pill = document.createElement("span");
+    // An upgraded connection has no meaningful final status. It said 101 and
+    // then stopped being HTTP.
+    pill.className = "pill " + (r.upgraded ? "s1" : statusClass(r.status));
+    pill.textContent = r.upgraded ? "101 ws" : String(r.status);
+    td.appendChild(pill);
+    return td;
+  }
+
   function rowNode(r) {
     const tr = document.createElement("tr");
     tr.dataset.id = String(r.id);
+    const when = cell(rel(r.started_at), "m");
+    when.title = r.started_at;
     tr.append(
-      cell(r.started_at.slice(11, 23), "m"),
+      when,
       cell(r.method, "m"),
       cell(r.path, "path"),
-      cell(r.upgraded ? "101 ws" : String(r.status), statusClass(r.status)),
+      statusCell(r),
       cell(r.duration_ms.toFixed(1) + "ms", "m"),
     );
     return tr;
@@ -358,8 +391,16 @@
       if (!tbody) {
         list.textContent = "";
         table = document.createElement("table");
+        const thead = document.createElement("thead");
+        const hr = document.createElement("tr");
+        for (const label of ["time", "method", "path", "status", "took"]) {
+          const th = document.createElement("th");
+          th.textContent = label;
+          hr.appendChild(th);
+        }
+        thead.appendChild(hr);
         tbody = document.createElement("tbody");
-        table.appendChild(tbody);
+        table.append(thead, tbody);
         list.appendChild(table);
         nodes.clear();
       }
@@ -765,7 +806,17 @@
   poll()
     .then(() => { if (!inspectorOff) return refresh(); })
     .finally(() => { if (!inspectorOff && live) connect(); });
-  setInterval(() => { poll(); refreshRoutes(); }, 10000);
+  setInterval(() => {
+    poll();
+    refreshRoutes();
+    // Walk rows and look the node up, not the other way around. rows can
+    // hold 5000 records, and scanning rows once per node would be 25
+    // million comparisons every ten seconds.
+    for (const r of rows) {
+      const tr = nodes.get(r.id);
+      if (tr) tr.firstElementChild.textContent = rel(r.started_at);
+    }
+  }, 10000);
 })();
 </script>
 </body>
