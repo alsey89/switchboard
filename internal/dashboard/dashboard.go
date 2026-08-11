@@ -236,7 +236,7 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	tmpl.ExecuteTemplate(w, "dashboard.html", data) //nolint:errcheck
+	tmpl.ExecuteTemplate(w, "console.html", data) //nolint:errcheck
 }
 
 func (s *Server) renderNoRoute(w http.ResponseWriter, cfg *config.Config, host string) {

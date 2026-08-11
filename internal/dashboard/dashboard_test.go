@@ -25,13 +25,37 @@ func get(t *testing.T, s *Server, host string) *httptest.ResponseRecorder {
 	return rec
 }
 
-func TestDashboardServedOnItsOwnDomain(t *testing.T) {
+func TestConsoleServedOnItsOwnDomain(t *testing.T) {
 	rec := get(t, newBasicServer(), "switchboard.test")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("got %d, want 200", rec.Code)
 	}
-	if !strings.Contains(rec.Body.String(), "app.test") {
-		t.Error("dashboard should list the configured route")
+	body := rec.Body.String()
+
+	// The rail is server rendered so the first paint already has routes.
+	// The client refreshes it, but a flash of "no routes" on every load
+	// would be worse than the reload it replaces.
+	if !strings.Contains(body, "app.test") {
+		t.Error("console should list the configured route in the rail")
+	}
+	// And it is the console, not the old routes-only dashboard.
+	for _, want := range []string{`id="list"`, `id="detail"`, `id="rail"`, "EventSource"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("console is missing %q", want)
+		}
+	}
+}
+
+func TestConsoleWithNoRoutesNamesTheAddCommand(t *testing.T) {
+	s := New(&config.Config{Suffix: "test"}, "test-version")
+	rec := get(t, s, "switchboard.test")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200", rec.Code)
+	}
+	// A first run has no routes. This is the new user's first screen and it
+	// has to say what to type.
+	if !strings.Contains(rec.Body.String(), "switchboard add") {
+		t.Error("empty rail should name the add command")
 	}
 }
 

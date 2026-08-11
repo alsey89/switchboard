@@ -31,6 +31,20 @@
     min-height: 0; }
   #list { overflow-y: auto; border-right: 1px solid var(--line); }
   #detail { overflow-y: auto; padding: 1rem; background: var(--panel); }
+  main { grid-template-columns: 190px minmax(240px, 34%) 1fr; }
+  #rail { overflow-y: auto; border-right: 1px solid var(--line); padding: .6rem 0; }
+  #rail h2 { margin: 0 .7rem .3rem; }
+  #rail ul { list-style: none; margin: 0; padding: 0; }
+  #rail li { padding: .3rem .7rem; cursor: pointer; display: flex;
+    align-items: baseline; gap: .35rem; }
+  #rail li:hover { background: var(--panel); }
+  #rail li.sel { background: color-mix(in srgb, var(--accent) 12%, transparent);
+    font-weight: 600; }
+  #rail .addr { color: var(--muted); font-size: .75rem;
+    font-family: ui-monospace, monospace; margin-left: auto; }
+  .dot { width: .5rem; height: .5rem; border-radius: 50%; flex: none;
+    background: var(--bad); }
+  .dot.up { background: var(--ok); }
   table { width: 100%; border-collapse: collapse; }
   tr.row { cursor: pointer; border-bottom: 1px solid var(--line); }
   tr.row:hover { background: var(--panel); }
@@ -53,6 +67,9 @@
   dt { color: var(--muted); }
   dd { margin: 0; font-family: ui-monospace, monospace; word-break: break-all; }
   .empty { color: var(--muted); padding: 2rem 1rem; }
+  #rail code { background: color-mix(in srgb, var(--line) 50%, transparent);
+    padding: .1rem .35rem; border-radius: 4px; font-size: .85em; }
+  #rail .empty { padding: .8rem .7rem; font-size: .8rem; }
   .note { color: var(--warn); padding: .6rem 1rem; font-size: .85rem; }
   .more { display: block; width: calc(100% - 1.6rem); margin: .6rem .8rem 1rem; }
   @media (max-width: 700px) { main { grid-template-columns: 1fr; }
@@ -61,9 +78,9 @@
 </head>
 <body>
 <header>
-  <h1><a href="/">Switchboard</a> inspector</h1>
+  <h1><a href="/">Switchboard</a><span class="m">.{{.Suffix}}</span></h1>
   <input id="q" type="search" placeholder="filter path" size="14">
-  <input id="domain" type="search" placeholder="domain" size="12">
+  <input id="domain" type="hidden">
   <select id="method">
     <option value="">any method</option>
     <option>GET</option><option>POST</option><option>PUT</option>
@@ -77,9 +94,24 @@
   <button id="pause" class="on">live</button>
   <span class="spacer"></span>
   <span id="drops" class="drops"></span>
+  <span class="m">{{.Version}}</span>
   <button id="clear">clear</button>
 </header>
 <main>
+  <aside id="rail">
+    <h2>Routes</h2>
+    <ul id="routes">
+      <li data-domain="" class="sel">All traffic</li>
+      {{range .Routes}}
+      <li data-domain="{{.Domain}}">
+        <span class="dot{{if .Up}} up{{end}}"></span>{{.Domain}}<span class="addr">{{.Upstream}}</span>
+      </li>
+      {{end}}
+    </ul>
+    {{if not .Routes}}
+    <p class="empty">No routes yet. Add one:<br><code>switchboard add app 3000</code></p>
+    {{end}}
+  </aside>
   <div id="list"><p class="empty">Waiting for traffic.</p></div>
   <div id="detail"><p class="empty">Pick a request.</p></div>
 </main>
@@ -440,6 +472,54 @@
     filterTimer = setTimeout(refresh, 250);
   }));
 
+  // The rail is the domain filter. #domain is a hidden input rather than a
+  // variable so query(), matches() and anyFilterSet() keep reading their
+  // filter from the same place they always did.
+  $("routes").addEventListener("click", (e) => {
+    const li = e.target.closest("li[data-domain]");
+    if (!li) return;
+    filters.domain.value = li.dataset.domain;
+    for (const other of $("routes").children) {
+      other.classList.toggle("sel", other === li);
+    }
+    refresh();
+  });
+
+  // refreshRoutes keeps the rail live. The dashboard this page replaced was
+  // rendered once, so a route coming up did not show until a reload.
+  async function refreshRoutes() {
+    let data;
+    try {
+      const resp = await fetch("/api/routes");
+      if (!resp.ok) return;
+      data = await resp.json();
+    } catch {
+      return; // daemon restarting; the next tick retries
+    }
+    const ul = $("routes");
+    const active = filters.domain.value;
+    ul.textContent = "";
+
+    const all = document.createElement("li");
+    all.dataset.domain = "";
+    all.textContent = "All traffic";
+    all.className = active === "" ? "sel" : "";
+    ul.appendChild(all);
+
+    for (const rt of data.routes) {
+      const li = document.createElement("li");
+      li.dataset.domain = rt.domain;
+      li.className = rt.domain === active ? "sel" : "";
+      const dot = document.createElement("span");
+      dot.className = rt.up ? "dot up" : "dot";
+      const addr = document.createElement("span");
+      addr.className = "addr";
+      addr.textContent = rt.upstream;
+      li.append(dot, document.createTextNode(rt.domain), addr);
+      ul.appendChild(li);
+    }
+  }
+
   $("pause").addEventListener("click", () => {
     live = !live;
     $("pause").textContent = live ? "live" : "paused";
@@ -551,7 +631,7 @@
   poll()
     .then(() => { if (!inspectorOff) return refresh(); })
     .finally(() => { if (!inspectorOff && live) connect(); });
-  setInterval(poll, 10000);
+  setInterval(() => { poll(); refreshRoutes(); }, 10000);
 })();
 </script>
 </body>

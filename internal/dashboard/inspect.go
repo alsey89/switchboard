@@ -322,5 +322,5 @@ func sendEvent(w http.ResponseWriter, v recordJSON) {
 // html/template to escape.
 func (s *Server) handleInspectPage(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	tmpl.ExecuteTemplate(w, "inspect.html", nil) //nolint:errcheck
+	tmpl.ExecuteTemplate(w, "console.html", nil) //nolint:errcheck
 }
