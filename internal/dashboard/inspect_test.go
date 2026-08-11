@@ -371,6 +371,26 @@ func TestConsoleOffersCopyAsCurl(t *testing.T) {
 	}
 }
 
+// TestConsoleQuotesEveryCurlField pins asCurl's fields to shellQuote. Every
+// value it emits came off the wire, so every value must go through
+// shellQuote, including the HTTP method: net/http accepts any RFC 7230
+// token as a method, and an unquoted r.method let a captured request like
+// `GET$(id)` execute when the copied command was pasted into a shell.
+func TestConsoleQuotesEveryCurlField(t *testing.T) {
+	s, _ := testServer(t)
+	body := do(s, "GET", "/", nil).Body.String()
+	for _, want := range []string{
+		`shellQuote(r.method)`,
+		`shellQuote(k + ": " + v)`,
+		`shellQuote(r.req_body)`,
+		`shellQuote("https://" + r.domain + r.path)`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("asCurl is missing %q", want)
+		}
+	}
+}
+
 // TestInspectRedirectsToTheConsole keeps the v0.3 URL working. The README,
 // the CHANGELOG and the 0.3.0 release notes all name it, and people have
 // bookmarked it.

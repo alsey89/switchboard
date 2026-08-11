@@ -554,7 +554,7 @@
   // produces a command that looks right and fails, which is worse than one
   // that is visibly missing its credentials.
   function asCurl(r) {
-    const parts = ["curl", "-i", "-X", r.method];
+    const parts = ["curl", "-i", "-X", shellQuote(r.method)];
     const headers = r.req_headers || {};
     for (const k of Object.keys(headers).sort()) {
       for (const v of headers[k]) {
