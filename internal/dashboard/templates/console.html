@@ -34,11 +34,23 @@
   #rail { overflow-y: auto; border-right: 1px solid var(--line); padding: .6rem 0; }
   #rail h2 { margin: 0 .7rem .3rem; }
   #rail ul { list-style: none; margin: 0; padding: 0; }
-  #rail li { padding: .3rem .7rem; cursor: pointer; display: flex;
-    align-items: baseline; gap: .35rem; }
+  #rail li { display: flex; align-items: baseline; gap: .35rem; }
   #rail li:hover { background: var(--panel); }
   #rail li.sel { background: color-mix(in srgb, var(--accent) 12%, transparent);
     font-weight: 600; }
+  /* A row is two controls, not one clickable box: .pick filters the list to
+     the domain, .open opens the site. Both are real controls, so the rail is
+     reachable by keyboard and .open can be middle-clicked. .pick carries the
+     row's padding so the whole left side is its hit area. */
+  #rail .pick { flex: 1; min-width: 0; display: flex; align-items: baseline;
+    gap: .35rem; padding: .3rem .7rem; text-align: left; border: 0;
+    border-radius: 0; background: none; color: inherit; font: inherit; }
+  /* Capture off disables .pick, and the routes are the whole page then, so
+     the generic dimming would fade the one thing left to read. */
+  #rail .pick:disabled { opacity: 1; }
+  #rail .open { flex: none; padding: .3rem .6rem .3rem 0; font-size: .8rem;
+    color: var(--muted); text-decoration: none; }
+  #rail .open:hover, #rail .open:focus-visible { color: var(--accent); }
   #rail .addr { color: var(--muted); font-size: .75rem;
     font-family: ui-monospace, monospace; margin-left: auto;
     min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -47,7 +59,6 @@
   body.inspector-off #list, body.inspector-off #detail { display: none; }
   body.inspector-off main { grid-template-columns: 1fr; }
   body.inspector-off #rail { border-right: 0; }
-  body.inspector-off #rail li { cursor: default; }
   body.inspector-off #rail li:hover { background: none; }
   #offnote { display: none; padding: .8rem .7rem; font-size: .85rem;
     color: var(--warn); }
@@ -120,6 +131,8 @@
     #rail ul { display: flex; gap: .35rem; flex-wrap: wrap; }
     #rail li { border: 1px solid var(--line); border-radius: 999px;
       padding: .12rem .55rem; font-size: .8rem; }
+    /* The pill is the li here, so the row's padding moves out to it. */
+    #rail .pick, #rail .open { padding: 0; }
     #rail li.sel { border-color: var(--accent); color: var(--accent); }
     #rail .addr { display: none; }
     #rail .empty, #offnote { padding: .2rem 0; }
@@ -179,11 +192,9 @@
   <aside id="rail">
     <h2>Routes</h2>
     <ul id="routes">
-      <li data-domain="" class="sel">All traffic</li>
+      <li data-domain="" class="sel"><button type="button" class="pick">All traffic</button></li>
       {{range .Routes}}
-      <li data-domain="{{.Domain}}">
-        <span class="dot{{if .Up}} up{{end}}"></span>{{.Domain}}<span class="addr">{{.Upstream}}</span>
-      </li>
+      <li data-domain="{{.Domain}}"><button type="button" class="pick"><span class="dot{{if .Up}} up{{end}}"></span>{{.Domain}}<span class="addr">{{.Upstream}}</span></button><a class="open" href="https://{{.Domain}}" target="_blank" rel="noopener" title="Open {{.Domain}}" aria-label="Open {{.Domain}}">↗</a></li>
       {{end}}
     </ul>
     {{if not .Routes}}
@@ -669,6 +680,13 @@
   // variable so query(), matches() and anyFilterSet() keep reading their
   // filter from the same place they always did.
   $("routes").addEventListener("click", (e) => {
+    // The open link is the row's other control. It goes to the site and must
+    // not change the filter on the way out.
+    if (e.target.closest("a.open")) return;
+    // A disabled .pick fires no click, but the thin gap between the two
+    // controls is still the li, and capture off means there is no list to
+    // filter.
+    if (inspectorOff) return;
     const li = e.target.closest("li[data-domain]");
     if (!li) return;
     filters.domain.value = li.dataset.domain;
@@ -718,13 +736,25 @@
   });
 
   // railNode builds one rail row. An empty domain is the "All traffic"
-  // entry, which is a filter rather than a route and so has no dot or addr.
-  // A route can never have an empty domain, so that is a safe sentinel.
+  // entry, which is a filter rather than a route and so has no dot, addr or
+  // open link. A route can never have an empty domain, so that is a safe
+  // sentinel.
+  //
+  // This has to build the same structure the template renders, because the
+  // first refreshRoutes() adopts the server-rendered rows and updates them
+  // in place from then on. A row built here and a row built there have to be
+  // the same shape or the update loop below reaches for a child that is not
+  // in one of them.
   function railNode(rt) {
     const li = document.createElement("li");
     li.dataset.domain = rt.domain;
+    const pick = document.createElement("button");
+    pick.type = "button";
+    pick.className = "pick";
+    pick.disabled = inspectorOff;
     if (!rt.domain) {
-      li.textContent = "All traffic";
+      pick.textContent = "All traffic";
+      li.append(pick);
       return li;
     }
     const dot = document.createElement("span");
@@ -732,8 +762,29 @@
     const addr = document.createElement("span");
     addr.className = "addr";
     addr.textContent = rt.upstream;
-    li.append(dot, document.createTextNode(rt.domain), addr);
+    pick.append(dot, document.createTextNode(rt.domain), addr);
+    // A real anchor, so it is focusable, middle-clickable and has an address
+    // on hover. The href is a property assignment, never a markup string.
+    const open = document.createElement("a");
+    open.className = "open";
+    open.textContent = "↗";
+    open.href = "https://" + rt.domain;
+    open.target = "_blank";
+    open.rel = "noopener";
+    open.title = "Open " + rt.domain;
+    open.setAttribute("aria-label", "Open " + rt.domain);
+    li.append(pick, open);
     return li;
+  }
+
+  // The rail's filter is dead while capture is off: the list it would filter
+  // is not on screen. The open link stays live, so a route is still reachable
+  // from the page in that state.
+  function syncRailPicks() {
+    for (const li of $("routes").children) {
+      const pick = li.querySelector(".pick");
+      if (pick) pick.disabled = inspectorOff;
+    }
   }
 
   // refreshRoutes keeps the rail live. The dashboard this page replaced was
@@ -774,7 +825,8 @@
         li = railNode(rt);
       } else if (rt.domain) {
         // Only the two mutable parts. The domain text is the key, so a row
-        // that is still here still names the same domain.
+        // that is still here still names the same domain, which is also why
+        // the open link's href never needs rewriting.
         li.querySelector(".dot").className = rt.up ? "dot up" : "dot";
         li.querySelector(".addr").textContent = rt.upstream;
       }
@@ -887,6 +939,7 @@
       refresh();
       if (live) connect();
     }
+    syncRailPicks();
     refreshRoutes();
   }
 
