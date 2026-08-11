@@ -33,6 +33,7 @@ var tmpl = template.Must(template.ParseFS(templateFS, "templates/*.html"))
 type Server struct {
 	cfg     atomic.Pointer[config.Config]
 	version string
+	probes  *prober
 	httpSrv *http.Server
 	insp    atomic.Pointer[inspect.Recorder]
 
@@ -50,7 +51,7 @@ type Server struct {
 }
 
 func New(cfg *config.Config, version string) *Server {
-	s := &Server{version: version, done: make(chan struct{})}
+	s := &Server{version: version, done: make(chan struct{}), probes: newProber(probeTTL)}
 	s.cfg.Store(cfg)
 	return s
 }
@@ -222,11 +223,16 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 		Suffix  string
 		Routes  []routeView
 	}{Version: s.version, Suffix: cfg.Suffix}
+	addrs := make([]string, 0, len(cfg.Routes))
+	for _, rt := range cfg.Routes {
+		addrs = append(addrs, rt.UpstreamAddr())
+	}
+	up := s.probes.statuses(addrs)
 	for _, rt := range cfg.Routes {
 		data.Routes = append(data.Routes, routeView{
 			Domain:   rt.Domain,
 			Upstream: rt.UpstreamAddr(),
-			Up:       probe(rt.UpstreamAddr()),
+			Up:       up[rt.UpstreamAddr()],
 		})
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -254,23 +260,18 @@ func (s *Server) handleAPIRoutes(w http.ResponseWriter, r *http.Request) {
 		Suffix  string      `json:"suffix"`
 		Routes  []routeJSON `json:"routes"`
 	}{Version: s.version, Suffix: cfg.Suffix, Routes: []routeJSON{}}
+	addrs := make([]string, 0, len(cfg.Routes))
+	for _, rt := range cfg.Routes {
+		addrs = append(addrs, rt.UpstreamAddr())
+	}
+	up := s.probes.statuses(addrs)
 	for _, rt := range cfg.Routes {
 		out.Routes = append(out.Routes, routeJSON{
 			Domain:   rt.Domain,
 			Upstream: rt.UpstreamAddr(),
-			Up:       probe(rt.UpstreamAddr()),
+			Up:       up[rt.UpstreamAddr()],
 		})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(out) //nolint:errcheck
-}
-
-// probe reports whether something is listening at addr.
-func probe(addr string) bool {
-	c, err := net.DialTimeout("tcp", addr, 300*time.Millisecond)
-	if err != nil {
-		return false
-	}
-	c.Close()
-	return true
 }
