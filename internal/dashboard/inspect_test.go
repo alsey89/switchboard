@@ -317,9 +317,9 @@ func TestInspectRequestsAppliesEachQueryParameter(t *testing.T) {
 	}
 }
 
-func TestInspectPageRenders(t *testing.T) {
+func TestConsolePageRenders(t *testing.T) {
 	s, _ := testServer(t)
-	w := do(s, "GET", "/inspect", nil)
+	w := do(s, "GET", "/", nil)
 	if w.Code != 200 {
 		t.Fatalf("status %d", w.Code)
 	}
@@ -327,7 +327,7 @@ func TestInspectPageRenders(t *testing.T) {
 	// The history API the page must actually use. Its only data source used
 	// to be the stream, whose backfill is 200 rows, so the filters ran over
 	// an in-memory array and the other ~96% of a default buffer was
-	// unreachable — a filter that matched nothing on screen looked identical
+	// unreachable. A filter that matched nothing on screen looked identical
 	// to no matching traffic at all.
 	//
 	// The last two are the render path. render() used to clear #list and
@@ -342,6 +342,20 @@ func TestInspectPageRenders(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("page is missing %q", want)
 		}
+	}
+}
+
+// TestInspectRedirectsToTheConsole keeps the v0.3 URL working. The README,
+// the CHANGELOG and the 0.3.0 release notes all name it, and people have
+// bookmarked it.
+func TestInspectRedirectsToTheConsole(t *testing.T) {
+	s, _ := testServer(t)
+	w := do(s, "GET", "/inspect", nil)
+	if w.Code != http.StatusFound {
+		t.Fatalf("status %d, want 302", w.Code)
+	}
+	if got := w.Header().Get("Location"); got != "/" {
+		t.Errorf("Location %q, want /", got)
 	}
 }
 

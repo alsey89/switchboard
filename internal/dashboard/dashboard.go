@@ -94,7 +94,7 @@ func (s *Server) routes() []routeEntry {
 		{"/api/inspect/requests/", s.guard(s.handleInspectRecord), true},
 		{"/api/inspect/clear", s.guard(s.handleInspectClear), true},
 		{"/api/inspect/stream", s.guard(s.handleInspectStream), true},
-		{"/inspect", s.guardPage(s.handleInspectPage), true},
+		{"/inspect", s.guardPage(s.handleInspectRedirect), true},
 		// handleRoot is its own guard: it needs the "/" vs any-other-path
 		// split alongside the host check, and it answers a foreign Host
 		// with the no-route page rather than delegating to guardPage.

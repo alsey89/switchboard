@@ -316,11 +316,16 @@ func sendEvent(w http.ResponseWriter, v recordJSON) {
 	io.WriteString(w, "\n\n")   //nolint:errcheck
 }
 
-// handleInspectPage serves the split-pane inspector UI. The page itself
-// carries no server-rendered record data — it fetches everything from the
-// JSON and SSE endpoints above, client side — so there is nothing here for
-// html/template to escape.
-func (s *Server) handleInspectPage(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	tmpl.ExecuteTemplate(w, "console.html", nil) //nolint:errcheck
+// handleInspectRedirect keeps the v0.3 inspector URL working. The page moved
+// to /, which is now the console.
+//
+// 302 and not 301: a permanent redirect is cached by the browser more or
+// less forever, so if /inspect ever needs to mean something again there is
+// no way to take it back from the people who visited it once.
+//
+// It stays wrapped in guardPage in the routes table, so the host check runs
+// before the redirect does. A foreign Host still gets the no-route page
+// rather than a redirect telling it where the dashboard lives.
+func (s *Server) handleInspectRedirect(w http.ResponseWriter, r *http.Request) {
+	http.Redirect(w, r, "/", http.StatusFound)
 }
