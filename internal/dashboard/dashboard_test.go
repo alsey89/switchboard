@@ -44,6 +44,15 @@ func TestConsoleServedOnItsOwnDomain(t *testing.T) {
 			t.Errorf("console is missing %q", want)
 		}
 	}
+	// The rail is the domain filter, and these two halves are how it says so.
+	// The row carries the domain it selects, and the filter the query layer
+	// reads is a hidden input the rail writes into. Drop either and the
+	// domain filter stops working with nothing else on the page changing.
+	for _, want := range []string{`data-domain="app.test"`, `<input id="domain" type="hidden">`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("rail filter contract is missing %q", want)
+		}
+	}
 }
 
 func TestConsoleWithNoRoutesNamesTheAddCommand(t *testing.T) {

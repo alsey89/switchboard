@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Switchboard inspector</title>
+<title>Switchboard</title>
 <style>
   :root { color-scheme: light dark;
     --fg: #1a1a1a; --bg: #ffffff; --muted: #6b7280; --line: #e5e7eb;
@@ -27,11 +27,10 @@
   button:disabled { opacity: .5; cursor: default; }
   .spacer { flex: 1; }
   .drops { color: var(--warn); font-size: .8rem; }
-  main { flex: 1; display: grid; grid-template-columns: minmax(280px, 40%) 1fr;
-    min-height: 0; }
+  main { flex: 1; display: grid;
+    grid-template-columns: 190px minmax(240px, 34%) 1fr; min-height: 0; }
   #list { overflow-y: auto; border-right: 1px solid var(--line); }
   #detail { overflow-y: auto; padding: 1rem; background: var(--panel); }
-  main { grid-template-columns: 190px minmax(240px, 34%) 1fr; }
   #rail { overflow-y: auto; border-right: 1px solid var(--line); padding: .6rem 0; }
   #rail h2 { margin: 0 .7rem .3rem; }
   #rail ul { list-style: none; margin: 0; padding: 0; }
@@ -467,6 +466,10 @@
   // Typing is debounced because every change is now a query, not an array
   // filter. The delay is short enough to feel immediate and long enough that
   // a typed word is one request rather than five.
+  //
+  // filters.domain is in this loop but never fires it: a hidden input has
+  // nothing to type into. The rail below drives that one filter and calls
+  // refresh() itself, so there is no second code path here to look for.
   Object.values(filters).forEach((el) => el.addEventListener("input", () => {
     if (filterTimer) clearTimeout(filterTimer);
     filterTimer = setTimeout(refresh, 250);
@@ -485,8 +488,34 @@
     refresh();
   });
 
+  // railNode builds one rail row. An empty domain is the "All traffic"
+  // entry, which is a filter rather than a route and so has no dot or addr.
+  // A route can never have an empty domain, so that is a safe sentinel.
+  function railNode(rt) {
+    const li = document.createElement("li");
+    li.dataset.domain = rt.domain;
+    if (!rt.domain) {
+      li.textContent = "All traffic";
+      return li;
+    }
+    const dot = document.createElement("span");
+    dot.className = rt.up ? "dot up" : "dot";
+    const addr = document.createElement("span");
+    addr.className = "addr";
+    addr.textContent = rt.upstream;
+    li.append(dot, document.createTextNode(rt.domain), addr);
+    return li;
+  }
+
   // refreshRoutes keeps the rail live. The dashboard this page replaced was
   // rendered once, so a route coming up did not show until a reload.
+  //
+  // Like render(), it reconciles rather than rebuilding. #rail is its own
+  // scroll container: clearing it and appending fresh rows snapped a user
+  // scrolled down a long rail back to the top every ten seconds, from a tick
+  // rather than anything they did. Keying on the domain means an unchanged
+  // route is never touched, and the domain is also the filter value, so the
+  // key and the thing it selects are the same string.
   async function refreshRoutes() {
     let data;
     try {
@@ -498,25 +527,46 @@
     }
     const ul = $("routes");
     const active = filters.domain.value;
-    ul.textContent = "";
 
-    const all = document.createElement("li");
-    all.dataset.domain = "";
-    all.textContent = "All traffic";
-    all.className = active === "" ? "sel" : "";
-    ul.appendChild(all);
+    // Read back from the DOM instead of a map kept across calls, so the
+    // first tick adopts the server-rendered rows rather than duplicating
+    // them, and nothing can drift out of sync with what is on screen.
+    const byDomain = new Map();
+    for (const li of ul.children) byDomain.set(li.dataset.domain, li);
 
-    for (const rt of data.routes) {
-      const li = document.createElement("li");
-      li.dataset.domain = rt.domain;
-      li.className = rt.domain === active ? "sel" : "";
-      const dot = document.createElement("span");
-      dot.className = rt.up ? "dot up" : "dot";
-      const addr = document.createElement("span");
-      addr.className = "addr";
-      addr.textContent = rt.upstream;
-      li.append(dot, document.createTextNode(rt.domain), addr);
-      ul.appendChild(li);
+    // "All traffic" leads and is not in the payload, so it can never be
+    // reconciled away.
+    const wanted = [{ domain: "" }].concat(data.routes);
+    let selFound = false;
+    for (let i = 0; i < wanted.length; i++) {
+      const rt = wanted[i];
+      let li = byDomain.get(rt.domain);
+      if (!li) {
+        li = railNode(rt);
+      } else if (rt.domain) {
+        // Only the two mutable parts. The domain text is the key, so a row
+        // that is still here still names the same domain.
+        li.querySelector(".dot").className = rt.up ? "dot up" : "dot";
+        li.querySelector(".addr").textContent = rt.upstream;
+      }
+      const at = ul.children[i];
+      if (at !== li) ul.insertBefore(li, at || null);
+      const sel = rt.domain === active;
+      li.classList.toggle("sel", sel);
+      if (sel) selFound = true;
+    }
+    // Whatever is left past the end is a route that left the config.
+    while (ul.children.length > wanted.length) ul.lastElementChild.remove();
+
+    // The selected domain was removed from the config while this page sat
+    // open. Nothing on screen carries sel, but the list is still filtered to
+    // that domain, so it reads as "the inspector stopped showing traffic"
+    // rather than "that route is gone". Fall back to All traffic and requery
+    // so the list matches what the rail claims.
+    if (!selFound) {
+      filters.domain.value = "";
+      ul.firstElementChild.classList.add("sel");
+      refresh();
     }
   }
 
