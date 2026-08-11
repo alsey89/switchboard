@@ -86,6 +86,8 @@
     margin: 0; font-size: .85rem; }
   dt { color: var(--muted); }
   dd { margin: 0; font-family: ui-monospace, monospace; word-break: break-all; }
+  .redacted { color: var(--warn); font-family: inherit; font-style: italic;
+    cursor: help; }
   .empty { color: var(--muted); padding: 2rem 1rem; }
   #rail code { background: color-mix(in srgb, var(--line) 50%, transparent);
     padding: .1rem .35rem; border-radius: 4px; font-size: .85em; }
@@ -512,7 +514,19 @@
       const dt = document.createElement("dt");
       dt.textContent = k;
       const dd = document.createElement("dd");
-      dd.textContent = h[k].join(", ");
+      const value = h[k].join(", ");
+      // REDACTED is the sentinel internal/inspect writes in place of a
+      // credential header's value. Matching on it is a little blunt, and a
+      // real header whose value happens to be this string would be marked
+      // too. That is a better failure than the alternative, which is the
+      // value rendering as unexplained literal text.
+      if (value === REDACTED) {
+        dd.className = "redacted";
+        dd.textContent = "redacted";
+        dd.title = "Set bodies = true under [inspect] to store this value as sent.";
+      } else {
+        dd.textContent = value;
+      }
       dl.append(dt, dd);
     }
     return dl;

@@ -401,6 +401,18 @@ func TestConsoleHandlesKeys(t *testing.T) {
 	}
 }
 
+func TestConsoleMarksRedactedHeaders(t *testing.T) {
+	s, _ := testServer(t)
+	body := do(s, "GET", "/", nil).Body.String()
+	// inspect.Redacted is the exact value the store writes.
+	if !strings.Contains(body, inspect.Redacted) {
+		t.Errorf("page should know the %q sentinel to mark it", inspect.Redacted)
+	}
+	if !strings.Contains(body, "bodies = true") {
+		t.Error("the redaction note should name the key that turns it off")
+	}
+}
+
 // TestInspectRedirectsToTheConsole keeps the v0.3 URL working. The README,
 // the CHANGELOG and the 0.3.0 release notes all name it, and people have
 // bookmarked it.
