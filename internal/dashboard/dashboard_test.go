@@ -68,6 +68,19 @@ func TestConsoleWithNoRoutesNamesTheAddCommand(t *testing.T) {
 	}
 }
 
+// TestConsoleNamesTheConfigKeyForCaptureOff checks the page ships the copy
+// that the inspector-off state renders. The state itself is set client side
+// by setOff, so this asserts the string is present to be rendered.
+func TestConsoleNamesTheConfigKeyForCaptureOff(t *testing.T) {
+	rec := get(t, newBasicServer(), "switchboard.test")
+	body := rec.Body.String()
+	for _, want := range []string{"inspector-off", "[inspect]", "enabled = true"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("console is missing %q", want)
+		}
+	}
+}
+
 func TestDashboardServedOnLoopback(t *testing.T) {
 	// These are the addresses that still work when DNS or the CA is broken.
 	for _, host := range []string{

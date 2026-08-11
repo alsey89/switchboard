@@ -41,6 +41,16 @@
     font-weight: 600; }
   #rail .addr { color: var(--muted); font-size: .75rem;
     font-family: ui-monospace, monospace; margin-left: auto; }
+  /* Capture off. The traffic columns have nothing to show, so the rail
+     stops being a rail and the routes become the page. */
+  body.inspector-off #list, body.inspector-off #detail { display: none; }
+  body.inspector-off main { grid-template-columns: 1fr; }
+  body.inspector-off #rail { border-right: 0; }
+  body.inspector-off #rail li { cursor: default; }
+  body.inspector-off #rail li:hover { background: none; }
+  #offnote { display: none; padding: .8rem .7rem; font-size: .85rem;
+    color: var(--warn); }
+  body.inspector-off #offnote { display: block; }
   .dot { width: .5rem; height: .5rem; border-radius: 50%; flex: none;
     background: var(--bad); }
   .dot.up { background: var(--ok); }
@@ -110,6 +120,11 @@
     {{if not .Routes}}
     <p class="empty">No routes yet. Add one:<br><code>switchboard add app 3000</code></p>
     {{end}}
+    <p id="offnote">
+      Capture is off, so there is no traffic to show. Set
+      <code>enabled = true</code> under <code>[inspect]</code> in your config
+      to turn it back on.
+    </p>
   </aside>
   <div id="list"><p class="empty">Waiting for traffic.</p></div>
   <div id="detail"><p class="empty">Pick a request.</p></div>
@@ -633,19 +648,21 @@
     };
   }
 
-  // setOff flips the page between its normal view and the inspector-off
-  // state, in either direction: a config reload can turn the inspector off
-  // or back on while this page stays open, and poll() below is what
-  // notices which way it went.
+  // setOff flips the page between the console and the capture-off state, in
+  // either direction: a config reload can turn the inspector off or back on
+  // while this page stays open, and poll() below is what notices which way
+  // it went.
+  //
+  // Off is not an error state. The routes are still worth showing, so the
+  // rail becomes the page and the note says which key turns capture back on.
   function setOff(off) {
     if (inspectorOff === off) return;
     inspectorOff = off;
+    document.body.classList.toggle("inspector-off", off);
     $("pause").disabled = off;
     $("clear").disabled = off;
     if (off) {
       if (source) { source.close(); source = null; }
-      empty(list, "The inspector is off.");
-      empty(detail, "The inspector is off.");
       $("drops").textContent = "";
     } else {
       selected = null;
@@ -656,6 +673,7 @@
       refresh();
       if (live) connect();
     }
+    refreshRoutes();
   }
 
   // poll() doubles as the periodic "N dropped" counter and the way the page
