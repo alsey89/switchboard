@@ -214,26 +214,22 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	type routeView struct {
-		Domain, Upstream string
-		Up               bool
-	}
 	data := struct {
 		Version string
 		Suffix  string
 		Routes  []routeView
-	}{Version: s.version, Suffix: cfg.Suffix}
-	addrs := make([]string, 0, len(cfg.Routes))
-	for _, rt := range cfg.Routes {
-		addrs = append(addrs, rt.UpstreamAddr())
-	}
-	up := s.probes.statuses(addrs)
-	for _, rt := range cfg.Routes {
-		data.Routes = append(data.Routes, routeView{
-			Domain:   rt.Domain,
-			Upstream: rt.UpstreamAddr(),
-			Up:       up[rt.UpstreamAddr()],
-		})
+		// Redacted is rendered into the page script, so inspect.Redacted is
+		// the only place the sentinel is written down. The script compares a
+		// header value against it to mark the value as redacted, and drops
+		// the header from a copied curl command. Two copies of the string
+		// would let one side change without the other, and the page would
+		// quietly stop recognising a redacted value.
+		Redacted string
+	}{
+		Version:  s.version,
+		Suffix:   cfg.Suffix,
+		Routes:   s.routeViews(cfg),
+		Redacted: inspect.Redacted,
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	tmpl.ExecuteTemplate(w, "console.html", data) //nolint:errcheck
@@ -250,28 +246,39 @@ func (s *Server) renderNoRoute(w http.ResponseWriter, cfg *config.Config, host s
 
 func (s *Server) handleAPIRoutes(w http.ResponseWriter, r *http.Request) {
 	cfg := s.cfg.Load()
-	type routeJSON struct {
-		Domain   string `json:"domain"`
-		Upstream string `json:"upstream"`
-		Up       bool   `json:"up"`
-	}
 	out := struct {
 		Version string      `json:"version"`
 		Suffix  string      `json:"suffix"`
-		Routes  []routeJSON `json:"routes"`
-	}{Version: s.version, Suffix: cfg.Suffix, Routes: []routeJSON{}}
-	addrs := make([]string, 0, len(cfg.Routes))
-	for _, rt := range cfg.Routes {
-		addrs = append(addrs, rt.UpstreamAddr())
-	}
-	up := s.probes.statuses(addrs)
-	for _, rt := range cfg.Routes {
-		out.Routes = append(out.Routes, routeJSON{
-			Domain:   rt.Domain,
-			Upstream: rt.UpstreamAddr(),
-			Up:       up[rt.UpstreamAddr()],
-		})
-	}
+		Routes  []routeView `json:"routes"`
+	}{Version: s.version, Suffix: cfg.Suffix, Routes: s.routeViews(cfg)}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(out) //nolint:errcheck
+}
+
+// routeView is one route as both the console template and /api/routes show
+// it. The rail is server rendered on load and refreshed from the API on a
+// timer, so the two have to agree field for field. One type with both sets
+// of names is how they are kept from drifting; the template reads the Go
+// names and the encoder reads the tags.
+type routeView struct {
+	Domain   string `json:"domain"`
+	Upstream string `json:"upstream"`
+	Up       bool   `json:"up"`
+}
+
+// routeViews pairs every configured route with whether its upstream is up.
+// It probes the whole set in one call, which is both what makes the dials
+// concurrent and what satisfies statuses' precondition below. Never nil, so
+// the JSON encoder writes [] rather than null for a config with no routes.
+func (s *Server) routeViews(cfg *config.Config) []routeView {
+	addrs := make([]string, len(cfg.Routes))
+	for i, rt := range cfg.Routes {
+		addrs[i] = rt.UpstreamAddr()
+	}
+	up := s.probes.statuses(addrs)
+	out := make([]routeView, 0, len(cfg.Routes))
+	for i, rt := range cfg.Routes {
+		out = append(out, routeView{Domain: rt.Domain, Upstream: addrs[i], Up: up[addrs[i]]})
+	}
+	return out
 }

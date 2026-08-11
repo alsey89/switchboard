@@ -404,9 +404,15 @@ func TestConsoleHandlesKeys(t *testing.T) {
 func TestConsoleMarksRedactedHeaders(t *testing.T) {
 	s, _ := testServer(t)
 	body := do(s, "GET", "/", nil).Body.String()
-	// inspect.Redacted is the exact value the store writes.
-	if !strings.Contains(body, inspect.Redacted) {
-		t.Errorf("page should know the %q sentinel to mark it", inspect.Redacted)
+	// The page compares a header value against this sentinel to mark it as
+	// redacted, and to keep it out of a copied curl command. The value is
+	// rendered from inspect.Redacted, so this asserts on the whole
+	// declaration: a page that hardcodes its own copy, or drops the template
+	// action, fails here rather than passing on a stray match elsewhere in
+	// the markup.
+	want := `const REDACTED = "` + inspect.Redacted + `";`
+	if !strings.Contains(body, want) {
+		t.Errorf("page script should declare %s", want)
 	}
 	if !strings.Contains(body, "bodies = true") {
 		t.Error("the redaction note should name the key that turns it off")

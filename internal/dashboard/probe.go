@@ -22,9 +22,16 @@ type probeResult struct {
 // prober answers "is anything listening at this address" for a set of
 // upstreams at once, and remembers each answer for ttl.
 //
-// Both halves matter now that the console refreshes routes on a timer. The
-// old code dialed serially, so five down routes cost 1.5 seconds, and the
-// page render and its /api/routes call each paid for it separately.
+// The concurrency is what pays now that the console refreshes routes on a
+// timer: the old code dialed serially, so five down routes cost 1.5 seconds
+// on every tick.
+//
+// The cache almost never hits, and that is by design. The rail is server
+// rendered on load, and the page's only other call is the ten second tick,
+// which is always past the TTL. The TTL still has a job: it is the ceiling
+// on how stale an answer a burst of calls can share, so raising it above the
+// tick interval would break the "a route that comes up shows within one
+// tick" promise. Do not raise it because the cache looks idle.
 //
 // now and dial are fields rather than direct calls so tests can drive the
 // clock and count dials without opening a socket.
@@ -58,6 +65,12 @@ func dialTCP(addr string) bool {
 // statuses reports up or down for every address in addrs. It dials only the
 // ones with no fresh cached answer, dials those in parallel, and dials a
 // repeated address once.
+//
+// addrs must be the complete set of upstreams, not a subset. Anything cached
+// that addrs does not name is treated as a route that left the config and is
+// dropped, so asking about one route would throw away the answers for all
+// the others. Both callers go through routeViews, which passes the whole
+// config; a new caller has to do the same.
 func (p *prober) statuses(addrs []string) map[string]bool {
 	now := p.now()
 	out := make(map[string]bool, len(addrs))

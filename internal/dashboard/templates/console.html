@@ -202,8 +202,9 @@
 <script>
 (function () {
   // REDACTED is the sentinel internal/inspect writes in place of a
-  // credential header's value.
-  const REDACTED = "[redacted]";
+  // credential header's value. It is rendered from the Go constant rather
+  // than written out again here, so there is one definition to change.
+  const REDACTED = "{{.Redacted}}";
 
   const $ = (id) => document.getElementById(id);
   const list = $("list"), detail = $("detail");
@@ -564,9 +565,9 @@
   }
 
   // asCurl rebuilds the request as a command. Redacted header values are
-  // dropped rather than emitted: pasting `-H 'authorization: [redacted]'`
-  // produces a command that looks right and fails, which is worse than one
-  // that is visibly missing its credentials.
+  // dropped rather than emitted: a command carrying the sentinel where the
+  // credential should be looks right and fails, which is worse than one that
+  // is visibly missing its credentials.
   function asCurl(r) {
     const parts = ["curl", "-i", "-X", shellQuote(r.method)];
     const headers = r.req_headers || {};
