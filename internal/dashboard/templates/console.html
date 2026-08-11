@@ -81,8 +81,48 @@
   #rail .empty { padding: .8rem .7rem; font-size: .8rem; }
   .note { color: var(--warn); padding: .6rem 1rem; font-size: .85rem; }
   .more { display: block; width: calc(100% - 1.6rem); margin: .6rem .8rem 1rem; }
-  @media (max-width: 700px) { main { grid-template-columns: 1fr; }
-    #list { border-right: 0; border-bottom: 1px solid var(--line); max-height: 45vh; } }
+  /* #sheetclose is a direct child of main (a grid container) so it needs a
+     display outside the sheet's own media query too, or grid auto-placement
+     gives it an implicit fourth cell at every width. */
+  #sheetclose { display: none; }
+  /* Below 1100px the rail folds above the list. A dropdown would scale to
+     more routes and cost no height, but it drops the up and down dots at
+     the width you actually use, which is most of the reason routes are on
+     the traffic page at all. */
+  @media (max-width: 1100px) {
+    main { grid-template-columns: minmax(240px, 40%) 1fr;
+      grid-template-rows: auto 1fr; }
+    #rail { grid-column: 1 / -1; overflow: visible; border-right: 0;
+      border-bottom: 1px solid var(--line); padding: .4rem .6rem;
+      display: flex; gap: .35rem; flex-wrap: wrap; align-items: center; }
+    #rail h2 { display: none; }
+    #rail ul { display: flex; gap: .35rem; flex-wrap: wrap; }
+    #rail li { border: 1px solid var(--line); border-radius: 999px;
+      padding: .12rem .55rem; font-size: .8rem; }
+    #rail li.sel { border-color: var(--accent); color: var(--accent); }
+    #rail .addr { display: none; }
+    #rail .empty, #offnote { padding: .2rem 0; }
+    body.inspector-off #rail { flex-direction: column; align-items: stretch; }
+    body.inspector-off #rail ul { flex-direction: column; }
+    body.inspector-off #rail li { border: 0; border-radius: 0;
+      font-size: .9rem; padding: .3rem 0; }
+    body.inspector-off #rail .addr { display: inline; }
+  }
+
+  /* Below 700px the detail stops being a column. It used to stack under a
+     list capped at 45vh, so reading a request scrolled the list off screen.
+     A sheet keeps the list where it was. */
+  @media (max-width: 700px) {
+    main { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
+    #list { border-right: 0; }
+    #detail { position: fixed; inset: 35% 0 0 0; z-index: 10;
+      border-top: 2px solid var(--accent);
+      box-shadow: 0 -8px 24px rgb(0 0 0 / .18); display: none; }
+    body.sheet-open #detail { display: block; }
+    #sheetclose { display: none; position: fixed; right: .6rem; top: 35%;
+      margin-top: .4rem; z-index: 11; }
+    body.sheet-open #sheetclose { display: block; }
+  }
 </style>
 </head>
 <body>
@@ -128,6 +168,7 @@
   </aside>
   <div id="list"><p class="empty">Waiting for traffic.</p></div>
   <div id="detail"><p class="empty">Pick a request.</p></div>
+  <button id="sheetclose" aria-label="Close request detail">✕</button>
 </main>
 <script>
 (function () {
@@ -441,6 +482,7 @@
   // place they come from.
   async function show(id) {
     selected = id;
+    document.body.classList.add("sheet-open");
     render();
     const resp = await fetch("/api/inspect/requests/" + id);
     // A faster second click may have landed while this one was in flight;
@@ -502,6 +544,13 @@
     }
     refresh();
   });
+
+  // The sheet only exists below 700px. Clearing the class at any width is
+  // harmless, since nothing above 700px reads it.
+  function closeSheet() {
+    document.body.classList.remove("sheet-open");
+  }
+  $("sheetclose").addEventListener("click", closeSheet);
 
   // railNode builds one rail row. An empty domain is the "All traffic"
   // entry, which is a filter rather than a route and so has no dot or addr.
