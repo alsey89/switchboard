@@ -2,6 +2,47 @@
 
 What changed in each release, and anything you need to do about it.
 
+## Unreleased
+
+### Changed
+
+- **The inspector is the dashboard.** `https://switchboard.test` now opens
+  the request console instead of a routes table. Routes moved to a rail on
+  the left that doubles as the domain filter. Click one to see only its
+  traffic.
+
+  `https://switchboard.test/inspect` still works. It redirects.
+
+  Nothing about capture changed. Same storage, same defaults, same config
+  keys.
+
+### Added
+
+- The routes list is live. A dev server coming up shows in the rail within
+  about ten seconds, no reload needed.
+- The console folds for narrow windows. Below 1100px the rail becomes a chip
+  strip above the list. Below 700px the request detail becomes a sheet over
+  the list.
+- Copy a captured request as a `curl` command from the detail pane, or copy
+  its URL. Redacted headers are left out of the command rather than pasted
+  in as `[redacted]`.
+- Keyboard control. Arrows or `j`/`k` move the selection, `/` focuses the
+  filter, Escape leaves a field or closes the detail sheet.
+- The request list has column headers now. They stick to the top while you
+  scroll.
+- Status is a pill. A websocket upgrade reads `101 ws`.
+- Recent rows show an age, like "2s ago", instead of a clock time. Past an
+  hour it goes back to a clock time. Hover for the full timestamp.
+
+### Fixed
+
+- Turning capture off used to leave the console showing "The inspector is
+  off" and nothing else. It now shows the routes full width and names the
+  config key that turns capture back on.
+- Redacted header values used to render as the literal string `[redacted]`,
+  as if that were what got sent. They now read "redacted", with a tooltip
+  naming `bodies = true` as the way to see the real value.
+
 ## 0.3.0 — 2026-08-04
 
 ### Added

@@ -317,9 +317,9 @@ func TestInspectRequestsAppliesEachQueryParameter(t *testing.T) {
 	}
 }
 
-func TestInspectPageRenders(t *testing.T) {
+func TestConsolePageRenders(t *testing.T) {
 	s, _ := testServer(t)
-	w := do(s, "GET", "/inspect", nil)
+	w := do(s, "GET", "/", nil)
 	if w.Code != 200 {
 		t.Fatalf("status %d", w.Code)
 	}
@@ -327,7 +327,7 @@ func TestInspectPageRenders(t *testing.T) {
 	// The history API the page must actually use. Its only data source used
 	// to be the stream, whose backfill is 200 rows, so the filters ran over
 	// an in-memory array and the other ~96% of a default buffer was
-	// unreachable — a filter that matched nothing on screen looked identical
+	// unreachable. A filter that matched nothing on screen looked identical
 	// to no matching traffic at all.
 	//
 	// The last two are the render path. render() used to clear #list and
@@ -342,6 +342,94 @@ func TestInspectPageRenders(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("page is missing %q", want)
 		}
+	}
+}
+
+func TestConsoleListHasColumnHeaders(t *testing.T) {
+	s, _ := testServer(t)
+	body := do(s, "GET", "/", nil).Body.String()
+	// Five unlabeled columns is a puzzle, not a table. The header row is
+	// built client side, so this asserts the code that builds it. Asserting
+	// "<thead>" would never match: it is never in the served source.
+	for _, want := range []string{
+		`createElement("thead")`,
+		`["time", "method", "path", "status", "took"]`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("list is missing %q", want)
+		}
+	}
+}
+
+func TestConsoleOffersCopyAsCurl(t *testing.T) {
+	s, _ := testServer(t)
+	body := do(s, "GET", "/", nil).Body.String()
+	for _, want := range []string{"copy as curl", "navigator.clipboard"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("detail pane is missing %q", want)
+		}
+	}
+}
+
+// TestConsoleQuotesEveryCurlField pins asCurl's fields to shellQuote. Every
+// value it emits came off the wire, so every value must go through
+// shellQuote, including the HTTP method: net/http accepts any RFC 7230
+// token as a method, and an unquoted r.method let a captured request like
+// `GET$(id)` execute when the copied command was pasted into a shell.
+func TestConsoleQuotesEveryCurlField(t *testing.T) {
+	s, _ := testServer(t)
+	body := do(s, "GET", "/", nil).Body.String()
+	for _, want := range []string{
+		`shellQuote(r.method)`,
+		`shellQuote(k + ": " + v)`,
+		`shellQuote(r.req_body)`,
+		`shellQuote("https://" + r.domain + r.path)`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("asCurl is missing %q", want)
+		}
+	}
+}
+
+func TestConsoleHandlesKeys(t *testing.T) {
+	s, _ := testServer(t)
+	body := do(s, "GET", "/", nil).Body.String()
+	for _, want := range []string{"ArrowDown", "ArrowUp", "Escape", "keydown"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("page does not handle %q", want)
+		}
+	}
+}
+
+func TestConsoleMarksRedactedHeaders(t *testing.T) {
+	s, _ := testServer(t)
+	body := do(s, "GET", "/", nil).Body.String()
+	// The page compares a header value against this sentinel to mark it as
+	// redacted, and to keep it out of a copied curl command. The value is
+	// rendered from inspect.Redacted, so this asserts on the whole
+	// declaration: a page that hardcodes its own copy, or drops the template
+	// action, fails here rather than passing on a stray match elsewhere in
+	// the markup.
+	want := `const REDACTED = "` + inspect.Redacted + `";`
+	if !strings.Contains(body, want) {
+		t.Errorf("page script should declare %s", want)
+	}
+	if !strings.Contains(body, "bodies = true") {
+		t.Error("the redaction note should name the key that turns it off")
+	}
+}
+
+// TestInspectRedirectsToTheConsole keeps the v0.3 URL working. The README,
+// the CHANGELOG and the 0.3.0 release notes all name it, and people have
+// bookmarked it.
+func TestInspectRedirectsToTheConsole(t *testing.T) {
+	s, _ := testServer(t)
+	w := do(s, "GET", "/inspect", nil)
+	if w.Code != http.StatusFound {
+		t.Fatalf("status %d, want 302", w.Code)
+	}
+	if got := w.Header().Get("Location"); got != "/" {
+		t.Errorf("Location %q, want /", got)
 	}
 }
 

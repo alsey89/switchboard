@@ -1,0 +1,1084 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Switchboard</title>
+<style>
+  :root { color-scheme: light dark;
+    --fg: #1a1a1a; --bg: #ffffff; --muted: #6b7280; --line: #e5e7eb;
+    --ok: #16a34a; --bad: #dc2626; --warn: #d97706; --accent: #4f46e5;
+    --panel: #fafafa; }
+  @media (prefers-color-scheme: dark) { :root {
+    --fg: #e5e7eb; --bg: #111318; --muted: #9ca3af; --line: #2a2e37;
+    --panel: #171a21; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); height: 100vh;
+    display: flex; flex-direction: column;
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif; }
+  header { padding: .8rem 1rem; border-bottom: 1px solid var(--line);
+    display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; }
+  header h1 { font-size: 1rem; margin: 0 .6rem 0 0; font-weight: 600; }
+  header h1 a { color: var(--fg); text-decoration: none; }
+  input, select, button { font: inherit; color: var(--fg); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 6px; padding: .3rem .5rem; }
+  button { cursor: pointer; }
+  button.on { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
+  .spacer { flex: 1; }
+  .drops { color: var(--warn); font-size: .8rem; }
+  main { flex: 1; display: grid;
+    grid-template-columns: 190px minmax(240px, 34%) 1fr; min-height: 0; }
+  #list { overflow-y: auto; border-right: 1px solid var(--line); }
+  #detail { overflow-y: auto; padding: 1rem; background: var(--panel); }
+  #rail { overflow-y: auto; border-right: 1px solid var(--line); padding: .6rem 0; }
+  #rail h2 { margin: 0 .7rem .3rem; }
+  #rail ul { list-style: none; margin: 0; padding: 0; }
+  /* center, not baseline: the row's two children are a nested flex button
+     and a link, and a flex container's baseline is whatever its own first
+     item hands up, which here is an empty dot. */
+  #rail li { display: flex; align-items: center; }
+  #rail li:hover { background: var(--panel); }
+  #rail li.sel { background: color-mix(in srgb, var(--accent) 12%, transparent);
+    font-weight: 600; }
+  /* A row is two controls, not one clickable box: .pick filters the list to
+     the domain, .open opens the site. Both are real controls, so the rail is
+     reachable by keyboard and .open can be middle-clicked. .pick carries the
+     row's padding so the whole left side is its hit area. */
+  #rail .pick { flex: 1; min-width: 0; display: flex; align-items: baseline;
+    gap: .35rem; padding: .3rem .4rem .3rem .7rem; text-align: left;
+    border: 0; border-radius: 0; background: none; color: inherit;
+    font: inherit; }
+  /* Capture off disables .pick, and the routes are the whole page then, so
+     the generic dimming would fade the one thing left to read. */
+  #rail .pick:disabled { opacity: 1; }
+  #rail .open { flex: none; padding: .3rem .7rem .3rem .2rem; font-size: .8rem;
+    line-height: 1; color: var(--muted); text-decoration: none; }
+  #rail .open:hover, #rail .open:focus-visible { color: var(--accent); }
+  #rail .addr { color: var(--muted); font-size: .75rem;
+    font-family: ui-monospace, monospace; margin-left: auto;
+    min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* Capture off. The traffic columns have nothing to show, so the rail
+     stops being a rail and the routes become the page. */
+  body.inspector-off #list, body.inspector-off #detail { display: none; }
+  body.inspector-off main { grid-template-columns: 1fr; }
+  body.inspector-off #rail { border-right: 0; }
+  body.inspector-off #rail li:hover { background: none; }
+  #offnote { display: none; padding: .8rem .7rem; font-size: .85rem;
+    color: var(--warn); }
+  body.inspector-off #offnote { display: block; }
+  .dot { width: .5rem; height: .5rem; border-radius: 50%; flex: none;
+    background: var(--bad); }
+  .dot.up { background: var(--ok); }
+  table { width: 100%; border-collapse: collapse; }
+  /* scroll-margin-top clears the sticky thead. Without it, arrowing up
+     through a scrolled list parks the selected row underneath the header,
+     because scrollIntoView aligns to the top of the scrollport and the
+     header is floating over it. The header is a .7rem line box plus .3rem
+     of padding top and bottom plus its border, so about 1.75rem. */
+  tr.row { cursor: pointer; border-bottom: 1px solid var(--line);
+    scroll-margin-top: 1.8rem; }
+  tr.row:hover { background: var(--panel); }
+  tr.row.sel { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  td { padding: .35rem .5rem; white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis; }
+  thead th { position: sticky; top: 0; z-index: 1; background: var(--bg);
+    text-align: left; padding: .3rem .5rem; font-size: .7rem; font-weight: 500;
+    color: var(--muted); text-transform: uppercase; letter-spacing: .05em;
+    border-bottom: 1px solid var(--line); }
+  td.path { max-width: 1px; width: 100%; font-family: ui-monospace, monospace;
+    font-size: .85em; }
+  .m { color: var(--muted); font-size: .8rem; }
+  .pill { display: inline-block; padding: .02rem .35rem; border-radius: 4px;
+    font-size: .78rem; font-variant-numeric: tabular-nums;
+    background: color-mix(in srgb, currentColor 12%, transparent); }
+  .s1 { color: var(--accent); }
+  .s2 { color: var(--ok); } .s3 { color: var(--accent); }
+  .s4, .s5 { color: var(--bad); }
+  h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .05em;
+    color: var(--muted); margin: 1.2rem 0 .4rem; font-weight: 500; }
+  h2:first-child { margin-top: 0; }
+  .actions { display: flex; gap: .4rem; margin-bottom: .8rem; }
+  .actions .copy { font-size: .78rem; padding: .18rem .45rem; }
+  pre { background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
+    padding: .6rem; overflow-x: auto; font-size: .8rem; margin: 0;
+    white-space: pre-wrap; word-break: break-all; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: .1rem .8rem;
+    margin: 0; font-size: .85rem; }
+  dt { color: var(--muted); }
+  dd { margin: 0; font-family: ui-monospace, monospace; word-break: break-all; }
+  .redacted { color: var(--warn); font-family: inherit; font-style: italic;
+    cursor: help; }
+  .empty { color: var(--muted); padding: 2rem 1rem; }
+  #rail code { background: color-mix(in srgb, var(--line) 50%, transparent);
+    padding: .1rem .35rem; border-radius: 4px; font-size: .85em; }
+  #rail .empty { padding: .8rem .7rem; font-size: .8rem; }
+  .note { color: var(--warn); padding: .6rem 1rem; font-size: .85rem; }
+  .more { display: block; width: calc(100% - 1.6rem); margin: .6rem .8rem 1rem; }
+  /* #sheetclose is a direct child of main (a grid container) so it needs a
+     display outside the sheet's own media query too, or grid auto-placement
+     gives it an implicit fourth cell at every width. */
+  #sheetclose { display: none; }
+  /* Below 1100px the rail folds above the list. A dropdown would scale to
+     more routes and cost no height, but it drops the up and down dots at
+     the width you actually use, which is most of the reason routes are on
+     the traffic page at all. */
+  @media (max-width: 1100px) {
+    /* The list gets the majority share here, not the detail. The list is
+       scanned continuously; the detail is opened one request at a time.
+       #list's path column absorbs whatever four fixed-width columns (time,
+       method, status, took ~= 286px) leave — below about 1000px a 40/60
+       split leaves less than that, and the path is crushed to nothing. */
+    main { grid-template-columns: minmax(320px, 55%) 1fr;
+      grid-template-rows: auto 1fr; }
+    /* overflow: visible ties in specificity with the base #rail's
+       overflow-y: auto at line 34; this block must stay after it in the
+       source, or the rail goes back to its own scrollbar here. */
+    #rail { grid-column: 1 / -1; overflow: visible; border-right: 0;
+      border-bottom: 1px solid var(--line); padding: .4rem .6rem;
+      display: flex; gap: .35rem; flex-wrap: wrap; align-items: center; }
+    #rail h2 { display: none; }
+    #rail ul { display: flex; gap: .35rem; flex-wrap: wrap; }
+    #rail li { border: 1px solid var(--line); border-radius: 999px;
+      padding: .12rem .55rem; font-size: .8rem; gap: .3rem; }
+    /* The pill is the li here, so the row's padding moves out to it. */
+    #rail .pick, #rail .open { padding: 0; }
+    #rail li.sel { border-color: var(--accent); color: var(--accent); }
+    #rail .addr { display: none; }
+    #rail .empty, #offnote { padding: .2rem 0; }
+    body.inspector-off #rail { flex-direction: column; align-items: stretch; }
+    body.inspector-off #rail ul { flex-direction: column; }
+    body.inspector-off #rail li { border: 0; border-radius: 0;
+      font-size: .9rem; padding: .3rem 0; }
+    body.inspector-off #rail .addr { display: inline; }
+  }
+
+  /* Below 700px the detail stops being a column. It used to stack under a
+     list capped at 45vh, so reading a request scrolled the list off screen.
+     A sheet keeps the list where it was. */
+  @media (max-width: 700px) {
+    /* grid-template-columns ties in specificity with the 1100px query's
+       main rule above; this block must stay after it in the source, or
+       the fold reverts to the two-column layout at this width. */
+    main { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
+    #list { border-right: 0; }
+    #detail { position: fixed; inset: 35% 0 0 0; z-index: 10;
+      border-top: 2px solid var(--accent);
+      box-shadow: 0 -8px 24px rgb(0 0 0 / .18); display: none; }
+    body.sheet-open #detail { display: block; }
+    /* No display here: the base rule above already hides it at every width,
+       and body.sheet-open below outranks both. */
+    #sheetclose { position: fixed; right: .6rem; top: 35%;
+      margin-top: .4rem; z-index: 11; }
+    body.sheet-open #sheetclose { display: block; }
+    /* Capture off must win the tie with sheet-open (both (1,1,1)): if a
+       lingering sheet survives a capture-off toggle, this has to stay after
+       the sheet-open rules above so source order breaks the tie in its
+       favor and the sheet does not float over the full-width routes list. */
+    body.inspector-off #detail, body.inspector-off #sheetclose { display: none; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1><a href="/">Switchboard</a><span class="m">.{{.Suffix}}</span></h1>
+  <input id="q" type="search" placeholder="filter path" size="14">
+  <input id="domain" type="hidden">
+  <select id="method">
+    <option value="">any method</option>
+    <option>GET</option><option>POST</option><option>PUT</option>
+    <option>PATCH</option><option>DELETE</option>
+  </select>
+  <select id="status">
+    <option value="">any status</option>
+    <option value="2xx">2xx</option><option value="3xx">3xx</option>
+    <option value="4xx">4xx</option><option value="5xx">5xx</option>
+  </select>
+  <button id="pause" class="on">live</button>
+  <span class="spacer"></span>
+  <span id="drops" class="drops"></span>
+  <span class="m">{{.Version}}</span>
+  <button id="clear">clear</button>
+</header>
+<main>
+  <aside id="rail">
+    <h2>Routes</h2>
+    <ul id="routes">
+      <li data-domain="" class="sel"><button type="button" class="pick">All traffic</button></li>
+      {{range .Routes}}
+      <li data-domain="{{.Domain}}"><button type="button" class="pick"><span class="dot{{if .Up}} up{{end}}"></span>{{.Domain}}<span class="addr">{{.Upstream}}</span></button><a class="open" href="https://{{.Domain}}" target="_blank" rel="noopener" title="Open {{.Domain}}" aria-label="Open {{.Domain}}">↗</a></li>
+      {{end}}
+    </ul>
+    {{if not .Routes}}
+    <p class="empty">No routes yet. Add one:<br><code>switchboard add app 3000</code></p>
+    {{end}}
+    <p id="offnote">
+      Capture is off, so there is no traffic to show. Set
+      <code>enabled = true</code> under <code>[inspect]</code> in your config
+      to turn it back on.
+    </p>
+  </aside>
+  <div id="list"><p class="empty">Waiting for traffic.</p></div>
+  <div id="detail"><p class="empty">Pick a request.</p></div>
+  <button id="sheetclose" aria-label="Close request detail">✕</button>
+</main>
+<script>
+(function () {
+  // REDACTED is the sentinel internal/inspect writes in place of a
+  // credential header's value. It is rendered from the Go constant rather
+  // than written out again here, so there is one definition to change.
+  const REDACTED = "{{.Redacted}}";
+
+  const $ = (id) => document.getElementById(id);
+  const list = $("list"), detail = $("detail");
+  const filters = { q: $("q"), domain: $("domain"), method: $("method"), status: $("status") };
+
+  // PAGE matches the history API's own default page size. Asking for more
+  // than 500 is pointless — the server caps it there.
+  const PAGE = 200;
+  // A page left open all day must not grow without bound. This is the
+  // default max_requests, so in the normal configuration nothing the buffer
+  // holds is out of reach; a bigger buffer needs the filters.
+  const MAX_ROWS = 5000;
+
+  let rows = [];        // newest first, already matching the active filters
+  let live = true;
+  let selected = null;
+  let source = null;
+  let inspectorOff = false;
+  let more = false;     // the last page came back full, so older rows exist
+  let loading = false;
+  let generation = 0;   // a stale in-flight refresh must not overwrite a newer one
+  let refreshing = false;
+  let pending = [];     // live records that arrived while a refresh was in flight
+  let filterTimer = null;
+  let table = null, tbody = null;   // kept across renders, never rebuilt
+  const nodes = new Map();          // record id -> its <tr>
+
+  const statusClass = (s) => "s" + String(s).charAt(0);
+
+  // Every record field below is attacker-influenced: it comes straight from
+  // whatever traffic hit the proxy, including a request a hostile page the
+  // developer visited could have sent through it. Nothing here goes near
+  // innerHTML — every value lands as textContent, a data-* value, or a
+  // className built from a fixed set of literals, so there is no markup
+  // context for it to break out of.
+  function empty(el, msg) {
+    el.textContent = "";
+    const p = document.createElement("p");
+    p.className = "empty";
+    p.textContent = msg;
+    el.appendChild(p);
+  }
+
+  function note(el, msg) {
+    const p = document.createElement("p");
+    p.className = "note";
+    p.textContent = msg;
+    el.textContent = "";
+    el.appendChild(p);
+  }
+
+  // query builds the filter parameters the history API already understands.
+  // The filters are applied by the store, not by this page: filtering an
+  // array of the last 200 records meant "by domain" silently meant "by
+  // domain, within the last 200", while the rest of the buffer sat on disk.
+  function query(extra) {
+    const p = new URLSearchParams();
+    if (filters.domain.value) p.set("domain", filters.domain.value);
+    if (filters.method.value) p.set("method", filters.method.value);
+    if (filters.status.value) p.set("status", filters.status.value);
+    if (filters.q.value) p.set("q", filters.q.value);
+    p.set("limit", String(PAGE));
+    for (const k in extra) p.set(k, String(extra[k]));
+    return "/api/inspect/requests?" + p.toString();
+  }
+
+  // matches mirrors the store's filter semantics for records that arrive on
+  // the live stream, which never went through a query. It has to agree with
+  // the SQL: domain and method are exact (method case-insensitively, since
+  // the store upper-cases it), q is a case-insensitive substring of the path
+  // the way SQLite's LIKE is, and a status filter is a leading digit.
+  function matches(r) {
+    const f = filters;
+    if (f.domain.value && r.domain !== f.domain.value) return false;
+    if (f.method.value && r.method.toUpperCase() !== f.method.value.toUpperCase()) return false;
+    if (f.q.value && !r.path.toLowerCase().includes(f.q.value.toLowerCase())) return false;
+    const s = f.status.value;
+    if (s && String(r.status).charAt(0) !== s.charAt(0)) return false;
+    return true;
+  }
+
+  const anyFilterSet = () =>
+    Object.values(filters).some((el) => el.value !== "");
+
+  // insert places a record at its position by id rather than assuming where
+  // it belongs. Ids are assigned in arrival order, so descending id is
+  // newest first, and an id already present is the same record arriving
+  // twice — a stream reconnect replays the last 200, and the backfill
+  // overlaps whatever the first fetch already returned.
+  function insert(r) {
+    let i = 0;
+    while (i < rows.length && rows[i].id > r.id) i++;
+    if (i < rows.length && rows[i].id === r.id) return false;
+    rows.splice(i, 0, r);
+    return true;
+  }
+
+  function cell(text, className) {
+    const td = document.createElement("td");
+    if (className) td.className = className;
+    td.textContent = text;
+    return td;
+  }
+
+  // rel renders a recent timestamp as an age, because "4s ago" answers the
+  // question the clock time is standing in for. Anything older than an hour
+  // is back to a clock time, where the age stops being the useful part.
+  function rel(iso) {
+    const then = Date.parse(iso);
+    if (Number.isNaN(then)) return iso.slice(11, 23);
+    const secs = Math.max(0, (Date.now() - then) / 1000);
+    if (secs < 60) return Math.floor(secs) + "s ago";
+    if (secs < 3600) return Math.floor(secs / 60) + "m ago";
+    return iso.slice(11, 19);
+  }
+
+  function statusCell(r) {
+    const td = document.createElement("td");
+    const pill = document.createElement("span");
+    // An upgraded connection has no meaningful final status. It said 101 and
+    // then stopped being HTTP.
+    pill.className = "pill " + (r.upgraded ? "s1" : statusClass(r.status));
+    pill.textContent = r.upgraded ? "101 ws" : String(r.status);
+    td.appendChild(pill);
+    return td;
+  }
+
+  function rowNode(r) {
+    const tr = document.createElement("tr");
+    tr.dataset.id = String(r.id);
+    const when = cell(rel(r.started_at), "m");
+    when.title = r.started_at;
+    tr.append(
+      when,
+      cell(r.method, "m"),
+      cell(r.path, "path"),
+      statusCell(r),
+      cell(r.duration_ms.toFixed(1) + "ms", "m"),
+    );
+    return tr;
+  }
+
+  // The load older button is one element for the life of the page, so a
+  // render cannot detach the thing the user is reaching for.
+  const moreBtn = document.createElement("button");
+  moreBtn.className = "more";
+  moreBtn.addEventListener("click", loadMore);
+
+  // anchorRow returns the topmost row still in view, along with where it sat
+  // on screen, so a render can put the user back on the same record rather
+  // than the same pixel — which is what rows arriving above them invalidate.
+  //
+  // Binary search, not a scan: the rows are in document order, and this runs
+  // on every live event against a list that can hold thousands.
+  function anchorRow() {
+    if (list.scrollTop <= 0 || !tbody || !tbody.children.length) return null;
+    const kids = tbody.children;
+    const top = list.getBoundingClientRect().top;
+    let lo = 0, hi = kids.length - 1, found = null;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (kids[mid].getBoundingClientRect().bottom > top) { found = kids[mid]; hi = mid - 1; }
+      else lo = mid + 1;
+    }
+    return found ? { el: found, top: found.getBoundingClientRect().top } : null;
+  }
+
+  // render reconciles the table against rows. It does not rebuild it.
+  //
+  // Clearing #list and building every row again did two things that matter
+  // here. It reset scrollTop to 0, and it ran from the stream's onmessage
+  // handler, so any traffic through the proxy yanked the user back to the
+  // top — which made load older unusable except while paused, with nothing
+  // on the page saying so. And it rebuilt every row on every event, up to
+  // MAX_ROWS of them, on the hot path of the one view this feature exists
+  // to serve.
+  //
+  // Keying on the record id means an unchanged row is never touched. A live
+  // record inserts one <tr> and moves nothing else; a load older appends and
+  // disturbs nothing above it.
+  function render() {
+    if (inspectorOff) return;
+    const anchor = anchorRow();
+
+    if (!rows.length) {
+      // An empty buffer (nothing captured yet, or a clear just ran) reads
+      // differently from a filter that happens to match nothing: only the
+      // second one is actually "yet".
+      table = tbody = null;
+      nodes.clear();
+      empty(list, anyFilterSet() ? "Nothing matches yet." : "Waiting for traffic.");
+    } else {
+      if (!tbody) {
+        list.textContent = "";
+        table = document.createElement("table");
+        const thead = document.createElement("thead");
+        const hr = document.createElement("tr");
+        for (const label of ["time", "method", "path", "status", "took"]) {
+          const th = document.createElement("th");
+          th.textContent = label;
+          hr.appendChild(th);
+        }
+        thead.appendChild(hr);
+        tbody = document.createElement("tbody");
+        table.append(thead, tbody);
+        list.appendChild(table);
+        nodes.clear();
+      }
+      for (let i = 0; i < rows.length; i++) {
+        const r = rows[i];
+        let tr = nodes.get(r.id);
+        if (!tr) { tr = rowNode(r); nodes.set(r.id, tr); }
+        const at = tbody.children[i];
+        if (at !== tr) tbody.insertBefore(tr, at || null);
+        tr.className = "row" + (r.id === selected ? " sel" : "");
+      }
+      // Whatever is left past the end is a row that was evicted, trimmed or
+      // filtered out. Anything still in nodes is still in the table.
+      while (tbody.children.length > rows.length) {
+        const gone = tbody.lastElementChild;
+        nodes.delete(Number(gone.dataset.id));
+        gone.remove();
+      }
+    }
+
+    // Guarded on rows.length as well as more, because loadMore refuses to
+    // page from an empty list: a button that does nothing is worse than no
+    // button.
+    if (more && rows.length) {
+      moreBtn.textContent = loading ? "loading…" : "load older";
+      moreBtn.disabled = loading;
+      if (moreBtn.parentNode !== list) list.appendChild(moreBtn);
+    } else {
+      moreBtn.remove();
+    }
+
+    if (anchor && anchor.el.isConnected) {
+      list.scrollTop += anchor.el.getBoundingClientRect().top - anchor.top;
+    }
+  }
+
+  // refresh replaces the view from the server. Any live record that arrives
+  // while the query is in flight is held in pending and merged afterwards,
+  // so changing a filter mid-traffic cannot silently swallow a request that
+  // landed between the query running and its answer arriving.
+  async function refresh() {
+    const mine = ++generation;
+    refreshing = true;
+    pending = [];
+    try {
+      let resp;
+      try {
+        resp = await fetch(query({}));
+      } catch {
+        return; // offline or the daemon is restarting; poll() retries
+      }
+      if (mine !== generation) return;
+      if (resp.status === 503) { setOff(true); return; }
+      if (!resp.ok) return;
+      const data = await resp.json();
+      if (mine !== generation) return;
+
+      rows = data.requests;
+      more = data.requests.length >= PAGE;
+      for (const r of pending) if (matches(r)) insert(r);
+      render();
+    } finally {
+      // Only the newest refresh owns these. An older one losing the race
+      // must not hand the live stream back to a query still in flight.
+      if (mine === generation) { refreshing = false; pending = []; }
+    }
+  }
+
+  // loadMore pages backwards with the cursor the API was built for. It only
+  // ever asks for rows older than the oldest one on screen, and the live
+  // stream only ever delivers rows newer than every one on screen, so the
+  // two can never fetch the same record — and insert() would reject it if
+  // they somehow did.
+  async function loadMore() {
+    if (loading || !rows.length) return;
+    loading = true;
+    render();
+    try {
+      const resp = await fetch(query({ before: rows[rows.length - 1].id }));
+      if (resp.status === 503) { setOff(true); return; }
+      if (!resp.ok) return;
+      const data = await resp.json();
+      for (const r of data.requests) insert(r);
+      more = data.requests.length >= PAGE;
+    } catch {
+      // Leave what is on screen and let the user try again.
+    } finally {
+      loading = false;
+      render();
+    }
+  }
+
+  function headerList(h) {
+    const names = h ? Object.keys(h).sort() : [];
+    if (!names.length) {
+      const p = document.createElement("p");
+      p.className = "m";
+      p.textContent = "none";
+      return p;
+    }
+    const dl = document.createElement("dl");
+    for (const k of names) {
+      const dt = document.createElement("dt");
+      dt.textContent = k;
+      const dd = document.createElement("dd");
+      const value = h[k].join(", ");
+      // REDACTED is the sentinel internal/inspect writes in place of a
+      // credential header's value. Matching on it is a little blunt, and a
+      // real header whose value happens to be this string would be marked
+      // too. That is a better failure than the alternative, which is the
+      // value rendering as unexplained literal text.
+      if (value === REDACTED) {
+        dd.className = "redacted";
+        dd.textContent = "redacted";
+        dd.title = "Set bodies = true under [inspect] to store this value as sent.";
+      } else {
+        dd.textContent = value;
+      }
+      dl.append(dt, dd);
+    }
+    return dl;
+  }
+
+  function heading(text) {
+    const h2 = document.createElement("h2");
+    h2.textContent = text;
+    return h2;
+  }
+
+  function field(dl, label, value) {
+    const dt = document.createElement("dt");
+    dt.textContent = label;
+    const dd = document.createElement("dd");
+    dd.textContent = value;
+    dl.append(dt, dd);
+  }
+
+  function body(label, text) {
+    const frag = document.createDocumentFragment();
+    frag.append(heading(label));
+    const pre = document.createElement("pre");
+    pre.textContent = text;
+    frag.append(pre);
+    return frag;
+  }
+
+  // shellQuote wraps a value for a POSIX shell in single quotes, which quote
+  // everything except a single quote itself. There is no escape for one
+  // inside single quotes, so the string is closed, an escaped quote is
+  // added, and the string is reopened.
+  function shellQuote(s) {
+    return "'" + String(s).replaceAll("'", `'\\''`) + "'";
+  }
+
+  // asCurl rebuilds the request as a command. Redacted header values are
+  // dropped rather than emitted: a command carrying the sentinel where the
+  // credential should be looks right and fails, which is worse than one that
+  // is visibly missing its credentials.
+  function asCurl(r) {
+    const parts = ["curl", "-i", "-X", shellQuote(r.method)];
+    const headers = r.req_headers || {};
+    for (const k of Object.keys(headers).sort()) {
+      for (const v of headers[k]) {
+        if (v === REDACTED) continue;
+        parts.push("-H", shellQuote(k + ": " + v));
+      }
+    }
+    if (r.req_body) parts.push("--data-raw", shellQuote(r.req_body));
+    parts.push(shellQuote("https://" + r.domain + r.path));
+    return parts.join(" ");
+  }
+
+  // copyButton is a button whose label reports what happened. The clipboard
+  // API can reject (no permission, an insecure context) and a button that
+  // silently did nothing is the worst version of this.
+  function copyButton(label, text) {
+    const b = document.createElement("button");
+    b.className = "copy";
+    b.textContent = label;
+    b.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(text);
+        b.textContent = "copied";
+      } catch {
+        b.textContent = "copy failed";
+      }
+      setTimeout(() => { b.textContent = label; }, 1500);
+    });
+    return b;
+  }
+
+  // select moves the highlight and opens the sheet. It touches the two rows
+  // that changed rather than calling render(), because holding an arrow key
+  // makes this run at the OS repeat rate and a reconcile walks every row.
+  function select(id) {
+    if (selected !== null) nodes.get(selected)?.classList.remove("sel");
+    selected = id;
+    nodes.get(id)?.classList.add("sel");
+    document.body.classList.add("sheet-open");
+  }
+
+  // DETAIL_DELAY holds the detail fetch back until a held key settles. Long
+  // enough that one press of an arrow key repeating at the OS rate is one
+  // request, short enough that a single deliberate press still feels like it
+  // answered immediately.
+  const DETAIL_DELAY = 120;
+  let detailTimer = null;
+
+  function cancelDetail() {
+    if (detailTimer) { clearTimeout(detailTimer); detailTimer = null; }
+  }
+
+  function showLater(id) {
+    cancelDetail();
+    detailTimer = setTimeout(() => { detailTimer = null; show(id); }, DETAIL_DELAY);
+  }
+
+  // show refetches the whole record. Neither the list nor the stream carries
+  // bodies — they would be dead weight on every row — so this is the only
+  // place they come from.
+  async function show(id) {
+    cancelDetail(); // a click beats a keyboard step that has not fired yet
+    select(id);
+    let r;
+    try {
+      const resp = await fetch("/api/inspect/requests/" + id);
+      // A faster second click may have landed while this one was in flight;
+      // whichever request resolves last must not win over a newer selection.
+      if (selected !== id) return;
+      if (resp.status === 503) { setOff(true); return; }
+      if (!resp.ok) { empty(detail, "Gone. The buffer may have trimmed it."); return; }
+      r = await resp.json();
+    } catch {
+      // The daemon restarting mid-session used to throw out of here, leaving
+      // the row highlighted and the pane still showing the last request. The
+      // pane has to say it is not the row you just picked.
+      if (selected === id) note(detail, "Could not load this request. The daemon may be restarting.");
+      return;
+    }
+    if (selected !== id) return; // still true after the second await
+
+    detail.textContent = "";
+
+    const actions = document.createElement("div");
+    actions.className = "actions";
+    actions.append(
+      copyButton("copy as curl", asCurl(r)),
+      copyButton("copy url", "https://" + r.domain + r.path),
+    );
+    detail.append(actions);
+
+    detail.append(heading("request"));
+
+    const dl = document.createElement("dl");
+    field(dl, "when", r.started_at);
+    field(dl, "host", r.domain);
+    field(dl, "method", r.method);
+    field(dl, "path", r.path);
+    field(dl, "proto", r.proto + (r.upgraded ? " (upgraded)" : ""));
+    field(dl, "status", String(r.status));
+    field(dl, "took", r.duration_ms.toFixed(1) + " ms");
+    field(dl, "sent", r.req_bytes + " bytes");
+    field(dl, "received", r.resp_bytes + " bytes");
+    if (r.error) field(dl, "error", r.error);
+    detail.append(dl);
+
+    detail.append(heading("request headers"), headerList(r.req_headers));
+    if (r.req_body) detail.append(body("request body", r.req_body));
+    detail.append(heading("response headers"), headerList(r.resp_headers));
+    if (r.resp_body) detail.append(body("response body", r.resp_body));
+  }
+
+  list.addEventListener("click", (e) => {
+    const tr = e.target.closest("tr.row");
+    if (tr) show(Number(tr.dataset.id));
+  });
+
+  // Typing is debounced because every change is now a query, not an array
+  // filter. The delay is short enough to feel immediate and long enough that
+  // a typed word is one request rather than five.
+  //
+  // filters.domain is in this loop but never fires it: a hidden input has
+  // nothing to type into. The rail below drives that one filter and calls
+  // refresh() itself, so there is no second code path here to look for.
+  Object.values(filters).forEach((el) => el.addEventListener("input", () => {
+    if (filterTimer) clearTimeout(filterTimer);
+    filterTimer = setTimeout(refresh, 250);
+  }));
+
+  // The rail is the domain filter. #domain is a hidden input rather than a
+  // variable so query(), matches() and anyFilterSet() keep reading their
+  // filter from the same place they always did.
+  $("routes").addEventListener("click", (e) => {
+    // The open link is the row's other control. It goes to the site and must
+    // not change the filter on the way out.
+    if (e.target.closest("a.open")) return;
+    // A disabled .pick fires no click, but the thin gap between the two
+    // controls is still the li, and capture off means there is no list to
+    // filter.
+    if (inspectorOff) return;
+    const li = e.target.closest("li[data-domain]");
+    if (!li) return;
+    filters.domain.value = li.dataset.domain;
+    for (const other of $("routes").children) {
+      other.classList.toggle("sel", other === li);
+    }
+    refresh();
+  });
+
+  // The sheet only exists below 700px. Clearing the class at any width is
+  // harmless, since nothing above 700px reads it.
+  function closeSheet() {
+    document.body.classList.remove("sheet-open");
+  }
+  $("sheetclose").addEventListener("click", closeSheet);
+
+  // step moves the selection by n rows and opens what it lands on. rows is
+  // newest first, so down is older, which is the direction the eye travels.
+  //
+  // The move is immediate and the fetch is deferred. A held arrow key
+  // repeats at the OS rate, and every repeat used to be a request the daemon
+  // had to answer and a detail pane nobody saw.
+  function step(n) {
+    if (!rows.length) return;
+    let i = rows.findIndex((r) => r.id === selected);
+    if (i < 0) i = n > 0 ? -1 : rows.length;
+    const next = rows[Math.min(rows.length - 1, Math.max(0, i + n))];
+    // Landing where you already are is a no-op, not a refetch. Both ends of
+    // the list clamp to the row you are on.
+    if (!next || next.id === selected) return;
+    select(next.id);
+    nodes.get(next.id)?.scrollIntoView({ block: "nearest" });
+    showLater(next.id);
+  }
+
+  // typing is true when the key belongs to a field the user is filling in.
+  // Arrow keys inside a search box move the caret, and stealing that would
+  // be worse than not having the shortcut.
+  function typing(el) {
+    return el instanceof HTMLInputElement || el instanceof HTMLSelectElement;
+  }
+
+  document.addEventListener("keydown", (e) => {
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key === "Escape") {
+      closeSheet();
+      if (typing(e.target)) e.target.blur();
+      return;
+    }
+    if (typing(e.target)) return;
+    if (e.key === "ArrowDown" || e.key === "j") { e.preventDefault(); step(1); }
+    else if (e.key === "ArrowUp" || e.key === "k") { e.preventDefault(); step(-1); }
+    else if (e.key === "/") { e.preventDefault(); $("q").focus(); }
+  });
+
+  // railNode builds one rail row. An empty domain is the "All traffic"
+  // entry, which is a filter rather than a route and so has no dot, addr or
+  // open link. A route can never have an empty domain, so that is a safe
+  // sentinel.
+  //
+  // This has to build the same structure the template renders, because the
+  // first refreshRoutes() adopts the server-rendered rows and updates them
+  // in place from then on. A row built here and a row built there have to be
+  // the same shape or the update loop below reaches for a child that is not
+  // in one of them.
+  function railNode(rt) {
+    const li = document.createElement("li");
+    li.dataset.domain = rt.domain;
+    const pick = document.createElement("button");
+    pick.type = "button";
+    pick.className = "pick";
+    pick.disabled = inspectorOff;
+    if (!rt.domain) {
+      pick.textContent = "All traffic";
+      li.append(pick);
+      return li;
+    }
+    const dot = document.createElement("span");
+    dot.className = rt.up ? "dot up" : "dot";
+    const addr = document.createElement("span");
+    addr.className = "addr";
+    addr.textContent = rt.upstream;
+    pick.append(dot, document.createTextNode(rt.domain), addr);
+    // A real anchor, so it is focusable, middle-clickable and has an address
+    // on hover. The href is a property assignment, never a markup string.
+    const open = document.createElement("a");
+    open.className = "open";
+    open.textContent = "↗";
+    open.href = "https://" + rt.domain;
+    open.target = "_blank";
+    open.rel = "noopener";
+    open.title = "Open " + rt.domain;
+    open.setAttribute("aria-label", "Open " + rt.domain);
+    li.append(pick, open);
+    return li;
+  }
+
+  // The rail's filter is dead while capture is off: the list it would filter
+  // is not on screen. The open link stays live, so a route is still reachable
+  // from the page in that state.
+  function syncRailPicks() {
+    for (const li of $("routes").children) {
+      const pick = li.querySelector(".pick");
+      if (pick) pick.disabled = inspectorOff;
+    }
+  }
+
+  // refreshRoutes keeps the rail live. The dashboard this page replaced was
+  // rendered once, so a route coming up did not show until a reload.
+  //
+  // Like render(), it reconciles rather than rebuilding. #rail is its own
+  // scroll container: clearing it and appending fresh rows snapped a user
+  // scrolled down a long rail back to the top every ten seconds, from a tick
+  // rather than anything they did. Keying on the domain means an unchanged
+  // route is never touched, and the domain is also the filter value, so the
+  // key and the thing it selects are the same string.
+  async function refreshRoutes() {
+    let data;
+    try {
+      const resp = await fetch("/api/routes");
+      if (!resp.ok) return;
+      data = await resp.json();
+    } catch {
+      return; // daemon restarting; the next tick retries
+    }
+    const ul = $("routes");
+    const active = filters.domain.value;
+
+    // Read back from the DOM instead of a map kept across calls, so the
+    // first tick adopts the server-rendered rows rather than duplicating
+    // them, and nothing can drift out of sync with what is on screen.
+    const byDomain = new Map();
+    for (const li of ul.children) byDomain.set(li.dataset.domain, li);
+
+    // "All traffic" leads and is not in the payload, so it can never be
+    // reconciled away.
+    const wanted = [{ domain: "" }].concat(data.routes);
+    let selFound = false;
+    for (let i = 0; i < wanted.length; i++) {
+      const rt = wanted[i];
+      let li = byDomain.get(rt.domain);
+      if (!li) {
+        li = railNode(rt);
+      } else if (rt.domain) {
+        // Only the two mutable parts. The domain text is the key, so a row
+        // that is still here still names the same domain, which is also why
+        // the open link's href never needs rewriting.
+        li.querySelector(".dot").className = rt.up ? "dot up" : "dot";
+        li.querySelector(".addr").textContent = rt.upstream;
+      }
+      const at = ul.children[i];
+      if (at !== li) ul.insertBefore(li, at || null);
+      const sel = rt.domain === active;
+      li.classList.toggle("sel", sel);
+      if (sel) selFound = true;
+    }
+    // Whatever is left past the end is a route that left the config.
+    while (ul.children.length > wanted.length) ul.lastElementChild.remove();
+
+    // The selected domain was removed from the config while this page sat
+    // open. Nothing on screen carries sel, but the list is still filtered to
+    // that domain, so it reads as "the inspector stopped showing traffic"
+    // rather than "that route is gone". Fall back to All traffic and requery
+    // so the list matches what the rail claims.
+    if (!selFound) {
+      filters.domain.value = "";
+      ul.firstElementChild.classList.add("sel");
+      refresh();
+    }
+  }
+
+  $("pause").addEventListener("click", () => {
+    live = !live;
+    $("pause").textContent = live ? "live" : "paused";
+    $("pause").classList.toggle("on", live);
+    if (live) connect(); else if (source) { source.close(); source = null; }
+  });
+
+  $("clear").addEventListener("click", async () => {
+    if (!confirm("Clear all captured requests? This cannot be undone.")) return;
+    let resp;
+    try {
+      resp = await fetch("/api/inspect/clear", { method: "POST" });
+    } catch {
+      note(detail, "Could not reach the daemon. Nothing was cleared.");
+      return;
+    }
+    // A 503 means the inspector went off between the page loading and the
+    // click; a 403 means the origin check refused it. Either way the buffer
+    // still holds everything, and saying nothing would leave the user
+    // believing it did not.
+    if (resp.status === 503) { setOff(true); return; }
+    if (!resp.ok) {
+      note(detail, "Clear failed (" + resp.status + "). Nothing was removed.");
+      return;
+    }
+    rows = [];
+    more = false;
+    selected = null;
+    cancelDetail();
+    closeSheet();
+    empty(detail, "Pick a request.");
+    render();
+  });
+
+  function connect() {
+    if (source) source.close();
+    // EventSource reconnects on its own, including after the server drops a
+    // subscriber for falling behind. Each connection replays the last 200,
+    // so a reconnect fills the gap. Replayed and live copies of the same
+    // record share an id, since the store assigns it before publishing to
+    // either path, so insert()'s id check is what keeps rows from doubling
+    // up regardless of which copy happens to arrive first.
+    source = new EventSource("/api/inspect/stream");
+    source.onmessage = (e) => {
+      const r = JSON.parse(e.data);
+      // The stream is unfiltered — it is a fan-out of everything the store
+      // accepted. Filtering here is what keeps a live record from appearing
+      // under a filter it does not match, while still letting one that does
+      // match show up immediately instead of waiting for a refresh.
+      if (!matches(r)) return;
+      if (refreshing) { pending.push(r); return; }
+      if (!insert(r)) return;
+      // Only the live path trims: a user who paged backwards asked for those
+      // older rows and should keep them.
+      if (rows.length > MAX_ROWS) { rows.length = MAX_ROWS; more = true; }
+      render();
+    };
+    source.onerror = () => {
+      // A closed source here means the inspector went off mid-session (a
+      // reload can do that); the next poll() call below will notice and
+      // switch the page into the off state. Anything else is transient and
+      // EventSource is already retrying on its own.
+    };
+  }
+
+  // setOff flips the page between the console and the capture-off state, in
+  // either direction: a config reload can turn the inspector off or back on
+  // while this page stays open, and poll() below is what notices which way
+  // it went.
+  //
+  // Off is not an error state. The routes are still worth showing, so the
+  // rail becomes the page and the note says which key turns capture back on.
+  function setOff(off) {
+    if (inspectorOff === off) return;
+    inspectorOff = off;
+    document.body.classList.toggle("inspector-off", off);
+    // Every header control, not just the two buttons. A live #q still fired
+    // the debounced refresh, which then 503s, and the two selects filtered a
+    // list that is not on screen.
+    for (const el of [$("pause"), $("clear"), $("q"), $("method"), $("status")]) {
+      el.disabled = off;
+    }
+    // Selection is dropped in both directions, so the sheet has to go with
+    // it. Off hides it by CSS; turning capture back on would un-hide a sheet
+    // that reads "Pick a request." over a list you have not picked from.
+    cancelDetail();
+    closeSheet();
+    if (off) {
+      if (source) { source.close(); source = null; }
+      $("drops").textContent = "";
+    } else {
+      selected = null;
+      rows = [];
+      more = false;
+      render();
+      empty(detail, "Pick a request.");
+      refresh();
+      if (live) connect();
+    }
+    syncRailPicks();
+    refreshRoutes();
+  }
+
+  // poll() doubles as the periodic "N dropped" counter and the way the page
+  // notices the inspector turned off, or back on, while it stayed open, so
+  // a stream drop or a stale filter view never quietly reads as "no
+  // traffic" instead of "the inspector is off" — and a network failure
+  // (the daemon restarting, the machine asleep) leaves the current view
+  // alone instead of silently killing the live connection for good.
+  async function poll() {
+    try {
+      const resp = await fetch("/api/inspect/requests?limit=1");
+      if (resp.status === 503) { setOff(true); return; }
+      if (!resp.ok) return;
+      if (inspectorOff) setOff(false);
+      const { dropped } = await resp.json();
+      $("drops").textContent = dropped ? dropped + " dropped" : "";
+    } catch {
+      // Fetch rejected outright — offline, daemon mid-restart. Not the same
+      // as a clean 503, so leave the page as is and let the next tick retry.
+    }
+  }
+
+  poll()
+    .then(() => { if (!inspectorOff) return refresh(); })
+    .finally(() => { if (!inspectorOff && live) connect(); });
+  // restamp rewrites the age column. It skips the whole walk while capture
+  // is off, where the table is hidden and rows is whatever was on screen
+  // when it went off, and it writes only the cells whose label actually
+  // changed. textContent does not dirty check, so an unconditional write to
+  // thousands of cells invalidates the whole table's style for nothing. The
+  // dirty check is where the saving is: an unchanged row costs a string
+  // compare instead of a DOM write and a style invalidation.
+  //
+  // It walks all of rows, and it has to. There is no row it can stop at.
+  //
+  // Rows are ordered by record id, and internal/inspect assigns the id when
+  // a request *completes*, not when it starts: the middleware submits the
+  // record after the next handler returns, carrying the start time it saved
+  // on the way in. So the list is ordered by completion and the label is
+  // computed from the start, and age is not monotone down the list. A slow
+  // request — SSE, a long poll, a hung backend, a large download — lands at
+  // the top of the list carrying a start time older than everything under
+  // it. (The one case that is handled is an upgraded connection, which
+  // inspect records at the handshake rather than at close, and that covers
+  // only 101 and h2 extended CONNECT.)
+  //
+  // Two stopping rules were tried and both are wrong. Stopping at the first
+  // unchanged label fails because in the minutes band a row flips when its
+  // own age crosses a multiple of 60 seconds and rows do not share a phase,
+  // so a 2m10s row is unchanged while a 3m05s row below it just flipped.
+  // Stopping at the first row past the hour, where rel() returns a fixed
+  // clock time, fails on the ordering above: one long-running request at the
+  // top freezes every label beneath it for the life of the page, because
+  // nothing else ever rewrites those cells.
+  function restamp() {
+    if (inspectorOff) return;
+    // Walk rows and look the node up, not the other way around. rows can
+    // hold 5000 records, and scanning rows once per node would be 25
+    // million comparisons every ten seconds.
+    for (const r of rows) {
+      const tr = nodes.get(r.id);
+      if (!tr) continue;
+      const td = tr.firstElementChild;
+      const label = rel(r.started_at);
+      if (td.textContent !== label) td.textContent = label;
+    }
+  }
+
+  setInterval(() => {
+    poll();
+    refreshRoutes();
+    restamp();
+  }, 10000);
+})();
+</script>
+</body>
+</html>
