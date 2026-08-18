@@ -26,6 +26,10 @@ type configView struct {
 	Effective effectiveView `json:"effective"`
 	Ports     portsView     `json:"ports"`
 	Inspect   inspectView   `json:"inspect"`
+
+	Applied         bool   `json:"applied"`
+	ApplyError      string `json:"applyError,omitempty"`
+	RestartRequired bool   `json:"restartRequired"`
 }
 
 // effectiveView is what the daemon runs with, defaults resolved.
@@ -58,7 +62,7 @@ type inspectView struct {
 }
 
 func (s *Server) newConfigView(cfg *config.Config, version string) configView {
-	return configView{
+	v := configView{
 		Version: version,
 		Suffix:  cfg.Suffix,
 		Routes:  s.routeViews(cfg),
@@ -83,6 +87,24 @@ func (s *Server) newConfigView(cfg *config.Config, version string) configView {
 			MaxAge:       cfg.InspectMaxAge().String(),
 		},
 	}
+
+	// Applied means the running daemon is serving this exact file. Absent
+	// any report it is false, not true: claiming a config is live when
+	// nothing has confirmed it makes the banner useless in the one case it
+	// exists for.
+	if a := s.applied.Load(); a != nil {
+		v.Applied = a.version == version && a.err == nil
+		if a.err != nil {
+			v.ApplyError = a.err.Error()
+		}
+	}
+
+	// The dashboard cannot rebind its own listener mid-request without
+	// killing the request it is answering, so a port change is a banner and
+	// a button, not something that happens on save.
+	v.RestartRequired = s.boundPort != 0 && cfg.EffDashboardPort() != s.boundPort
+
+	return v
 }
 
 // writeConfigView answers with the config as it now stands on disk. Both

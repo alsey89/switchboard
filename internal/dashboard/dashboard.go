@@ -58,6 +58,15 @@ type Server struct {
 	// the break-glass URL that is still the only one working.
 	boundPort int
 
+	// applied is the outcome of the daemon's last config load.
+	//
+	// Save only runs Validate, and proxy.Load can fail for reasons Validate
+	// does not model, so a write can succeed and the daemon can still be
+	// serving the previous config. Rather than making writes synchronous,
+	// the reload reports itself and the dashboard says whether the file and
+	// the running daemon agree.
+	applied atomic.Pointer[applyState]
+
 	// done is closed by Shutdown, before http.Server.Shutdown runs. It is
 	// how a long-lived handler learns the server wants to stop.
 	//
@@ -98,6 +107,17 @@ type paths struct{ configPath, dataDir string }
 // live. Without them the diagnostic and write endpoints answer 503.
 func (s *Server) SetPaths(configPath, dataDir string) {
 	s.paths.Store(&paths{configPath: configPath, dataDir: dataDir})
+}
+
+type applyState struct {
+	version string
+	err     error
+}
+
+// SetApplied records the outcome of a config load. The daemon calls it after
+// every attempt, successful or not, including the one at startup.
+func (s *Server) SetApplied(version string, err error) {
+	s.applied.Store(&applyState{version: version, err: err})
 }
 
 // pathsOr503 is the paths counterpart to recorder(): it answers the request

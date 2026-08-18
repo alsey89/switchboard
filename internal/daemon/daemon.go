@@ -96,7 +96,7 @@ func Run(ctx context.Context, opts Options) error {
 		}
 	}
 
-	cfg, err := config.Load(opts.ConfigPath)
+	cfg, cfgVersion, err := config.LoadWithVersion(opts.ConfigPath)
 	if err != nil {
 		return err
 	}
@@ -125,6 +125,7 @@ func Run(ctx context.Context, opts Options) error {
 	// Dashboard.
 	dash := dashboard.New(cfg, opts.Version)
 	dash.SetPaths(opts.ConfigPath, opts.DataDir)
+	dash.SetApplied(cfgVersion, nil)
 	dashBind := net.JoinHostPort("127.0.0.1", strconv.Itoa(cfg.EffDashboardPort()))
 	if err := dash.Start(dashBind); err != nil {
 		return friendlyBindError(err, "dashboard", dashBind, opts.ConfigPath)
@@ -253,9 +254,12 @@ func Run(ctx context.Context, opts Options) error {
 			})
 
 		case <-reload:
-			next, err := config.Load(opts.ConfigPath)
+			next, nextVersion, err := config.LoadWithVersion(opts.ConfigPath)
 			if err != nil {
 				log.Error("config reload failed; keeping previous config", "err", err)
+				// No version to report: the file did not parse, so there is
+				// nothing to say is applied. The dashboard keeps showing the
+				// last good one as stale, which is accurate.
 				continue
 			}
 			if next.Suffix != cfg.Suffix {
@@ -263,10 +267,13 @@ func Run(ctx context.Context, opts Options) error {
 				// switch would silently break resolution. Require a restart.
 				log.Error("suffix changed; restart the daemon (and re-run setup) to apply",
 					"old", cfg.Suffix, "new", next.Suffix)
+				dash.SetApplied(nextVersion, errors.New(
+					"the suffix changed; restart the daemon and re-run setup to apply it"))
 				continue
 			}
 			if err := proxy.Load(next, opts.DataDir, set); err != nil {
 				log.Error("proxy reload failed; keeping previous config", "err", err)
+				dash.SetApplied(nextVersion, err)
 				continue
 			}
 			cfg = next
@@ -278,6 +285,7 @@ func Run(ctx context.Context, opts Options) error {
 			// down (without deleting inspect.db) the moment it is turned
 			// off, so the dashboard stops serving what was captured.
 			ensureInspector(next)
+			dash.SetApplied(nextVersion, nil)
 			log.Info("config reloaded", "routes", len(cfg.Routes))
 
 		case err, ok := <-watcher.Errors:

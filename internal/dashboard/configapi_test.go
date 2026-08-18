@@ -2,6 +2,7 @@ package dashboard
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -264,4 +265,99 @@ func TestPatchConfigRefusingOneFieldWritesNone(t *testing.T) {
 	if after.Version != before.Version {
 		t.Error("the config file changed despite the refusal")
 	}
+}
+
+// A config nobody has told the dashboard about yet is not claimed to be
+// running. Reporting applied:true by default would make the banner useless
+// in exactly the case it exists for.
+func TestAppliedIsFalseUntilTheDaemonSaysOtherwise(t *testing.T) {
+	s, _ := serverWithPaths(t, baseConfig)
+	if getAppliedView(t, s).Applied {
+		t.Error("applied should be false before any reload is reported")
+	}
+}
+
+func TestAppliedIsTrueForTheVersionTheDaemonLoaded(t *testing.T) {
+	s, _ := serverWithPaths(t, baseConfig)
+	version := getConfig(t, s).Version
+	s.SetApplied(version, nil)
+
+	got := getAppliedView(t, s)
+	if !got.Applied {
+		t.Error("applied should be true for the version the daemon loaded")
+	}
+	if got.ApplyError != "" {
+		t.Errorf("applyError %q, want empty", got.ApplyError)
+	}
+}
+
+// A write moves the file ahead of the daemon. Until the watcher catches up,
+// the dashboard must say so rather than imply the change is live.
+func TestAppliedGoesFalseAfterAWrite(t *testing.T) {
+	s, _ := serverWithPaths(t, baseConfig)
+	version := getConfig(t, s).Version
+	s.SetApplied(version, nil)
+
+	if w := write(t, s, "POST", "/api/routes",
+		`{"domain":"api","port":4000,"version":"`+version+`"}`); w.Code != http.StatusCreated {
+		t.Fatalf("status %d: %s", w.Code, w.Body)
+	}
+	if getAppliedView(t, s).Applied {
+		t.Error("applied should be false: the file moved and no reload was reported")
+	}
+}
+
+// A reload that failed has to surface. Today it only reaches the log, where
+// nobody is looking, and that is true for hand edits as well as for writes.
+func TestApplyErrorSurfaces(t *testing.T) {
+	s, _ := serverWithPaths(t, baseConfig)
+	version := getConfig(t, s).Version
+	s.SetApplied(version, errors.New("proxy reload exploded"))
+
+	got := getAppliedView(t, s)
+	if got.Applied {
+		t.Error("applied should be false when the reload failed")
+	}
+	if !strings.Contains(got.ApplyError, "exploded") {
+		t.Errorf("applyError %q should carry the reason", got.ApplyError)
+	}
+}
+
+func TestRestartRequiredWhenTheDashboardPortMoved(t *testing.T) {
+	s, _ := serverWithPaths(t, baseConfig)
+	// Start records the port it actually bound. Simulate that without
+	// binding, so the test does not need a free port.
+	s.boundPort = 8484
+
+	if getAppliedView(t, s).RestartRequired {
+		t.Error("no restart needed: the config port matches the bound port")
+	}
+
+	version := getConfig(t, s).Version
+	if w := write(t, s, "PATCH", "/api/config",
+		`{"dashboardPort":9000,"version":"`+version+`"}`); w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body)
+	}
+	if !getAppliedView(t, s).RestartRequired {
+		t.Error("restart should be required: the saved port is not the bound port")
+	}
+}
+
+type appliedView struct {
+	Applied         bool   `json:"applied"`
+	ApplyError      string `json:"applyError"`
+	RestartRequired bool   `json:"restartRequired"`
+}
+
+func getAppliedView(t *testing.T, s *Server) appliedView {
+	t.Helper()
+	w := do(s, "GET", "/api/config", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body)
+	}
+	var out appliedView
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	return out
 }
