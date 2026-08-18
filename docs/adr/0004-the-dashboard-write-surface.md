@@ -175,10 +175,26 @@ the loopback port, but the browser will not let it read the answer, because
 there is no `Access-Control-Allow-Origin` on the response. A read's damage
 needs the response. A write's damage is done by the request.
 
+### What the write surface covers, and what it refuses
+
+Writable: routes, `dashboard_port`, and the inspector settings.
+
+Refused, each with an error naming the command to run instead: `suffix`,
+`dns_port`, `http_port` and `https_port`. See `sudoTierRefusal`.
+
+The suffix and `dns_port` are refused for the same reason as each other.
+Changing the suffix rewrites `/etc/resolver` and re-issues the CA, and
+`dns_port` is written into that resolver file. Both need sudo, so an
+endpoint that accepted them would be writing a value nothing could act on
+until the user ran a privileged command anyway.
+
+`dashboard_port` is writable but is not free. See "A `dashboard_port` edit
+breaks the canonical URL before the restart" under Consequences.
+
 ### The privileged ports stay out
 
-The write surface covers routes, the suffix, and the inspector settings. It
-does not cover `https_port` or `http_port`.
+`http_port` and `https_port` are the two refusals with a security argument
+behind them rather than a practical one.
 
 ADR 0001 settled why. The privileged parent binds 80 and 443, hardcoded, and
 reads the user's config never. "Root will bind whatever port you name" is a
@@ -252,12 +268,49 @@ is the right shape for this too. Persisting the token to disk would fix the
 tab and give up the only property the token has, since every local process
 could then read it.
 
+### A `dashboard_port` edit breaks the canonical URL before the restart
+
+This is the one writable field whose edit does damage on the way to being
+applied, and it is written down because the code does not currently prevent
+it.
+
+`proxy.Generate` builds Caddy's catch-all dashboard upstream from
+`cfg.EffDashboardPort()`. The dashboard's own listener, meanwhile, binds
+once in `Start` and a reload rebinds nothing. So the moment the config
+reload lands, Caddy proxies `https://switchboard.<suffix>` to the newly
+configured port, where nothing is listening, and the canonical URL 502s.
+Not after the restart. Immediately, and the restart is what fixes it.
+
+`applied` stays true through this, correctly: `proxy.Load` succeeded and the
+daemon really is running the file as written. The mismatch is between two
+things that are each doing what the file says.
+
+`http://127.0.0.1:<old port>` keeps working throughout, because that is the
+socket that exists, and `sameOriginStrict` compares against the bound port
+for exactly this reason. So the break-glass path this ADR spends its Reads
+section defending is also the recovery path for this.
+
+The right fix is to generate the upstream from the port the dashboard
+actually bound rather than from the config, which makes the two agree by
+construction. That belongs in `internal/proxy` and is its own change. Until
+it lands, `restartRequired` carries a `restartReason` naming the consequence
+and the URL that still works, so the banner says what is broken rather than
+only that something is.
+
 ### A new write route cannot skip the wrapper by accident
 
 `TestEveryMutatingRouteRejectsABadWrite` walks `routes()` and fires six
 hostile requests at every entry marked `mutating`. A route added without
 `mutate` fails by construction, not because somebody remembered to add a
 case.
+
+The flag that walk depends on is itself checked, which is what makes
+"by construction" true rather than nearly true. A route marked `mutating`
+and missing `mutate` fails that test; a route that changes state and was
+never marked at all would be invisible to it, so
+`TestEveryGuardedRouteRejectsAForeignHost` asserts that every entry serving
+a method other than `GET` carries the flag. Forgetting the wrapper and
+forgetting the flag both fail.
 
 The test also fails outright when it finds no mutating routes. A guard test
 that passes because it checked nothing is worse than no test at all, and this

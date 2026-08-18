@@ -391,8 +391,29 @@ func TestRestartRequiredWhenTheDashboardPortMoved(t *testing.T) {
 		`{"dashboardPort":9000,"version":"`+version+`"}`); w.Code != http.StatusOK {
 		t.Fatalf("status %d: %s", w.Code, w.Body)
 	}
-	if !getAppliedView(t, s).RestartRequired {
+	got := getAppliedView(t, s)
+	if !got.RestartRequired {
 		t.Error("restart should be required: the saved port is not the bound port")
+	}
+	// The reason is not decoration. The edit breaks https://switchboard.test
+	// as soon as the proxy reloads, before any restart, and the only URL
+	// still working is the old loopback port. A banner that says "restart
+	// required" and nothing else leaves the user to find that out by
+	// hitting a 502 on the URL they always use.
+	for _, want := range []string{"9000", "8484", "switchboard.test", "127.0.0.1:8484"} {
+		if !strings.Contains(got.RestartReason, want) {
+			t.Errorf("restartReason should mention %q, got: %s", want, got.RestartReason)
+		}
+	}
+}
+
+// No restart, no reason. An empty banner string is what tells a client
+// there is nothing to show.
+func TestRestartReasonIsEmptyWhenThePortMatches(t *testing.T) {
+	s, _ := serverWithPaths(t, baseConfig)
+	s.boundPort = config.DefaultDashboardPort
+	if got := getAppliedView(t, s); got.RestartReason != "" {
+		t.Errorf("restartReason = %q, want empty", got.RestartReason)
 	}
 }
 
@@ -400,6 +421,7 @@ type appliedView struct {
 	Applied         bool   `json:"applied"`
 	ApplyError      string `json:"applyError"`
 	RestartRequired bool   `json:"restartRequired"`
+	RestartReason   string `json:"restartReason"`
 }
 
 func getAppliedView(t *testing.T, s *Server) appliedView {

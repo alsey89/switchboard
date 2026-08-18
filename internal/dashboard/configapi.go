@@ -31,9 +31,21 @@ type configView struct {
 	Applied         bool   `json:"applied"`
 	ApplyError      string `json:"applyError,omitempty"`
 	RestartRequired bool   `json:"restartRequired"`
+	// RestartReason says what is broken until the restart happens. A banner
+	// that only says "restart required" leaves the user to discover the
+	// consequence by hitting it, and the consequence here is that the
+	// canonical dashboard URL stops working.
+	RestartReason string `json:"restartReason,omitempty"`
 }
 
-// effectiveView is what the daemon runs with, defaults resolved.
+// effectiveView is the config with defaults resolved.
+//
+// Not "what the daemon runs with". For every field but one it is the same
+// thing, and dashboardPort is the exception: the listener binds once at
+// startup and a port edit rebinds nothing, so after such an edit this
+// reports the number in the file while the daemon is still serving the old
+// one. s.boundPort is the port that is actually being served, and
+// restartRequired below is how the difference is reported.
 type effectiveView struct {
 	HTTPPort      int `json:"httpPort"`
 	HTTPSPort     int `json:"httpsPort"`
@@ -103,7 +115,25 @@ func (s *Server) newConfigView(cfg *config.Config, version string) configView {
 	// The dashboard cannot rebind its own listener mid-request without
 	// killing the request it is answering, so a port change is a banner and
 	// a button, not something that happens on save.
-	v.RestartRequired = s.boundPort != 0 && cfg.EffDashboardPort() != s.boundPort
+	//
+	// The banner has to say what is broken, not just that something is. A
+	// dashboard_port edit does not wait politely for the restart: the proxy
+	// reload builds Caddy's dashboard upstream from the configured port, so
+	// the moment the reload lands, https://switchboard.<suffix> is proxied
+	// to a port nothing is listening on and answers 502. The daemon's own
+	// listener is still on the old port, so http://127.0.0.1:<old> keeps
+	// working, and that is the URL the user needs to be told about. Nothing
+	// reports this as an apply failure, because proxy.Load did succeed.
+	if s.boundPort != 0 && cfg.EffDashboardPort() != s.boundPort {
+		v.RestartRequired = true
+		v.RestartReason = fmt.Sprintf(
+			"dashboard_port is %d in the config but the dashboard is still listening on %d, "+
+				"because the listener binds once at startup. Until the daemon restarts, "+
+				"https://%s is proxied to port %d and will not answer. Reach the dashboard "+
+				"at http://127.0.0.1:%d in the meantime.",
+			cfg.EffDashboardPort(), s.boundPort, cfg.DashboardDomain(),
+			cfg.EffDashboardPort(), s.boundPort)
+	}
 
 	return v
 }
