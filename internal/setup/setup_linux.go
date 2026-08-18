@@ -6,13 +6,13 @@ import (
 	"io"
 )
 
-// Linux automation lands in v0.5 (see DESIGN.md §5): there is no
+// Linux automation lands in v0.6 (see DESIGN.md §5): there is no
 // /etc/resolver equivalent, so split-DNS needs systemd-resolved or dnsmasq
 // integration. Until then, setup prints exact manual steps instead of
 // failing opaquely.
 
 // AuthNotice describes the authorization prompts setup will produce. Linux
-// automation is not implemented yet (v0.5), so setup prints manual steps
+// automation is not implemented yet (v0.6), so setup prints manual steps
 // rather than elevating anything itself.
 // systemSetupPresent reports whether anything setup installed is still on
 // the machine. Automation is not implemented on this platform yet, so setup
@@ -22,7 +22,7 @@ func systemSetupPresent(*config.Config, string) bool { return false }
 func AuthNotice() []string { return nil }
 
 func installResolver(suffix string, dnsPort int, out io.Writer) ([]string, error) {
-	fmt.Fprintf(out, `  Linux DNS automation is planned for v0.5. Manual options until then:
+	fmt.Fprintf(out, `  Linux DNS automation is planned for v0.6. Manual options until then:
 
   systemd-resolved (most desktop distros):
     1. create /etc/systemd/resolved.conf.d/switchboard.conf with:
@@ -45,7 +45,7 @@ func removeResolver(suffix string, out io.Writer) error {
 }
 
 func installTrust(rootPath string, out io.Writer) ([]string, error) {
-	fmt.Fprintf(out, `  Linux trust-store automation is planned for v0.5. Manual steps:
+	fmt.Fprintf(out, `  Linux trust-store automation is planned for v0.6. Manual steps:
 
   Debian/Ubuntu:
     sudo cp %s /usr/local/share/ca-certificates/switchboard-root.crt

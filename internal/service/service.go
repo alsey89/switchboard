@@ -27,7 +27,7 @@ const Label = "io.github.alsey89.switchboard"
 const SystemLogPath = "/Library/Logs/switchboard.log"
 
 // ErrUnsupported is returned by every entry point on platforms without
-// service automation yet — Windows (v0.4) and Linux (v0.5); see DESIGN.md §6.
+// service automation yet — Windows (v0.5) and Linux (v0.6); see DESIGN.md §6.
 // Exported so callers doing a best-effort teardown (`switchboard uninstall`)
 // can tell "there is no service manager here" apart from a real failure.
 var ErrUnsupported = errors.New(

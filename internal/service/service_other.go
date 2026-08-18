@@ -7,8 +7,8 @@ import (
 )
 
 // Every entry point returns ErrUnsupported (declared in service.go, so
-// callers can errors.Is against it on every platform) until Windows (v0.4)
-// and Linux (v0.5) land; see DESIGN.md §6.
+// callers can errors.Is against it on every platform) until Windows (v0.5)
+// and Linux (v0.6) land; see DESIGN.md §6.
 
 func PlistPath() (string, error) { return "", ErrUnsupported }
 

@@ -1,6 +1,6 @@
 # Switchboard — Design Document
 
-> Status: revision 4 — v0.1 and v0.2 (§3, §6) are implemented in this repo,
+> Status: revision 5 — v0.1 through v0.4 (§3, §6) are implemented in this repo,
 > including the privileged-port resolution (ADR 0001/0002) and the
 > name-constrained local CA (ADR 0003). Supersedes the pure-Rust plan
 > (preserved in git history at fe3533d if ever needed).
@@ -321,7 +321,7 @@ holds privilege in either shape. That is the property the whole design is
 arranged around, and it is why the root component is a ~150-line socket
 binder rather than the daemon with a `UserName` key in a plist.
 
-### Windows (v0.4) — NRPT is the /etc/resolver equivalent
+### Windows (v0.5) — NRPT is the /etc/resolver equivalent
 
 - `Add-DnsClientNrptRule -Namespace ".test" -NameServers 127.0.0.1`
   (admin, one-time). Caveat: NRPT has no port field → we must bind
@@ -332,7 +332,7 @@ binder rather than the daemon with a `UserName` key in a plist.
   edition.
 - No low-port restriction on Windows; trust install covered by Caddy.
 
-### Linux (v0.5) — the messy one, deliberately last
+### Linux (v0.6) — the messy one, deliberately last
 
 - No `/etc/resolver`. Options, in preference order: `systemd-resolved`
   split-DNS (per-link DNS + `~test` routing domain), `dnsmasq` drop-in
@@ -355,8 +355,9 @@ binder rather than the daemon with a `UserName` key in a plist.
 | **v0.1** | macOS. CLI + daemon: DNS, embedded Caddy (proxy + HTTPS + trust), `setup`/`add`/`rm`/`ls`/`doctor`, hot-reload config. **The whole point, shippable alone.** |
 | **v0.2** | Apache-2.0 license; `.internal` and user-owned domain suffixes; dashboard reachable on loopback; websocket/HMR integration test; **launchd agent (`switchboard daemon install`)**; Homebrew distribution. |
 | **v0.3** | Inspector: custom Caddy handler module captures method/URL/headers/bodies → SQLite ring buffer → live feed. Dashboard matured (inspector split-pane). Route add/remove moved out: it turns the dashboard into a write surface and needs its own origin and auth design. Best demo material. **Constraint, decided now rather than after the schema exists: request and response bodies are captured only when explicitly enabled, never by default.** The inspector records the user's own dev traffic — auth headers, session cookies, request payloads — to disk, and a ring buffer means it persists past the moment they were looking at it. Metadata by default is useful; bodies by default is a credential store nobody asked for. |
-| **v0.4** | Windows (NRPT + hosts-block fallback). |
-| **v0.5** | Linux (resolved/dnsmasq + setcap). |
+| **v0.4** | The dashboard becomes the request console. `/` opens the inspector; routes become a rail that doubles as the domain filter; `/inspect` redirects. Copy a request as `curl`, keyboard control, marked redaction, a fold for narrow windows. Taken ahead of Windows because v0.3 shipped the inspector behind a grey footer link and almost nobody would have found it. |
+| **v0.5** | Windows (NRPT + hosts-block fallback). |
+| **v0.6** | Linux (resolved/dnsmasq + setcap). |
 | **v1.x** | Tunnels: OSS self-hostable relay first (candidates to embed or crib: `frp`, `chisel` — embeddable Go lib — or custom on `yamux`); hosted paid tier only on traction. mDNS/Bonjour LAN sharing (`myapp.local` to your phone) as a separate opt-in feature — note mDNS can't do wildcards and only `.local`. |
 
 Failure mode being avoided: building tunnels (hardest, costs money, weakest
