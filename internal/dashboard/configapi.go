@@ -7,6 +7,7 @@ package dashboard
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"sync"
 
@@ -259,6 +260,32 @@ func sudoTierRefusal(field string) error {
 	}
 }
 
+// checkDashboardPort refuses a dashboard_port this daemon could not bind.
+//
+// config.Validate already rejects a number outside 1-65535, for everyone.
+// This adds the privileged range, and only for this endpoint, because the
+// two refusals protect against different things. A low port saved here is
+// unrecoverable in a way a hand edit is not: the reload takes the dashboard
+// down, and the dashboard is the window the user just made the change in,
+// so the GUI cannot undo its own write. The same value in a config file is
+// undone by opening the file again.
+//
+// Putting this rule in Validate would make an existing config with a low
+// dashboard_port unloadable, which breaks the daemon, the CLI and doctor
+// all at once. That is a worse failure than the one being prevented.
+//
+// Zero is allowed through: it is not a low port, it is the field unset, and
+// it resolves to the default the daemon binds today. A negative number is
+// left to Validate as well, so it gets the message that fits it.
+func checkDashboardPort(port int) error {
+	if port > 0 && port < 1024 {
+		return fmt.Errorf("dashboard_port %d is below 1024, and the daemon runs as you "+
+			"rather than as root, so it could not bind it. The reload would take the "+
+			"dashboard down and this page with it. Choose a port above 1024", port)
+	}
+	return nil
+}
+
 func (s *Server) handleConfigPatch(w http.ResponseWriter, r *http.Request) {
 	var in configPatch
 	if !decodeBody(w, r, &in) {
@@ -274,6 +301,9 @@ func (s *Server) handleConfigPatch(w http.ResponseWriter, r *http.Request) {
 			return sudoTierRefusal("ports")
 		}
 		if in.DashboardPort != nil {
+			if err := checkDashboardPort(*in.DashboardPort); err != nil {
+				return err
+			}
 			cfg.DashboardPort = *in.DashboardPort
 		}
 		if in.Inspect != nil {

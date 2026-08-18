@@ -3,6 +3,7 @@ package dashboard
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -233,6 +234,58 @@ func TestPatchConfigRefusesTheSudoTier(t *testing.T) {
 				t.Errorf("the error should name the CLI command to use, got: %s", w.Body)
 			}
 		})
+	}
+}
+
+// A port the daemon cannot bind must be refused before it reaches the file.
+// Saving one is a one-way door: the reload kills the dashboard, and the
+// dashboard is the only place the write could be undone from.
+func TestPatchConfigRefusesAnUnbindablePort(t *testing.T) {
+	for name, tc := range map[string]struct {
+		port int
+		want string
+	}{
+		"privileged":   {80, "1024"},
+		"just below":   {1023, "1024"},
+		"out of range": {70000, "out of range"},
+		"negative":     {-1, "out of range"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, _ := serverWithPaths(t, baseConfig)
+			before := getConfig(t, s)
+
+			w := write(t, s, "PATCH", "/api/config",
+				fmt.Sprintf(`{"dashboardPort":%d,"version":%q}`, tc.port, before.Version))
+			if w.Code != http.StatusUnprocessableEntity {
+				t.Fatalf("status %d, want 422: %s", w.Code, w.Body)
+			}
+			if !strings.Contains(w.Body.String(), tc.want) {
+				t.Errorf("the refusal should mention %q, got: %s", tc.want, w.Body)
+			}
+			if getConfig(t, s).Version != before.Version {
+				t.Error("the file changed despite the refusal")
+			}
+		})
+	}
+}
+
+// Zero is the field unset, not a low port, and it resolves to the default
+// the daemon is already binding. Refusing it would leave a settings form
+// with no way to clear the field.
+func TestPatchConfigAcceptsZeroAsUnset(t *testing.T) {
+	s, _ := serverWithPaths(t, "suffix = \"test\"\ndashboard_port = 9000\n")
+	version := getConfig(t, s).Version
+
+	if w := write(t, s, "PATCH", "/api/config",
+		`{"dashboardPort":0,"version":"`+version+`"}`); w.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200: %s", w.Code, w.Body)
+	}
+	out := getConfig(t, s)
+	if out.Ports.DashboardPort != 0 {
+		t.Errorf("file dashboard port %d, want 0 (cleared)", out.Ports.DashboardPort)
+	}
+	if out.Effective.DashboardPort != config.DefaultDashboardPort {
+		t.Errorf("effective dashboard port %d, want the default", out.Effective.DashboardPort)
 	}
 }
 

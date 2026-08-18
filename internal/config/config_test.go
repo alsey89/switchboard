@@ -116,6 +116,44 @@ func TestValidateRoutes(t *testing.T) {
 	}
 }
 
+// A port outside 1-65535 cannot be bound by anything, so it is caught at
+// load time rather than at net.Listen, where the daemon has already started
+// tearing itself down. Zero is the field unset and must stay valid.
+func TestValidateRejectsImpossiblePorts(t *testing.T) {
+	for name, c := range map[string]*Config{
+		"http too high":      {Suffix: "test", HTTPPort: 70000},
+		"https too high":     {Suffix: "test", HTTPSPort: 65536},
+		"dns negative":       {Suffix: "test", DNSPort: -1},
+		"dashboard too high": {Suffix: "test", DashboardPort: 99999},
+		"dashboard negative": {Suffix: "test", DashboardPort: -8484},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := c.Validate()
+			if err == nil {
+				t.Fatal("expected an error, got none")
+			}
+			if !strings.Contains(err.Error(), "out of range") {
+				t.Errorf("error should say the port is out of range, got: %v", err)
+			}
+		})
+	}
+
+	// Unset ports and a privileged one both load. The low port is the case
+	// worth pinning: the dashboard's PATCH endpoint refuses it, and moving
+	// that rule here would make an existing config unreadable.
+	for name, c := range map[string]*Config{
+		"all unset":          {Suffix: "test"},
+		"privileged is fine": {Suffix: "test", DashboardPort: 80, HTTPSPort: 443},
+		"top of the range":   {Suffix: "test", DashboardPort: 65535},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := c.Validate(); err != nil {
+				t.Errorf("valid config rejected: %v", err)
+			}
+		})
+	}
+}
+
 func TestSaveLoadRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
 	c := &Config{Suffix: "test", Routes: []Route{

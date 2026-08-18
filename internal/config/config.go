@@ -249,6 +249,9 @@ func (c *Config) Validate() error {
 	if err := validateSuffix(c.Suffix); err != nil {
 		return err
 	}
+	if err := c.validatePorts(); err != nil {
+		return err
+	}
 	seen := map[string]bool{}
 	for i := range c.Routes {
 		r := &c.Routes[i]
@@ -273,6 +276,35 @@ func (c *Config) Validate() error {
 	}
 	if err := c.Inspect.validate(); err != nil {
 		return fmt.Errorf("inspect: %w", err)
+	}
+	return nil
+}
+
+// validatePorts rejects a port number no listener could ever take.
+//
+// Only the impossible range, deliberately. A port below 1024 is refusable
+// where the refusal can be undone, which is the dashboard's PATCH endpoint
+// and not here: this runs on every load, so rejecting a low port would turn
+// a config someone already has into one the daemon will not read at all.
+// Out of range is different. There is no machine on which 70000 works, so
+// no existing config can be relying on it, and catching it at load time is
+// what stops the daemon starting up only to die on net.Listen.
+//
+// Zero is not a port here, it is the field unset, and every unset port
+// resolves to its default through the Eff accessors.
+func (c *Config) validatePorts() error {
+	for _, p := range []struct {
+		key   string
+		value int
+	}{
+		{"http_port", c.HTTPPort},
+		{"https_port", c.HTTPSPort},
+		{"dns_port", c.DNSPort},
+		{"dashboard_port", c.DashboardPort},
+	} {
+		if p.value != 0 && (p.value < 1 || p.value > 65535) {
+			return fmt.Errorf("%s %d is out of range: a port is 1-65535", p.key, p.value)
+		}
 	}
 	return nil
 }
