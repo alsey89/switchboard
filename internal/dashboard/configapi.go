@@ -7,6 +7,7 @@ package dashboard
 import (
 	"encoding/json"
 	"net/http"
+	"sync"
 
 	"github.com/alsey89/switchboard/internal/config"
 )
@@ -110,4 +111,72 @@ func (s *Server) writeConfigView(w http.ResponseWriter, status int) bool {
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	s.writeConfigView(w, http.StatusOK)
+}
+
+// writeMu serializes config writes from this process.
+//
+// It cannot serialize against the CLI, which does its own read-modify-write
+// on the same file. That is what the version is for. A CLI write between a
+// client's read and its write is caught by the version compare below. A CLI
+// write inside this critical section is not, but that window is microseconds
+// and the CLI is human paced. Named here so nobody mistakes it for an
+// oversight and reaches for a lock file.
+var writeMu sync.Mutex
+
+// withConfig runs edit against a freshly read config, under the write lock,
+// and saves the result. Every write endpoint goes through it, so no
+// individual handler can forget the version guard.
+//
+// A stale version answers 409 with the current config in the body. The
+// client has to re-render anyway, and making it fetch again is a round trip
+// for information this response is already holding.
+//
+// Returns whether the write succeeded. On false it has already answered.
+func (s *Server) withConfig(w http.ResponseWriter, wantVersion string, edit func(*config.Config) error) bool {
+	p, ok := s.pathsOr503(w)
+	if !ok {
+		return false
+	}
+
+	writeMu.Lock()
+	defer writeMu.Unlock()
+
+	cfg, version, err := config.LoadWithVersion(p.configPath)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return false
+	}
+	if wantVersion != version {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(s.newConfigView(cfg, version)) //nolint:errcheck
+		return false
+	}
+	if err := edit(cfg); err != nil {
+		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+		return false
+	}
+	// Validate explicitly before Save. Save validates too, but it returns
+	// one error for both a bad edit and a filesystem failure, and those are
+	// a 422 and a 500 respectively.
+	if err := cfg.Validate(); err != nil {
+		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+		return false
+	}
+	if err := cfg.Save(p.configPath); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return false
+	}
+	return true
+}
+
+// decodeBody reads a JSON request body with a size cap. A config write is
+// never large, and an uncapped decoder on a loopback listener is still an
+// uncapped decoder.
+func decodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(v); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return false
+	}
+	return true
 }
