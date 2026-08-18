@@ -124,6 +124,7 @@ func Run(ctx context.Context, opts Options) error {
 
 	// Dashboard.
 	dash := dashboard.New(cfg, opts.Version)
+	dash.SetPaths(opts.ConfigPath, opts.DataDir)
 	dashBind := net.JoinHostPort("127.0.0.1", strconv.Itoa(cfg.EffDashboardPort()))
 	if err := dash.Start(dashBind); err != nil {
 		return friendlyBindError(err, "dashboard", dashBind, opts.ConfigPath)
