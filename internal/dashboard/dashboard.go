@@ -127,6 +127,7 @@ func (s *Server) routes() []routeEntry {
 	return []routeEntry{
 		{pattern: "/api/routes", handler: s.guard(s.handleAPIRoutes), guarded: true},
 		{pattern: "/api/doctor", handler: s.guard(s.handleDoctor), guarded: true},
+		{pattern: "/api/service", handler: s.guard(s.handleService), guarded: true},
 		{pattern: "/api/inspect/requests", handler: s.guard(s.handleInspectRequests), guarded: true},
 		{pattern: "/api/inspect/requests/", handler: s.guard(s.handleInspectRecord), guarded: true},
 		{pattern: "/api/inspect/clear", handler: s.guard(s.handleInspectClear), guarded: true},

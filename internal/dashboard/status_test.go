@@ -92,3 +92,28 @@ func TestDoctorIs503WithoutPaths(t *testing.T) {
 		t.Fatalf("status %d, want 503", w.Code)
 	}
 }
+
+// service.Status shells out to launchctl and is macOS-only. On every other
+// platform it returns an error alongside NotInstalled, and callers must
+// check the error first. The endpoint must report that as "unsupported"
+// rather than as a 500, because a Linux user is not experiencing a failure.
+func TestServiceEndpointAlwaysAnswers(t *testing.T) {
+	s, _ := serverWithPaths(t, "suffix = \"test\"\n")
+
+	w := do(s, "GET", "/api/service", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200: %s", w.Code, w.Body)
+	}
+
+	var out struct {
+		State     string `json:"state"`
+		PlistPath string `json:"plistPath"`
+		Supported bool   `json:"supported"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.State == "" {
+		t.Error("state should always be populated, even when unsupported")
+	}
+}

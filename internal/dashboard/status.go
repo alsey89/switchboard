@@ -8,6 +8,7 @@ import (
 
 	"github.com/alsey89/switchboard/internal/config"
 	"github.com/alsey89/switchboard/internal/doctor"
+	"github.com/alsey89/switchboard/internal/service"
 )
 
 // checkView is one doctor.Check on the wire. Status goes out as its string,
@@ -41,4 +42,29 @@ func (s *Server) handleDoctor(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, out)
+}
+
+// serviceView is what the dashboard knows about the background service.
+//
+// Supported exists because service.Status is macOS-only. Everywhere else it
+// returns an error next to NotInstalled, and that is not a failure the user
+// caused or can act on. A Linux user should see "not supported here", not a
+// red 500.
+type serviceView struct {
+	State     string `json:"state"`
+	PlistPath string `json:"plistPath,omitempty"`
+	Supported bool   `json:"supported"`
+}
+
+func (s *Server) handleService(w http.ResponseWriter, r *http.Request) {
+	state, plistPath, err := service.Status()
+	if err != nil {
+		writeJSON(w, serviceView{State: "not supported on this platform"})
+		return
+	}
+	writeJSON(w, serviceView{
+		State:     state.String(),
+		PlistPath: plistPath,
+		Supported: true,
+	})
 }
