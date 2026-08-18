@@ -1,9 +1,11 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -169,6 +171,75 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	}
 	if len(got.Routes) != 2 || got.Routes[0].Domain != "app.test" || got.Routes[1].Upstream != "127.0.0.1:9999" {
 		t.Errorf("round trip mismatch: %+v", got)
+	}
+}
+
+// TestConcurrentSavesPublishOneWholeFile races writers of very different
+// lengths, which is the shape that used to tear. With one shared
+// config.toml.tmp both wrote from offset zero on separate descriptors, so
+// the long writer's tail outlived the short writer's content and the rename
+// published a file that was half of each. Every read here must parse and
+// must be one of the two configs, never a splice.
+func TestConcurrentSavesPublishOneWholeFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+
+	// A fresh Config per writer, because Validate normalizes route domains
+	// in place. Two goroutines sharing one *Config would race on the struct
+	// rather than on the file, which is not the thing under test. Separate
+	// processes each have their own anyway.
+	const shortRoutes, longRoutes = 1, 200
+	mk := func(n int) *Config {
+		c := &Config{Suffix: "test"}
+		for i := 0; i < n; i++ {
+			c.Routes = append(c.Routes, Route{
+				Domain: fmt.Sprintf("r%03d.test", i), Port: 4000 + i,
+			})
+		}
+		return c
+	}
+	if err := mk(longRoutes).Save(path); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		for _, n := range []int{shortRoutes, longRoutes} {
+			wg.Add(1)
+			go func(n int) {
+				defer wg.Done()
+				if err := mk(n).Save(path); err != nil {
+					t.Errorf("Save: %v", err)
+				}
+			}(n)
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			got, err := Load(path)
+			if err != nil {
+				t.Errorf("Load saw a file that does not parse: %v", err)
+				return
+			}
+			if len(got.Routes) != shortRoutes && len(got.Routes) != longRoutes {
+				t.Errorf("Load saw %d routes, want one of the two whole configs",
+					len(got.Routes))
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Nothing may be left over. A temp file per writer is only correct if
+	// each one is cleaned up, and a directory that fills with them is the
+	// obvious way for this fix to go wrong.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name() != "config.toml" {
+			t.Errorf("left behind %q", e.Name())
+		}
 	}
 }
 

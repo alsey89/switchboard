@@ -224,11 +224,23 @@ func decode(b []byte, path string) (*Config, error) {
 
 // Save writes the config atomically (write temp + rename), creating the
 // directory if needed.
+//
+// The temp file gets a unique name, from os.CreateTemp, rather than the
+// fixed path+".tmp" it used to use. A fixed name is not private to one
+// writer. The daemon's own write mutex serializes writers inside the
+// daemon, and the version hash catches a CLI write landing between a
+// client's read and its write, but neither covers two processes calling
+// Save at the same instant: both opened the same config.toml.tmp, both
+// wrote from offset zero on their own descriptor, and the longer content's
+// tail survived past the end of the shorter one. The rename then published
+// a file that is half of each. A name only this call knows makes each
+// rename publish bytes only this call wrote.
 func (c *Config) Save(path string) error {
 	if err := c.Validate(); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 	var sb strings.Builder
@@ -237,11 +249,43 @@ func (c *Config) Save(path string) error {
 	if err := toml.NewEncoder(&sb).Encode(c); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(sb.String()), 0o644); err != nil {
+
+	// Same directory as the target, so the rename stays on one filesystem
+	// and therefore stays atomic. The ".toml" tail is for the human who
+	// finds one of these left behind after a crash.
+	f, err := os.CreateTemp(dir, "config.*.toml")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	tmp := f.Name()
+	// Every path out of here that is not the rename leaves a file behind
+	// otherwise, and nothing else ever cleans this directory up. Cleared
+	// once the rename has succeeded, because at that point the name refers
+	// to the real config file.
+	defer func() {
+		if tmp != "" {
+			os.Remove(tmp) //nolint:errcheck
+		}
+	}()
+
+	if _, err := f.WriteString(sb.String()); err != nil {
+		f.Close() //nolint:errcheck // the write error is the one worth reporting
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	// CreateTemp makes the file 0600. The config is not a secret and was
+	// 0644 before this, so restore that rather than silently tightening a
+	// permission on a file the user may be reading with another tool.
+	if err := os.Chmod(tmp, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	tmp = ""
+	return nil
 }
 
 // Validate checks the whole config for consistency.
