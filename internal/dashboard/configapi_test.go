@@ -24,9 +24,19 @@ type readConfigView struct {
 		DNSPort       int `json:"dnsPort"`
 		DashboardPort int `json:"dashboardPort"`
 	} `json:"effective"`
+	Ports struct {
+		HTTPPort      int `json:"httpPort"`
+		HTTPSPort     int `json:"httpsPort"`
+		DNSPort       int `json:"dnsPort"`
+		DashboardPort int `json:"dashboardPort"`
+	} `json:"ports"`
 	Inspect struct {
-		Enabled bool `json:"enabled"`
-		Bodies  bool `json:"bodies"`
+		Enabled      bool   `json:"enabled"`
+		Bodies       bool   `json:"bodies"`
+		MaxRequests  int    `json:"maxRequests"`
+		MaxBytes     int64  `json:"maxBytes"`
+		MaxBodyBytes int    `json:"maxBodyBytes"`
+		MaxAge       string `json:"maxAge"`
 	} `json:"inspect"`
 }
 
@@ -73,10 +83,50 @@ func TestConfigEndpointReportsFileAndEffectiveValues(t *testing.T) {
 	if out.Effective.DashboardPort != config.DefaultDashboardPort {
 		t.Errorf("dashboard port %d, want %d", out.Effective.DashboardPort, config.DefaultDashboardPort)
 	}
+	// Ports is what the file literally says, so an unset port is zero here
+	// even though Effective resolved it to a default. Asserting both halves
+	// is the point: a Ports that merely echoed Effective would be useless to
+	// a settings form, and would pass a test that only checked Effective.
+	if out.Ports.DashboardPort != 0 {
+		t.Errorf("file dashboard port %d, want 0 (unset in the file)", out.Ports.DashboardPort)
+	}
+	if out.Ports.HTTPSPort != 0 {
+		t.Errorf("file https port %d, want 0 (unset in the file)", out.Ports.HTTPSPort)
+	}
 	// Inspect defaults to on. A plain bool cannot tell unset from off, which
 	// is why config uses a pointer, and the endpoint must resolve it.
 	if !out.Inspect.Enabled {
 		t.Error("inspect should default to enabled")
+	}
+	// The file has no [inspect] block, so every numeric field must come back
+	// as the package default rather than the zero value a missing block
+	// would otherwise produce.
+	if out.Inspect.MaxRequests != config.DefaultInspectMaxRequests {
+		t.Errorf("max requests %d, want %d", out.Inspect.MaxRequests, config.DefaultInspectMaxRequests)
+	}
+	if out.Inspect.MaxBytes != config.DefaultInspectMaxBytes {
+		t.Errorf("max bytes %d, want %d", out.Inspect.MaxBytes, config.DefaultInspectMaxBytes)
+	}
+	if out.Inspect.MaxBodyBytes != config.DefaultInspectMaxBodyBytes {
+		t.Errorf("max body bytes %d, want %d", out.Inspect.MaxBodyBytes, config.DefaultInspectMaxBodyBytes)
+	}
+	if out.Inspect.MaxAge != config.DefaultInspectMaxAge.String() {
+		t.Errorf("max age %q, want %q", out.Inspect.MaxAge, config.DefaultInspectMaxAge.String())
+	}
+}
+
+// A port set in the file appears in Ports as written and in Effective as
+// resolved. With no port set the two differ by construction, so this is the
+// case that proves Ports is read from the file rather than zeroed.
+func TestConfigEndpointReportsAnExplicitPort(t *testing.T) {
+	s, _ := serverWithPaths(t, "suffix = \"test\"\ndashboard_port = 9999\n")
+
+	out := getConfig(t, s)
+	if out.Ports.DashboardPort != 9999 {
+		t.Errorf("file dashboard port %d, want 9999", out.Ports.DashboardPort)
+	}
+	if out.Effective.DashboardPort != 9999 {
+		t.Errorf("effective dashboard port %d, want 9999", out.Effective.DashboardPort)
 	}
 }
 
