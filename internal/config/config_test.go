@@ -300,3 +300,72 @@ func TestInspectRejectsBadSettings(t *testing.T) {
 		})
 	}
 }
+
+func TestVersionChangesWithContent(t *testing.T) {
+	a := Version([]byte("suffix = \"test\"\n"))
+	b := Version([]byte("suffix = \"test\"\n\n"))
+	if a == b {
+		t.Fatal("different bytes produced the same version")
+	}
+	if a != Version([]byte("suffix = \"test\"\n")) {
+		t.Fatal("the same bytes produced different versions")
+	}
+	if len(a) != 16 {
+		t.Fatalf("version is %d chars, want 16", len(a))
+	}
+}
+
+func TestLoadWithVersionMatchesLoad(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	body := "suffix = \"test\"\n\n[[routes]]\ndomain = \"app.test\"\nport = 3000\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, version, err := LoadWithVersion(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version != Version([]byte(body)) {
+		t.Fatalf("version %q does not match the file bytes", version)
+	}
+	if len(cfg.Routes) != 1 || cfg.Routes[0].Domain != "app.test" {
+		t.Fatalf("config did not load: %+v", cfg)
+	}
+
+	// Load must stay exactly equivalent. It is called from the daemon, the
+	// CLI and doctor, and this refactor must not change any of them.
+	plain, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plain.Routes) != len(cfg.Routes) || plain.Suffix != cfg.Suffix {
+		t.Fatalf("Load and LoadWithVersion disagree: %+v vs %+v", plain, cfg)
+	}
+}
+
+// A missing file is not an error. It yields defaults and an empty version,
+// so a first write from a fresh install sends "" and matches.
+func TestLoadWithVersionMissingFile(t *testing.T) {
+	cfg, version, err := LoadWithVersion(filepath.Join(t.TempDir(), "nope.toml"))
+	if err != nil {
+		t.Fatalf("a missing file should not error: %v", err)
+	}
+	if version != "" {
+		t.Fatalf("version %q, want empty for a missing file", version)
+	}
+	if cfg.Suffix != DefaultSuffix {
+		t.Fatalf("suffix %q, want the default", cfg.Suffix)
+	}
+}
+
+func TestLoadWithVersionRejectsBrokenToml(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("this is not toml {{{"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := LoadWithVersion(path); err == nil {
+		t.Fatal("expected a parse error")
+	}
+}

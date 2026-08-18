@@ -4,6 +4,8 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -162,16 +164,51 @@ func LoadLenient(path string) (*Config, error) {
 	return &c, validateSuffix(c.Suffix)
 }
 
+// Version identifies the exact bytes of a config file. A write request
+// echoes back the version it read, so an edit made against a stale view
+// fails loudly instead of quietly clobbering someone else's change.
+//
+// Sixteen hex characters, not the full digest. This is a collision check
+// between two edits seconds apart, not a security boundary, and a short
+// value is one a human can compare in a log line.
+func Version(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])[:16]
+}
+
+// LoadWithVersion is Load plus the version of the bytes it read.
+//
+// Anything that intends to write the file back must use this rather than
+// Load followed by a separate read. The hash has to come from the same read
+// as the config, or the guard is racing the thing it exists to prevent.
+//
+// A missing file yields defaults and an empty version, matching Load's rule
+// that the tool works before `add` has ever run.
+func LoadWithVersion(path string) (*Config, string, error) {
+	b, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return Default(), "", nil
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	c, err := decode(b, path)
+	if err != nil {
+		return nil, "", err
+	}
+	return c, Version(b), nil
+}
+
 // Load reads and validates the config at path. A missing file yields the
 // default config (not an error): the tool should work before `add` runs.
 func Load(path string) (*Config, error) {
-	b, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return Default(), nil
-	}
-	if err != nil {
-		return nil, err
-	}
+	c, _, err := LoadWithVersion(path)
+	return c, err
+}
+
+// decode parses and validates config bytes. Split out so Load and
+// LoadWithVersion share one implementation and cannot drift.
+func decode(b []byte, path string) (*Config, error) {
 	var c Config
 	if _, err := toml.Decode(string(b), &c); err != nil {
 		return nil, fmt.Errorf("parsing %s: %w", path, err)
