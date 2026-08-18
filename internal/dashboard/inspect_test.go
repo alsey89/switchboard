@@ -218,22 +218,47 @@ func TestInspectEndpointsRefuseForeignHosts(t *testing.T) {
 // earlier version of this file — mux()'s route list and this test's route
 // list were two separate hand-maintained things, and only one of them got
 // updated.
+//
+// Each row is driven with its own method. Firing GET at every row looked
+// equivalent while every row served any method, and stopped being so the
+// moment method-scoped rows arrived: a GET to "POST /api/routes" is served
+// by the sibling read row, so the row under test was never entered and its
+// guard could have been deleted with this test still green.
 func TestEveryGuardedRouteRejectsAForeignHost(t *testing.T) {
 	s, r := testServer(t)
 	seed(t, r, "/x")
 
 	for _, rt := range s.routes() {
+		// Any row that serves something other than GET changes state, and a
+		// state-changing row has to carry the mutate wrapper. routes()
+		// records that as the mutating flag, and it is the flag rather than
+		// the wrapper that TestEveryMutatingRouteRejectsABadWrite walks. So
+		// an unmarked write row is invisible to that test, and this is the
+		// check that makes the flag itself impossible to forget.
+		if rt.method != "" && rt.method != http.MethodGet && !rt.mutating {
+			t.Errorf("%s %s serves a state-changing method but is not marked mutating",
+				rt.method, rt.pattern)
+		}
 		if !rt.guarded {
 			continue
 		}
-		t.Run(rt.pattern, func(t *testing.T) {
+		method := rt.method
+		if method == "" {
+			method = http.MethodGet // an entry with no method serves them all
+		}
+		t.Run(method+" "+rt.pattern, func(t *testing.T) {
 			target := rt.pattern
 			if strings.HasSuffix(target, "/") {
 				target += "1" // land inside the subtree, not just on its root
 			}
-			req := httptest.NewRequest("GET", target, nil)
+			req := httptest.NewRequest(method, target, nil)
 			req.Host = "evil.example"
+			// guard is the outermost wrapper, so a foreign Host is refused
+			// before mutate ever runs. These two headers are what a request
+			// that would otherwise pass the write checks carries, and the
+			// answer must still be 404.
 			req.Header.Set("Origin", "https://evil.example")
+			req.Header.Set(csrfHeader, s.csrf)
 			w := httptest.NewRecorder()
 			s.mux().ServeHTTP(w, req)
 
