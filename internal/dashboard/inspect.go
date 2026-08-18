@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -159,22 +158,17 @@ func (s *Server) handleInspectRecord(w http.ResponseWriter, r *http.Request) {
 
 // handleInspectClear empties the buffer.
 //
-// This is the dashboard's only state-changing endpoint, so it states its
-// rule rather than inheriting one. POST only, and Origin must be present and
-// match. An absent Origin is refused rather than trusted: browsers always
-// send it on fetch, so refusing absence closes the simple-request CSRF hole
-// that loopback alone does not.
+// It is a write, so routes() wraps it in mutate as well as guard. The origin
+// and token checks live there and are the same ones every other write gets;
+// see origin.go. All this handler still states for itself is POST only.
 //
 // What it destroys is captured traffic. No route, no trust setting, no
-// config. When route mutation lands it will need this same check, harder.
+// config. It is the smallest thing the write checks could be proved against,
+// which is why it went behind them first.
 func (s *Server) handleInspectClear(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		http.Error(w, "use POST", http.StatusMethodNotAllowed)
-		return
-	}
-	if !s.sameOrigin(r) {
-		http.Error(w, "bad origin", http.StatusForbidden)
 		return
 	}
 	rec, ok := s.recorder(w)
@@ -186,33 +180,6 @@ func (s *Server) handleInspectClear(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
-}
-
-// sameOrigin reports whether the request carries an Origin naming this
-// dashboard. A missing Origin is not same-origin.
-//
-// Loopback is trusted at any port and any scheme: http://localhost:3000
-// passes exactly as well as https://switchboard.test does. That is
-// deliberate, not an oversight — the whole premise of switchboard is
-// sitting in front of whatever dev servers are already running on
-// loopback, and pinning to one port would defeat it. But it means every
-// process listening on 127.0.0.1 sits inside the trust boundary for
-// whatever calls sameOrigin. Today the only caller is handleInspectClear,
-// so the blast radius is "can clear captured traffic" — tolerable. If a
-// future mutating route (the "harder" case handleInspectClear's comment
-// above anticipates) reuses sameOrigin for something with a bigger blast
-// radius, this port-and-scheme-blind trust needs revisiting first.
-func (s *Server) sameOrigin(r *http.Request) bool {
-	o := r.Header.Get("Origin")
-	if o == "" {
-		return false
-	}
-	u, err := url.Parse(o)
-	if err != nil {
-		return false
-	}
-	host := strings.ToLower(hostOnly(u.Host))
-	return host == s.cfg.Load().DashboardDomain() || isLoopbackHost(host)
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

@@ -44,6 +44,10 @@ type Server struct {
 	// when capture is off.
 	paths atomic.Pointer[paths]
 
+	// csrf is minted once per process and injected into the page. See
+	// origin.go.
+	csrf string
+
 	// done is closed by Shutdown, before http.Server.Shutdown runs. It is
 	// how a long-lived handler learns the server wants to stop.
 	//
@@ -58,7 +62,12 @@ type Server struct {
 }
 
 func New(cfg *config.Config, version string) *Server {
-	s := &Server{version: version, done: make(chan struct{}), probes: newProber(probeTTL)}
+	s := &Server{
+		version: version,
+		csrf:    newCSRFToken(),
+		done:    make(chan struct{}),
+		probes:  newProber(probeTTL),
+	}
 	s.cfg.Store(cfg)
 	return s
 }
@@ -131,7 +140,8 @@ func (s *Server) routes() []routeEntry {
 		{pattern: "/api/config", handler: s.guard(s.handleConfig), guarded: true},
 		{pattern: "/api/inspect/requests", handler: s.guard(s.handleInspectRequests), guarded: true},
 		{pattern: "/api/inspect/requests/", handler: s.guard(s.handleInspectRecord), guarded: true},
-		{pattern: "/api/inspect/clear", handler: s.guard(s.handleInspectClear), guarded: true},
+		{pattern: "/api/inspect/clear", handler: s.guard(s.mutate(s.handleInspectClear)),
+			guarded: true, mutating: true},
 		{pattern: "/api/inspect/stream", handler: s.guard(s.handleInspectStream), guarded: true},
 		{pattern: "/inspect", handler: s.guardPage(s.handleInspectRedirect), guarded: true},
 		// handleRoot is its own guard: it needs the "/" vs any-other-path
@@ -170,7 +180,7 @@ func (s *Server) hostAllowed(hostport string) bool {
 //
 // guard is necessary for a mutating route but not sufficient by itself —
 // see the note on isLoopbackHost below. A route that changes state must
-// also check sameOrigin (inspect.go), the way handleInspectClear does;
+// also be wrapped in mutate (origin.go), the way handleInspectClear is;
 // guard alone only proves the Host header matched, and a Host header is
 // something an attacker's page gets to send too.
 func (s *Server) guard(h http.HandlerFunc) http.HandlerFunc {
@@ -229,10 +239,13 @@ func hostOnly(hostport string) string {
 // its own domain name to 127.0.0.1 and point the browser there. Either way,
 // a POST from an attacker's page sails through a Host check by itself.
 //
-// That endpoint landed in inspect.go: handleInspectClear pairs guard with
-// sameOrigin, which requires an Origin header that is present and matches.
-// Any future mutating route must do the same — a Host check is necessary
-// for one but was never sufficient on its own.
+// A mutating route therefore pairs guard with mutate (origin.go), the way
+// handleInspectClear does. mutate wants an Origin naming the dashboard
+// itself, and a token only a page this server rendered can know. Loopback
+// at any port is not enough for a write: every dev server this proxy sits
+// in front of is on loopback too. Any future mutating route must do the
+// same. A Host check is necessary for one but was never sufficient on its
+// own.
 func isLoopbackHost(host string) bool {
 	if host == "localhost" {
 		return true
@@ -261,6 +274,12 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 		Version string
 		Suffix  string
 		Routes  []routeView
+		// CSRF is the per-process write token. It goes into a meta tag
+		// rather than the script, so there is one place in the page the
+		// value is written and the script reads it from there. The clear
+		// button is the only thing that sends it back today; every write
+		// the settings UI adds will need it too.
+		CSRF string
 		// Redacted is rendered into the page script, so inspect.Redacted is
 		// the only place the sentinel is written down. The script compares a
 		// header value against it to mark the value as redacted, and drops
@@ -272,6 +291,7 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 		Version:  s.version,
 		Suffix:   cfg.Suffix,
 		Routes:   s.routeViews(cfg),
+		CSRF:     s.csrf,
 		Redacted: inspect.Redacted,
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")

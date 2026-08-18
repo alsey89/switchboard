@@ -59,6 +59,18 @@ func do(s *Server, method, target string, hdr map[string]string) *httptest.Respo
 	return w
 }
 
+// withToken copies hdr and adds this server's write token. Tests that are
+// about something other than the token say so by using it: the token is
+// present, so whatever the case is really checking is what decided the
+// answer. Tests about the token itself set the header by hand.
+func withToken(s *Server, hdr map[string]string) map[string]string {
+	out := map[string]string{csrfHeader: s.csrf}
+	for k, v := range hdr {
+		out[k] = v
+	}
+	return out
+}
+
 func TestInspectRequestsListsNewestFirst(t *testing.T) {
 	s, r := testServer(t)
 	seed(t, r, "/one")
@@ -131,6 +143,15 @@ func TestInspectRecordUnknownIDIs404(t *testing.T) {
 	}
 }
 
+// TestClearRequiresPostAndOrigin covers what clear itself still decides
+// (POST only) and how it behaves at the write boundary it now sits behind.
+// The origin rules themselves are origin_test.go's subject; these cases are
+// here because clear is the endpoint they were first written against.
+//
+// Every case carries the token, because the token is not what any of them
+// is testing. Only clear's own port is loopback-allowed now, so the "any
+// loopback port" case that used to pass here moved to origin_test.go as a
+// rejection.
 func TestClearRequiresPostAndOrigin(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -142,13 +163,13 @@ func TestClearRequiresPostAndOrigin(t *testing.T) {
 		{"no origin is refused", "POST", nil, http.StatusForbidden},
 		{"foreign origin is refused", "POST", map[string]string{"Origin": "https://evil.example"}, http.StatusForbidden},
 		{"same origin is allowed", "POST", map[string]string{"Origin": "https://switchboard.test"}, http.StatusNoContent},
-		{"loopback origin is allowed", "POST", map[string]string{"Origin": "http://127.0.0.1:8484"}, http.StatusNoContent},
+		{"loopback at the dashboard port is allowed", "POST", map[string]string{"Origin": "http://127.0.0.1:8484"}, http.StatusNoContent},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			s, r := testServer(t)
 			seed(t, r, "/x")
-			if w := do(s, c.method, "/api/inspect/clear", c.origin); w.Code != c.want {
+			if w := do(s, c.method, "/api/inspect/clear", withToken(s, c.origin)); w.Code != c.want {
 				t.Fatalf("status %d, want %d", w.Code, c.want)
 			}
 		})
@@ -160,7 +181,7 @@ func TestClearEmptiesTheBuffer(t *testing.T) {
 	seed(t, r, "/x")
 
 	if w := do(s, "POST", "/api/inspect/clear",
-		map[string]string{"Origin": "https://switchboard.test"}); w.Code != http.StatusNoContent {
+		withToken(s, map[string]string{"Origin": "https://switchboard.test"})); w.Code != http.StatusNoContent {
 		t.Fatalf("status %d", w.Code)
 	}
 	got, err := r.Store().List(inspect.Query{Limit: 10})
@@ -250,7 +271,7 @@ func TestInspectEndpointsAre503WithNoRecorder(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			s := New(&config.Config{Suffix: "test"}, "test")
-			if w := do(s, c.method, c.path, c.origin); w.Code != http.StatusServiceUnavailable {
+			if w := do(s, c.method, c.path, withToken(s, c.origin)); w.Code != http.StatusServiceUnavailable {
 				t.Fatalf("status %d, want 503", w.Code)
 			}
 		})
@@ -604,7 +625,7 @@ func TestInspectEndpointsSurviveAClosedStore(t *testing.T) {
 
 	t.Run("clear", func(t *testing.T) {
 		w := do(s, "POST", "/api/inspect/clear",
-			map[string]string{"Origin": "https://switchboard.test"})
+			withToken(s, map[string]string{"Origin": "https://switchboard.test"}))
 		if w.Code != http.StatusServiceUnavailable {
 			t.Fatalf("status %d, want 503", w.Code)
 		}
