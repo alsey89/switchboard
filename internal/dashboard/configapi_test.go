@@ -190,6 +190,27 @@ func TestPatchConfigLeavesOmittedFieldsAlone(t *testing.T) {
 	}
 }
 
+// enabled = false explicitly, because the accessor returns true for both
+// "unset" and "absent". A test seeded with the default cannot tell a
+// preserved value from a dropped one: deleting the guard in
+// handleConfigPatch would leave Enabled nil, and nil still reads as true.
+func TestPatchConfigLeavesAnExplicitEnabledAlone(t *testing.T) {
+	s, _ := serverWithPaths(t, "suffix = \"test\"\n\n[inspect]\nenabled = false\n")
+	version := getConfig(t, s).Version
+
+	if w := write(t, s, "PATCH", "/api/config",
+		`{"inspect":{"bodies":true},"version":"`+version+`"}`); w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body)
+	}
+	out := getConfig(t, s)
+	if !out.Inspect.Bodies {
+		t.Error("bodies should be on")
+	}
+	if out.Inspect.Enabled {
+		t.Error("enabled was explicitly false and was not in the request; it should still be false")
+	}
+}
+
 // The privileged ports and the suffix are not writable here. They need sudo
 // or a resolver rewrite, and this endpoint accepting them would silently do
 // nothing, which is worse than refusing.
@@ -220,5 +241,27 @@ func TestPatchConfigRejectsAStaleVersion(t *testing.T) {
 		`{"dashboardPort":9000,"version":"0000000000000000"}`)
 	if w.Code != http.StatusConflict {
 		t.Fatalf("status %d, want 409", w.Code)
+	}
+}
+
+// A refused field must abort the whole patch, not just its own assignment.
+// The sudo-tier switch runs before anything is written, and this is what
+// stops a later refactor from quietly reordering that.
+func TestPatchConfigRefusingOneFieldWritesNone(t *testing.T) {
+	s, _ := serverWithPaths(t, baseConfig)
+	before := getConfig(t, s)
+
+	w := write(t, s, "PATCH", "/api/config",
+		`{"dashboardPort":9000,"suffix":"internal","version":"`+before.Version+`"}`)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status %d, want 422: %s", w.Code, w.Body)
+	}
+
+	after := getConfig(t, s)
+	if after.Effective.DashboardPort != before.Effective.DashboardPort {
+		t.Errorf("dashboard port moved to %d despite the refusal", after.Effective.DashboardPort)
+	}
+	if after.Version != before.Version {
+		t.Error("the config file changed despite the refusal")
 	}
 }
