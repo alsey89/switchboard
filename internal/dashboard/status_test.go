@@ -25,6 +25,7 @@ func serverWithPaths(t *testing.T, body string) (*Server, string) {
 	}
 	s := New(&config.Config{Suffix: "test"}, "test")
 	s.SetPaths(path, dir)
+	s.boundPort = config.DefaultDashboardPort // Start would set this; see testServer
 	return s, path
 }
 

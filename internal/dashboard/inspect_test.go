@@ -31,6 +31,10 @@ func testServer(t *testing.T) (*Server, *inspect.Recorder) {
 
 	s := New(&config.Config{Suffix: "test"}, "test")
 	s.SetInspector(r)
+	// Start is what normally fills this in, and no test binds a port. The
+	// write checks compare an origin's port against it, so a server that
+	// never started would reject every loopback origin.
+	s.boundPort = config.DefaultDashboardPort
 	return s, r
 }
 

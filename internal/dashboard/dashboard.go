@@ -15,6 +15,7 @@ import (
 	"html/template"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -47,6 +48,15 @@ type Server struct {
 	// csrf is minted once per process and injected into the page. See
 	// origin.go.
 	csrf string
+
+	// boundPort is the port the listener actually accepted on.
+	//
+	// Not the configured port. Start binds once, and a dashboard_port edit
+	// hot-reloads into s.cfg without rebinding anything, so the configured
+	// value can name a port nothing is serving. sameOriginStrict has to
+	// compare against the socket that exists, or a port edit silently 403s
+	// the break-glass URL that is still the only one working.
+	boundPort int
 
 	// done is closed by Shutdown, before http.Server.Shutdown runs. It is
 	// how a long-lived handler learns the server wants to stop.
@@ -107,6 +117,13 @@ func (s *Server) Start(bind string) error {
 	ln, err := net.Listen("tcp", bind)
 	if err != nil {
 		return err
+	}
+	// Read the port back off the listener rather than out of bind. A bind
+	// of "127.0.0.1:0" names a real port only once the kernel has picked
+	// one, and that is the port an origin will carry. Written before Serve
+	// starts, so no handler can observe it unset.
+	if _, port, splitErr := net.SplitHostPort(ln.Addr().String()); splitErr == nil {
+		s.boundPort, _ = strconv.Atoi(port)
 	}
 	s.httpSrv = &http.Server{Handler: s.mux(), ReadHeaderTimeout: 10 * time.Second}
 	go s.httpSrv.Serve(ln) //nolint:errcheck // exits on Shutdown

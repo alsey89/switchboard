@@ -53,6 +53,13 @@ func newCSRFToken() string {
 // Writes therefore require the dashboard's own domain, or loopback at the
 // dashboard port specifically. Loopback with no explicit port is not the
 // dashboard, since the dashboard never runs on 80 or 443.
+//
+// The port compared against is s.boundPort, the one the listener actually
+// took, not cfg.EffDashboardPort(). Those two disagree the moment someone
+// edits dashboard_port: the edit hot-reloads into s.cfg, but Start binds
+// once and nothing rebinds. Keying on the config would 403 the URL that
+// still works and start accepting writes from whatever process happens to
+// be on the newly configured port.
 func (s *Server) sameOriginStrict(r *http.Request) bool {
 	o := r.Header.Get("Origin")
 	if o == "" {
@@ -62,19 +69,24 @@ func (s *Server) sameOriginStrict(r *http.Request) bool {
 	if err != nil {
 		return false
 	}
-	cfg := s.cfg.Load()
 	host := strings.ToLower(hostOnly(u.Host))
-	if host == cfg.DashboardDomain() {
+	if host == s.cfg.Load().DashboardDomain() {
 		return true
 	}
 	if !isLoopbackHost(host) {
+		return false
+	}
+	// A Server whose Start never ran is serving on nothing, so no origin
+	// can be at its port. Stated rather than left to the comparison, which
+	// would otherwise let an origin of ":0" match an unbound server.
+	if s.boundPort == 0 {
 		return false
 	}
 	_, port, err := net.SplitHostPort(u.Host)
 	if err != nil {
 		return false
 	}
-	return port == strconv.Itoa(cfg.EffDashboardPort())
+	return port == strconv.Itoa(s.boundPort)
 }
 
 // mutate wraps a state-changing handler in the two checks a write needs on

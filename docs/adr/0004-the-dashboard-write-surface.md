@@ -94,24 +94,27 @@ tests, rather than the other way round.
 
 - The dashboard's own domain. Nothing else answers on that name, and it
   resolves to loopback only because we put it in the resolver file.
-- Loopback at the dashboard port, 8484 by default.
+- Loopback at the port the dashboard listener actually bound, 8484 unless
+  `dashboard_port` says otherwise.
 - Nothing else.
 
 Two rejections are worth stating, because both look like edge cases and
 neither is.
 
-**An absent Origin is refused, not treated as neutral.** Browsers send Origin
-on every `fetch` and on cross-origin form posts. The classic CSRF shape is a
-form auto-submitted by a hostile page. Reading a missing Origin as "probably
-fine" is how that shape walks through.
+**An absent Origin is refused, not treated as neutral.** Browsers set Origin
+on every request that is not a GET or a HEAD, cross-origin form posts
+included. That is the fact an origin check is built on. It follows that a
+write arriving with no Origin did not come from a page acting for the user,
+and whatever it did come from has the config file anyway. Treating absence
+as neutral would hand the gate to anything that just leaves the header off.
 
 **Loopback with no explicit port is refused.** No port means port 80. The
 dashboard does not run on 80, so an origin that claims it is not the
 dashboard. `net.SplitHostPort` returns an error for a bare host, and that
 error is the rejection.
 
-The dashboard's own domain is matched by name, so it is accepted at any port.
-That is looser than it first looks, because the resolver file sends every
+The dashboard's own domain is matched by name, so it is accepted at any port
+and over either scheme. That is looser than it first looks, because the resolver file sends every
 `*.test` name to loopback, and `http://switchboard.test:3000` therefore
 reaches whatever dev server is on 3000. Getting script to run at that origin
 is the hard part: a hostile page cannot make a local server serve its code,
@@ -119,13 +122,25 @@ and nobody browses to their dev server by the dashboard's name. If it
 happened anyway, the token is what stops the write, which is the clearest
 example of why the token is worth having.
 
-Narrowing it to the HTTPS port is not as easy as the loopback branch makes it
-look. The dashboard port is real: nothing ever inherits it, so
-`EffDashboardPort` is the port being served. `https_port` is not. Under a
-privileged parent the socket is inherited and the config value is inert, and
-the daemon already logs a warning saying so. A check comparing an origin's
-port against a number the daemon is not serving on would refuse the real
-dashboard, which is a worse failure than the one it prevents.
+Narrowing it to the dashboard's real scheme and port is not as easy as the
+loopback branch makes it look, and the asymmetry is worth stating. The
+loopback branch compares against the port the listener accepted, which is
+true by construction. There is no equivalent number for the domain branch:
+the daemon does not serve that name, Caddy does, on a socket it may have
+inherited. `https_port` is inert whenever the socket came from the privileged
+parent, and the daemon already logs a warning saying so. A check against that
+number would refuse the real dashboard, which is a worse failure than the one
+it prevents.
+
+**The port compared against is the one the listener took, not the one the
+config names.** `Start` binds once. A `dashboard_port` edit hot-reloads into
+the server's config and rebinds nothing, so from that moment the configured
+value names a port nothing is serving. Keying the check on the config would
+403 `http://127.0.0.1:<old>`, the URL that is still working and the
+break-glass path this ADR argues must keep working, and would begin accepting
+writes from `http://127.0.0.1:<new>`, which is whatever process happens to be
+listening there. So the server records the port off its own listener and the
+check reads that.
 
 ### Why the token exists, given the Origin check
 
@@ -177,6 +192,29 @@ does nothing at best, and to a request root must never take at worst. They
 stay where they are, edited by hand in a file, which is the form ADR 0001
 already reasoned about.
 
+### Options that lost
+
+**Keep `sameOrigin`.** Loopback at any port puts every proxied dev server
+inside the boundary. That is a strange boundary for a proxy whose whole job is
+sitting in front of dev servers.
+
+**Add authentication.** A secret the daemon can read is a secret every local
+process can read. It stops the adversary we do not face and not the one we
+do, and it puts a login screen on a tool whose pitch is that it just works.
+
+**Serve writes on a Unix socket.** File permissions would keep browsers out
+completely, since a browser cannot speak to a Unix socket. That is also why it
+fails: the dashboard is a browser page, and it is the client.
+
+**Rely on the custom header alone.** A request carrying `X-Switchboard-CSRF`
+is not a simple request, so a cross-origin caller needs a preflight this
+server never answers. That is a real defence, and it is part of why the token
+is worth having. It is not the gate, because it is a property of browser
+behaviour we would be leaning on rather than a check we are making.
+
+**Tighten reads to match writes.** It closes the break-glass path, which is
+the only reason loopback access exists.
+
 ---
 
 ## Consequences
@@ -226,26 +264,3 @@ that passes because it checked nothing is worse than no test at all, and this
 codebase has had one: in an earlier version `/api/routes` escaped the Host
 guard, because `mux()`'s route list and the test's route list were two
 hand-maintained things and only one of them got updated.
-
-### Options that lost
-
-**Keep `sameOrigin`.** Loopback at any port puts every proxied dev server
-inside the boundary. That is a strange boundary for a proxy whose whole job is
-sitting in front of dev servers.
-
-**Add authentication.** A secret the daemon can read is a secret every local
-process can read. It stops the adversary we do not face and not the one we
-do, and it puts a login screen on a tool whose pitch is that it just works.
-
-**Serve writes on a Unix socket.** File permissions would keep browsers out
-completely, since a browser cannot speak to a Unix socket. That is also why it
-fails: the dashboard is a browser page, and it is the client.
-
-**Rely on the custom header alone.** A request carrying `X-Switchboard-CSRF`
-is not a simple request, so a cross-origin caller needs a preflight this
-server never answers. That is a real defence, and it is part of why the token
-is worth having. It is not the gate, because it is a property of browser
-behaviour we would be leaning on rather than a check we are making.
-
-**Tighten reads to match writes.** It closes the break-glass path, which is
-the only reason loopback access exists.

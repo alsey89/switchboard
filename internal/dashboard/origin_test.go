@@ -1,7 +1,9 @@
 package dashboard
 
 import (
+	"context"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -9,7 +11,13 @@ import (
 // badWriteHeaders is every way a request can fail the write checks. Each
 // case is a real attack shape, not a permutation for its own sake:
 //
-//   - no origin: a form post, which browsers send with no Origin at all
+//   - no origin: a caller that is not a browser page acting for the user,
+//     such as curl or a script. Not the form-post case: browsers do send
+//     Origin on a cross-origin form post, which is what makes an
+//     origin-based defence work at all. Absence is refused rather than read
+//     as neutral, because it is not evidence of a good origin. (A sandboxed
+//     frame sends Origin: null, a header that is present and fails
+//     separately, since url.Parse leaves it with an empty host.)
 //   - foreign origin: an ordinary hostile page
 //   - loopback on another port: your own dev server, one bad npm dependency
 //     deep. This is the case the old sameOrigin let through and the reason
@@ -50,6 +58,13 @@ func TestEveryMutatingRouteRejectsABadWrite(t *testing.T) {
 			continue
 		}
 		found++
+		// mutate is not a substitute for guard, and both origin.go and
+		// dashboard.go say so. The two table walks skip on different
+		// fields, so without this a route could be mutating and unguarded
+		// and satisfy them both.
+		if !rt.guarded {
+			t.Errorf("%s is mutating but not guarded", rt.pattern)
+		}
 		target := rt.pattern
 		if strings.HasSuffix(target, "/") {
 			target += "app.test"
@@ -127,5 +142,66 @@ func TestThePageCarriesTheToken(t *testing.T) {
 	want := `<meta name="switchboard-csrf" content="` + s.csrf + `">`
 	if !strings.Contains(w.Body.String(), want) {
 		t.Fatalf("the page does not carry the token")
+	}
+}
+
+// TestTheCheckFollowsTheBoundPort pins the loopback branch to the port the
+// listener actually took. Every other loopback case in the suite uses the
+// default 8484, so writing that literal into sameOriginStrict would leave
+// the whole suite green and break everyone who set dashboard_port.
+func TestTheCheckFollowsTheBoundPort(t *testing.T) {
+	s, _ := testServer(t)
+	s.boundPort = 9999
+
+	at := func(origin string) int {
+		return do(s, "POST", "/api/inspect/clear", map[string]string{
+			"Origin": origin, "X-Switchboard-CSRF": s.csrf}).Code
+	}
+	if got := at("http://127.0.0.1:9999"); got != http.StatusNoContent {
+		t.Errorf("status %d at the bound port, want 204", got)
+	}
+	if got := at("http://127.0.0.1:8484"); got != http.StatusForbidden {
+		t.Errorf("status %d at the default port, want 403", got)
+	}
+}
+
+// TestAnUnboundServerAcceptsNoLoopbackOrigin covers the zero value. A Server
+// built by New and never started is serving on nothing, so no loopback
+// origin can be at its port. Port 0 is the case worth naming: it is what a
+// bare comparison against an unset boundPort would have accepted.
+func TestAnUnboundServerAcceptsNoLoopbackOrigin(t *testing.T) {
+	s, _ := testServer(t)
+	s.boundPort = 0
+	for _, origin := range []string{"http://127.0.0.1:0", "http://127.0.0.1:8484"} {
+		w := do(s, "POST", "/api/inspect/clear", map[string]string{
+			"Origin": origin, "X-Switchboard-CSRF": s.csrf})
+		if w.Code != http.StatusForbidden {
+			t.Errorf("%s: status %d, want 403", origin, w.Code)
+		}
+	}
+}
+
+// TestStartRecordsThePortItBound is the wiring the two tests above assume.
+// It binds port 0, so the only way to learn the real port is to ask the
+// listener; parsing the bind string would yield 0 and every loopback write
+// would then be refused. The assertion is that the recorded port is one a
+// client can actually connect to.
+func TestStartRecordsThePortItBound(t *testing.T) {
+	s, _ := testServer(t)
+	s.boundPort = 0
+	if err := s.Start("127.0.0.1:0"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Shutdown(context.Background()) }) //nolint:errcheck
+	if s.boundPort == 0 {
+		t.Fatal("Start bound a port and recorded nothing")
+	}
+	resp, err := http.Get("http://127.0.0.1:" + strconv.Itoa(s.boundPort) + "/api/routes")
+	if err != nil {
+		t.Fatalf("the recorded port is not the one being served: %v", err)
+	}
+	defer resp.Body.Close() //nolint:errcheck
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d from the recorded port, want 200", resp.StatusCode)
 	}
 }
