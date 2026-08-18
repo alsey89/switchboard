@@ -4,6 +4,7 @@
 package dashboard
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/alsey89/switchboard/internal/config"
@@ -56,15 +57,30 @@ type serviceView struct {
 	Supported bool   `json:"supported"`
 }
 
-func (s *Server) handleService(w http.ResponseWriter, r *http.Request) {
-	state, plistPath, err := service.Status()
-	if err != nil {
-		writeJSON(w, serviceView{State: "not supported on this platform"})
-		return
+// serviceStateFor turns a service.Status() result into what the endpoint
+// reports.
+//
+// The three-way split matters. service.ErrUnsupported means there is no
+// service manager on this platform at all, which is not a failure the user
+// caused or can act on. Any other error means the platform does support one
+// and something went wrong looking it up, which is a real problem they can
+// fix. Collapsing the two would tell a macOS user with a broken home
+// directory that launchd does not exist.
+//
+// Split from handleService so both error branches can be tested anywhere.
+// Calling service.Status() directly only ever exercises whichever branch the
+// test machine happens to reach.
+func serviceStateFor(state service.State, plistPath string, err error) serviceView {
+	switch {
+	case errors.Is(err, service.ErrUnsupported):
+		return serviceView{State: "not supported on this platform"}
+	case err != nil:
+		return serviceView{State: "could not be determined: " + err.Error(), Supported: true}
+	default:
+		return serviceView{State: state.String(), PlistPath: plistPath, Supported: true}
 	}
-	writeJSON(w, serviceView{
-		State:     state.String(),
-		PlistPath: plistPath,
-		Supported: true,
-	})
+}
+
+func (s *Server) handleService(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, serviceStateFor(service.Status()))
 }

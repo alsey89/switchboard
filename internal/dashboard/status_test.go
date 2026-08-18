@@ -2,12 +2,15 @@ package dashboard
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/alsey89/switchboard/internal/config"
+	"github.com/alsey89/switchboard/internal/service"
 )
 
 // serverWithPaths is a dashboard wired to a real config file on disk. The
@@ -115,5 +118,64 @@ func TestServiceEndpointAlwaysAnswers(t *testing.T) {
 	}
 	if out.State == "" {
 		t.Error("state should always be populated, even when unsupported")
+	}
+}
+
+// TestServiceStateFor covers all three branches of serviceStateFor with
+// errors that can be tested on any platform.
+func TestServiceStateFor(t *testing.T) {
+	tests := []struct {
+		name string
+		// serviceStateFor parameters
+		state     service.State
+		plistPath string
+		err       error
+		// expected output
+		wantState     string
+		wantPlistPath string
+		wantSupported bool
+	}{
+		{
+			name:          "unsupported platform",
+			state:         service.NotInstalled,
+			plistPath:     "",
+			err:           fmt.Errorf("%w", service.ErrUnsupported),
+			wantState:     "not supported on this platform",
+			wantPlistPath: "",
+			wantSupported: false,
+		},
+		{
+			name:          "platform supports service but lookup failed",
+			state:         service.NotInstalled,
+			plistPath:     "",
+			err:           errors.New("home directory unavailable"),
+			wantState:     "could not be determined: home directory unavailable",
+			wantPlistPath: "",
+			wantSupported: true,
+		},
+		{
+			name:          "service running",
+			state:         service.Running,
+			plistPath:     "/path/to/plist",
+			err:           nil,
+			wantState:     "running",
+			wantPlistPath: "/path/to/plist",
+			wantSupported: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := serviceStateFor(tt.state, tt.plistPath, tt.err)
+			if got.State != tt.wantState {
+				t.Errorf("State = %q, want %q", got.State, tt.wantState)
+			}
+			if got.PlistPath != tt.wantPlistPath {
+				t.Errorf("PlistPath = %q, want %q", got.PlistPath, tt.wantPlistPath)
+			}
+			if got.Supported != tt.wantSupported {
+				t.Errorf("Supported = %v, want %v", got.Supported, tt.wantSupported)
+			}
+		})
 	}
 }
