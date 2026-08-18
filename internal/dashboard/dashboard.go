@@ -155,6 +155,8 @@ func (s *Server) routes() []routeEntry {
 		{pattern: "/api/doctor", handler: s.guard(s.handleDoctor), guarded: true},
 		{pattern: "/api/service", handler: s.guard(s.handleService), guarded: true},
 		{pattern: "/api/config", handler: s.guard(s.handleConfig), guarded: true},
+		{method: "PATCH", pattern: "/api/config",
+			handler: s.guard(s.mutate(s.handleConfigPatch)), guarded: true, mutating: true},
 		{method: "POST", pattern: "/api/routes",
 			handler: s.guard(s.mutate(s.handleRouteCreate)), guarded: true, mutating: true},
 		{method: "PATCH", pattern: "/api/routes/",

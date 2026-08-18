@@ -3,6 +3,7 @@ package dashboard
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/alsey89/switchboard/internal/config"
@@ -134,5 +135,90 @@ func TestConfigEndpointIs503WithoutPaths(t *testing.T) {
 	s := New(&config.Config{Suffix: "test"}, "test")
 	if w := do(s, "GET", "/api/config", nil); w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status %d, want 503", w.Code)
+	}
+}
+
+func TestPatchConfigSetsDashboardPort(t *testing.T) {
+	s, _ := serverWithPaths(t, baseConfig)
+	version := getConfig(t, s).Version
+
+	w := write(t, s, "PATCH", "/api/config",
+		`{"dashboardPort":9000,"version":"`+version+`"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200: %s", w.Code, w.Body)
+	}
+	out := getConfig(t, s)
+	if out.Effective.DashboardPort != 9000 {
+		t.Errorf("dashboard port %d, want 9000", out.Effective.DashboardPort)
+	}
+}
+
+func TestPatchConfigTurnsTheInspectorOff(t *testing.T) {
+	s, _ := serverWithPaths(t, baseConfig)
+	version := getConfig(t, s).Version
+
+	w := write(t, s, "PATCH", "/api/config",
+		`{"inspect":{"enabled":false},"version":"`+version+`"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200: %s", w.Code, w.Body)
+	}
+	if getConfig(t, s).Inspect.Enabled {
+		t.Error("inspector should be off")
+	}
+}
+
+// Omitting a field must leave it alone. A settings form that sends one
+// changed field should not silently reset the rest, which is exactly what a
+// plain bool would do here.
+func TestPatchConfigLeavesOmittedFieldsAlone(t *testing.T) {
+	s, _ := serverWithPaths(t, baseConfig)
+	version := getConfig(t, s).Version
+
+	if w := write(t, s, "PATCH", "/api/config",
+		`{"inspect":{"bodies":true},"version":"`+version+`"}`); w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body)
+	}
+	out := getConfig(t, s)
+	if !out.Inspect.Bodies {
+		t.Error("bodies should be on")
+	}
+	if !out.Inspect.Enabled {
+		t.Error("enabled should still be on; it was not in the request")
+	}
+	if len(out.Routes) != 1 {
+		t.Error("routes should be untouched")
+	}
+}
+
+// The privileged ports and the suffix are not writable here. They need sudo
+// or a resolver rewrite, and this endpoint accepting them would silently do
+// nothing, which is worse than refusing.
+func TestPatchConfigRefusesTheSudoTier(t *testing.T) {
+	for _, body := range []string{
+		`{"httpsPort":8443,"version":"%s"}`,
+		`{"httpPort":8080,"version":"%s"}`,
+		`{"dnsPort":5454,"version":"%s"}`,
+		`{"suffix":"internal","version":"%s"}`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			s, _ := serverWithPaths(t, baseConfig)
+			version := getConfig(t, s).Version
+			w := write(t, s, "PATCH", "/api/config", strings.Replace(body, "%s", version, 1))
+			if w.Code != http.StatusUnprocessableEntity {
+				t.Fatalf("status %d, want 422: %s", w.Code, w.Body)
+			}
+			if !strings.Contains(w.Body.String(), "switchboard") {
+				t.Errorf("the error should name the CLI command to use, got: %s", w.Body)
+			}
+		})
+	}
+}
+
+func TestPatchConfigRejectsAStaleVersion(t *testing.T) {
+	s, _ := serverWithPaths(t, baseConfig)
+	w := write(t, s, "PATCH", "/api/config",
+		`{"dashboardPort":9000,"version":"0000000000000000"}`)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status %d, want 409", w.Code)
 	}
 }
