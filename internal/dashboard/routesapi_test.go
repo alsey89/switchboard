@@ -177,3 +177,98 @@ func TestConcurrentWritesAtTheSameVersionProduceOneWinner(t *testing.T) {
 		t.Fatalf("%d routes on disk, want 2 (the original plus one winner)", got)
 	}
 }
+
+func TestEditRouteChangesTheUpstream(t *testing.T) {
+	s, _ := serverWithPaths(t, baseConfig)
+	version := getConfig(t, s).Version
+
+	w := write(t, s, "PATCH", "/api/routes/app.test",
+		`{"port":5000,"version":"`+version+`"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200: %s", w.Code, w.Body)
+	}
+
+	out := getConfig(t, s)
+	if len(out.Routes) != 1 {
+		t.Fatalf("%d routes, want 1", len(out.Routes))
+	}
+	// localhost, not 127.0.0.1. Route.UpstreamAddr resolves a bare port via
+	// net.JoinHostPort("localhost", port). Only an explicitly set upstream
+	// comes back verbatim.
+	if out.Routes[0].Upstream != "localhost:5000" {
+		t.Errorf("upstream %q, want localhost:5000", out.Routes[0].Upstream)
+	}
+}
+
+// Renaming has to clear the old shorthand as well as set the new one.
+// Leaving Port set while Upstream is also set makes Validate reject the
+// whole config, which would be a confusing 422 on the next unrelated write.
+func TestEditRouteSwitchingToAnUpstreamClearsThePort(t *testing.T) {
+	s, _ := serverWithPaths(t, baseConfig)
+	version := getConfig(t, s).Version
+
+	w := write(t, s, "PATCH", "/api/routes/app.test",
+		`{"upstream":"127.0.0.1:6000","version":"`+version+`"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200: %s", w.Code, w.Body)
+	}
+	if got := getConfig(t, s).Routes[0].Upstream; got != "127.0.0.1:6000" {
+		t.Errorf("upstream %q", got)
+	}
+}
+
+func TestEditRouteRenamesTheDomain(t *testing.T) {
+	s, _ := serverWithPaths(t, baseConfig)
+	version := getConfig(t, s).Version
+
+	w := write(t, s, "PATCH", "/api/routes/app.test",
+		`{"domain":"web","version":"`+version+`"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200: %s", w.Code, w.Body)
+	}
+	if got := getConfig(t, s).Routes[0].Domain; got != "web.test" {
+		t.Errorf("domain %q, want web.test", got)
+	}
+}
+
+func TestEditUnknownRouteIs404(t *testing.T) {
+	s, _ := serverWithPaths(t, baseConfig)
+	version := getConfig(t, s).Version
+
+	w := write(t, s, "PATCH", "/api/routes/nope.test",
+		`{"port":5000,"version":"`+version+`"}`)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status %d, want 404: %s", w.Code, w.Body)
+	}
+}
+
+func TestDeleteRouteRemovesIt(t *testing.T) {
+	s, _ := serverWithPaths(t, baseConfig)
+	version := getConfig(t, s).Version
+
+	w := write(t, s, "DELETE", "/api/routes/app.test?version="+version, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200: %s", w.Code, w.Body)
+	}
+	if got := len(getConfig(t, s).Routes); got != 0 {
+		t.Fatalf("%d routes left, want 0", got)
+	}
+}
+
+func TestDeleteUnknownRouteIs404(t *testing.T) {
+	s, _ := serverWithPaths(t, baseConfig)
+	version := getConfig(t, s).Version
+
+	w := write(t, s, "DELETE", "/api/routes/nope.test?version="+version, "")
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status %d, want 404: %s", w.Code, w.Body)
+	}
+}
+
+func TestDeleteRouteRejectsAStaleVersion(t *testing.T) {
+	s, _ := serverWithPaths(t, baseConfig)
+	w := write(t, s, "DELETE", "/api/routes/app.test?version=0000000000000000", "")
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status %d, want 409", w.Code)
+	}
+}
