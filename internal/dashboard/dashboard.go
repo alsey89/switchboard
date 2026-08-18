@@ -354,11 +354,17 @@ func (s *Server) renderNoRoute(w http.ResponseWriter, cfg *config.Config, host s
 
 func (s *Server) handleAPIRoutes(w http.ResponseWriter, r *http.Request) {
 	cfg := s.cfg.Load()
+	// appVersion, not version. /api/config has a field called version and it
+	// is a hash of the config file bytes, the token every write has to echo
+	// back. This one is the build string. Two sibling endpoints in one
+	// package using the same name for two unrelated values is how a client
+	// ends up sending a build string as a write token and getting a 409 it
+	// can never clear.
 	out := struct {
-		Version string      `json:"version"`
-		Suffix  string      `json:"suffix"`
-		Routes  []routeView `json:"routes"`
-	}{Version: s.version, Suffix: cfg.Suffix, Routes: s.routeViews(cfg)}
+		AppVersion string      `json:"appVersion"`
+		Suffix     string      `json:"suffix"`
+		Routes     []routeView `json:"routes"`
+	}{AppVersion: s.version, Suffix: cfg.Suffix, Routes: s.routeViews(cfg)}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(out) //nolint:errcheck
 }

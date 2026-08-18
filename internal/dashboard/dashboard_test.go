@@ -1,6 +1,7 @@
 package dashboard
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -52,6 +53,30 @@ func TestConsoleServedOnItsOwnDomain(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("rail filter contract is missing %q", want)
 		}
+	}
+}
+
+// TestRoutesAndConfigDoNotShareAVersionField pins the two names apart.
+// /api/config's version is the config file hash, and a write that echoes
+// the wrong string back gets a 409 it cannot clear by retrying. Naming the
+// build string on the sibling endpoint "version" made picking the wrong one
+// a plausible mistake rather than a careless one.
+func TestRoutesAndConfigDoNotShareAVersionField(t *testing.T) {
+	s, _ := serverWithPaths(t, baseConfig)
+
+	w := do(s, "GET", "/api/routes", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := out["version"]; ok {
+		t.Error("/api/routes must not have a version field; /api/config's version is the write token")
+	}
+	if out["appVersion"] != "test" {
+		t.Errorf("appVersion = %v, want the build string", out["appVersion"])
 	}
 }
 
