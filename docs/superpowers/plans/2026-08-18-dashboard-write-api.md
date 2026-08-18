@@ -1682,8 +1682,11 @@ func TestEditRouteChangesTheUpstream(t *testing.T) {
 	if len(out.Routes) != 1 {
 		t.Fatalf("%d routes, want 1", len(out.Routes))
 	}
-	if out.Routes[0].Upstream != "127.0.0.1:5000" {
-		t.Errorf("upstream %q, want 127.0.0.1:5000", out.Routes[0].Upstream)
+	// localhost, not 127.0.0.1. Route.UpstreamAddr resolves a bare port via
+	// net.JoinHostPort("localhost", port). Only an explicitly set upstream
+	// comes back verbatim.
+	if out.Routes[0].Upstream != "localhost:5000" {
+		t.Errorf("upstream %q, want localhost:5000", out.Routes[0].Upstream)
 	}
 }
 
