@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Switchboard</title>
+<meta name="switchboard-csrf" content="{{.CSRF}}">
 <style>
   :root { color-scheme: light dark;
     --fg: #1a1a1a; --bg: #ffffff; --muted: #6b7280; --line: #e5e7eb;
@@ -228,6 +229,13 @@
   // credential header's value. It is rendered from the Go constant rather
   // than written out again here, so there is one definition to change.
   const REDACTED = "{{.Redacted}}";
+
+  // CSRF is the write token this daemon minted for this page. Every
+  // state-changing request has to send it back in X-Switchboard-CSRF, on
+  // top of the origin check the server makes; see
+  // internal/dashboard/origin.go. It is read from the meta tag rather than
+  // templated in here as well, so the value is written into the page once.
+  const CSRF = document.querySelector('meta[name="switchboard-csrf"]').content;
 
   const $ = (id) => document.getElementById(id);
   const list = $("list"), detail = $("detail");
@@ -915,15 +923,20 @@
     if (!confirm("Clear all captured requests? This cannot be undone.")) return;
     let resp;
     try {
-      resp = await fetch("/api/inspect/clear", { method: "POST" });
+      resp = await fetch("/api/inspect/clear", {
+        method: "POST",
+        headers: { "X-Switchboard-CSRF": CSRF },
+      });
     } catch {
       note(detail, "Could not reach the daemon. Nothing was cleared.");
       return;
     }
     // A 503 means the inspector went off between the page loading and the
-    // click; a 403 means the origin check refused it. Either way the buffer
-    // still holds everything, and saying nothing would leave the user
-    // believing it did not.
+    // click; a 403 means the write checks refused it, which for a page this
+    // daemon served means the daemon restarted and this tab is holding a
+    // token from the old process. Either way the buffer still holds
+    // everything, and saying nothing would leave the user believing it did
+    // not.
     if (resp.status === 503) { setOff(true); return; }
     if (!resp.ok) {
       note(detail, "Clear failed (" + resp.status + "). Nothing was removed.");

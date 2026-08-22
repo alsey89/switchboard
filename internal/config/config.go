@@ -4,6 +4,8 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -162,16 +164,51 @@ func LoadLenient(path string) (*Config, error) {
 	return &c, validateSuffix(c.Suffix)
 }
 
+// Version identifies the exact bytes of a config file. A write request
+// echoes back the version it read, so an edit made against a stale view
+// fails loudly instead of quietly clobbering someone else's change.
+//
+// Sixteen hex characters, not the full digest. This is a collision check
+// between two edits seconds apart, not a security boundary, and a short
+// value is one a human can compare in a log line.
+func Version(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])[:16]
+}
+
+// LoadWithVersion is Load plus the version of the bytes it read.
+//
+// Anything that intends to write the file back must use this rather than
+// Load followed by a separate read. The hash has to come from the same read
+// as the config, or the guard is racing the thing it exists to prevent.
+//
+// A missing file yields defaults and an empty version, matching Load's rule
+// that the tool works before `add` has ever run.
+func LoadWithVersion(path string) (*Config, string, error) {
+	b, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return Default(), "", nil
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	c, err := decode(b, path)
+	if err != nil {
+		return nil, "", err
+	}
+	return c, Version(b), nil
+}
+
 // Load reads and validates the config at path. A missing file yields the
 // default config (not an error): the tool should work before `add` runs.
 func Load(path string) (*Config, error) {
-	b, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return Default(), nil
-	}
-	if err != nil {
-		return nil, err
-	}
+	c, _, err := LoadWithVersion(path)
+	return c, err
+}
+
+// decode parses and validates config bytes. Split out so Load and
+// LoadWithVersion share one implementation and cannot drift.
+func decode(b []byte, path string) (*Config, error) {
 	var c Config
 	if _, err := toml.Decode(string(b), &c); err != nil {
 		return nil, fmt.Errorf("parsing %s: %w", path, err)
@@ -187,11 +224,23 @@ func Load(path string) (*Config, error) {
 
 // Save writes the config atomically (write temp + rename), creating the
 // directory if needed.
+//
+// The temp file gets a unique name, from os.CreateTemp, rather than the
+// fixed path+".tmp" it used to use. A fixed name is not private to one
+// writer. The daemon's own write mutex serializes writers inside the
+// daemon, and the version hash catches a CLI write landing between a
+// client's read and its write, but neither covers two processes calling
+// Save at the same instant: both opened the same config.toml.tmp, both
+// wrote from offset zero on their own descriptor, and the longer content's
+// tail survived past the end of the shorter one. The rename then published
+// a file that is half of each. A name only this call knows makes each
+// rename publish bytes only this call wrote.
 func (c *Config) Save(path string) error {
 	if err := c.Validate(); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 	var sb strings.Builder
@@ -200,16 +249,51 @@ func (c *Config) Save(path string) error {
 	if err := toml.NewEncoder(&sb).Encode(c); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(sb.String()), 0o644); err != nil {
+
+	// Same directory as the target, so the rename stays on one filesystem
+	// and therefore stays atomic. The ".toml" tail is for the human who
+	// finds one of these left behind after a crash.
+	f, err := os.CreateTemp(dir, "config.*.toml")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	tmp := f.Name()
+	// Every path out of here that is not the rename leaves a file behind
+	// otherwise, and nothing else ever cleans this directory up. Cleared
+	// once the rename has succeeded, because at that point the name refers
+	// to the real config file.
+	defer func() {
+		if tmp != "" {
+			os.Remove(tmp) //nolint:errcheck
+		}
+	}()
+
+	if _, err := f.WriteString(sb.String()); err != nil {
+		f.Close() //nolint:errcheck // the write error is the one worth reporting
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	// CreateTemp makes the file 0600. The config is not a secret and was
+	// 0644 before this, so restore that rather than silently tightening a
+	// permission on a file the user may be reading with another tool.
+	if err := os.Chmod(tmp, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	tmp = ""
+	return nil
 }
 
 // Validate checks the whole config for consistency.
 func (c *Config) Validate() error {
 	if err := validateSuffix(c.Suffix); err != nil {
+		return err
+	}
+	if err := c.validatePorts(); err != nil {
 		return err
 	}
 	seen := map[string]bool{}
@@ -236,6 +320,35 @@ func (c *Config) Validate() error {
 	}
 	if err := c.Inspect.validate(); err != nil {
 		return fmt.Errorf("inspect: %w", err)
+	}
+	return nil
+}
+
+// validatePorts rejects a port number no listener could ever take.
+//
+// Only the impossible range, deliberately. A port below 1024 is refusable
+// where the refusal can be undone, which is the dashboard's PATCH endpoint
+// and not here: this runs on every load, so rejecting a low port would turn
+// a config someone already has into one the daemon will not read at all.
+// Out of range is different. There is no machine on which 70000 works, so
+// no existing config can be relying on it, and catching it at load time is
+// what stops the daemon starting up only to die on net.Listen.
+//
+// Zero is not a port here, it is the field unset, and every unset port
+// resolves to its default through the Eff accessors.
+func (c *Config) validatePorts() error {
+	for _, p := range []struct {
+		key   string
+		value int
+	}{
+		{"http_port", c.HTTPPort},
+		{"https_port", c.HTTPSPort},
+		{"dns_port", c.DNSPort},
+		{"dashboard_port", c.DashboardPort},
+	} {
+		if p.value != 0 && (p.value < 1 || p.value > 65535) {
+			return fmt.Errorf("%s %d is out of range: a port is 1-65535", p.key, p.value)
+		}
 	}
 	return nil
 }

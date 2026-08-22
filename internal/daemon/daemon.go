@@ -96,7 +96,7 @@ func Run(ctx context.Context, opts Options) error {
 		}
 	}
 
-	cfg, err := config.Load(opts.ConfigPath)
+	cfg, cfgVersion, err := config.LoadWithVersion(opts.ConfigPath)
 	if err != nil {
 		return err
 	}
@@ -124,6 +124,14 @@ func Run(ctx context.Context, opts Options) error {
 
 	// Dashboard.
 	dash := dashboard.New(cfg, opts.Version)
+	dash.SetPaths(opts.ConfigPath, opts.DataDir)
+	// No SetApplied here. Nothing is proxying yet, and applied is the claim
+	// that the running daemon is serving this exact file. The gap is
+	// normally milliseconds, but on a first run proxy.Load mints and
+	// installs the CA and can sit on a keychain dialog for as long as the
+	// user takes to answer it. The dashboard is already up and reachable
+	// through that whole wait, saying applied:true about a proxy that has
+	// not loaded. The call moved to just after proxy.Load returns.
 	dashBind := net.JoinHostPort("127.0.0.1", strconv.Itoa(cfg.EffDashboardPort()))
 	if err := dash.Start(dashBind); err != nil {
 		return friendlyBindError(err, "dashboard", dashBind, opts.ConfigPath)
@@ -145,7 +153,14 @@ func Run(ctx context.Context, opts Options) error {
 	// reason it does not start. ensureInspector must run before proxy.Load:
 	// that call is what puts the switchboard_inspect handler into Caddy's
 	// config, and the handler reads inspect.Current() on its first request.
-	ensureInspector := func(c *config.Config) {
+	//
+	// It returns the failure as well as logging it. Not starting is not the
+	// same as not mattering: the inspector's settings are one of the things
+	// this config file can turn on, so a user who enables it and gets a
+	// warning in a log nobody reads would be told the config is applied
+	// while the inspector endpoints answer 503. The caller feeds this into
+	// SetApplied so the dashboard says what actually happened.
+	ensureInspector := func(c *config.Config) error {
 		if !c.InspectEnabled() {
 			if insp != nil {
 				// Tear down in the same order as shutdown, and for the
@@ -165,12 +180,12 @@ func Run(ctx context.Context, opts Options) error {
 				insp = nil
 				log.Info("inspector down", "reason", "disabled by config reload")
 			}
-			return
+			return nil
 		}
 		if insp != nil {
 			insp.SetOptions(c.InspectBodies(), c.InspectMaxBodyBytes())
 			insp.Store().SetLimits(inspectLimits(c))
-			return
+			return nil
 		}
 		// The data directory itself is normally created by proxy.Load's
 		// EnsureRoot — but ensureInspector runs before that call, so on a
@@ -180,13 +195,15 @@ func Run(ctx context.Context, opts Options) error {
 		// until something else (a later reload) creates the directory.
 		if err := os.MkdirAll(opts.DataDir, 0o700); err != nil {
 			log.Warn("inspector disabled: cannot create its data directory", "path", opts.DataDir, "err", err)
-			return
+			return fmt.Errorf("the inspector is enabled but its data directory %s "+
+				"could not be created, so capture is off: %w", opts.DataDir, err)
 		}
 		dbPath := filepath.Join(opts.DataDir, "inspect.db")
 		st, err := inspect.Open(dbPath, inspectLimits(c))
 		if err != nil {
 			log.Warn("inspector disabled: cannot open its database", "path", dbPath, "err", err)
-			return
+			return fmt.Errorf("the inspector is enabled but its database %s could not be "+
+				"opened, so capture is off: %w", dbPath, err)
 		}
 		insp = inspect.New(st, inspect.Options{
 			Bodies:       c.InspectBodies(),
@@ -196,8 +213,9 @@ func Run(ctx context.Context, opts Options) error {
 		inspect.SetCurrent(insp)
 		dash.SetInspector(insp)
 		log.Info("inspector up", "db", dbPath, "bodies", c.InspectBodies())
+		return nil
 	}
-	ensureInspector(cfg)
+	inspErr := ensureInspector(cfg)
 
 	// Embedded Caddy: proxy + TLS + PKI.
 	httpsAddr, _ := proxy.Addrs(cfg, set)
@@ -205,6 +223,11 @@ func Run(ctx context.Context, opts Options) error {
 		return friendlyBindError(err, "proxy", httpsAddr, opts.ConfigPath)
 	}
 	defer proxy.Stop() //nolint:errcheck
+	// Now the file is really being served, so now it can be called applied.
+	// inspErr rather than nil: the inspector is part of what this file
+	// configures, and a config whose inspector could not start is not a
+	// config the daemon is running as written.
+	dash.SetApplied(cfgVersion, inspErr)
 	log.Info("proxy up",
 		"https", httpsAddr,
 		"routes", len(cfg.Routes),
@@ -252,9 +275,19 @@ func Run(ctx context.Context, opts Options) error {
 			})
 
 		case <-reload:
-			next, err := config.Load(opts.ConfigPath)
+			next, nextVersion, err := config.LoadWithVersion(opts.ConfigPath)
 			if err != nil {
 				log.Error("config reload failed; keeping previous config", "err", err)
+				// No version to report: the file did not parse, so there is
+				// no version, and nothing to call applied or unapplied.
+				//
+				// The proxy keeps serving the last good config. The
+				// dashboard does not show it: GET /api/config re-reads the
+				// file on every request, so it answers 500 for as long as
+				// the file is broken. That is the honest answer, because
+				// there is no config to return. /api/doctor reads the file
+				// separately and reports the parse failure as a check, so
+				// the diagnostic that explains this 500 still works.
 				continue
 			}
 			if next.Suffix != cfg.Suffix {
@@ -262,10 +295,13 @@ func Run(ctx context.Context, opts Options) error {
 				// switch would silently break resolution. Require a restart.
 				log.Error("suffix changed; restart the daemon (and re-run setup) to apply",
 					"old", cfg.Suffix, "new", next.Suffix)
+				dash.SetApplied(nextVersion, errors.New(
+					"the suffix changed; restart the daemon and re-run setup to apply it"))
 				continue
 			}
 			if err := proxy.Load(next, opts.DataDir, set); err != nil {
 				log.Error("proxy reload failed; keeping previous config", "err", err)
+				dash.SetApplied(nextVersion, err)
 				continue
 			}
 			cfg = next
@@ -276,7 +312,12 @@ func Run(ctx context.Context, opts Options) error {
 			// restart the daemon to use it, and it tears the recorder
 			// down (without deleting inspect.db) the moment it is turned
 			// off, so the dashboard stops serving what was captured.
-			ensureInspector(next)
+			//
+			// Its outcome is what gets reported. Turning the inspector on is
+			// a write this API offers, so a reload where the proxy took the
+			// new routes but the inspector refused to open is not applied,
+			// however green the proxy half looks.
+			dash.SetApplied(nextVersion, ensureInspector(next))
 			log.Info("config reloaded", "routes", len(cfg.Routes))
 
 		case err, ok := <-watcher.Errors:

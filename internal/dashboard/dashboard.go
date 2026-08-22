@@ -15,6 +15,7 @@ import (
 	"html/template"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -37,6 +38,35 @@ type Server struct {
 	httpSrv *http.Server
 	insp    atomic.Pointer[inspect.Recorder]
 
+	// paths are the filesystem locations the diagnostic and write endpoints
+	// need. Injected after New rather than passed to it, matching
+	// SetInspector: New is called in tests that have no filesystem, and a
+	// handler with no paths answers 503 exactly as an inspector handler does
+	// when capture is off.
+	paths atomic.Pointer[paths]
+
+	// csrf is minted once per process and injected into the page. See
+	// origin.go.
+	csrf string
+
+	// boundPort is the port the listener actually accepted on.
+	//
+	// Not the configured port. Start binds once, and a dashboard_port edit
+	// hot-reloads into s.cfg without rebinding anything, so the configured
+	// value can name a port nothing is serving. sameOriginStrict has to
+	// compare against the socket that exists, or a port edit silently 403s
+	// the break-glass URL that is still the only one working.
+	boundPort int
+
+	// applied is the outcome of the daemon's last config load.
+	//
+	// Save only runs Validate, and proxy.Load can fail for reasons Validate
+	// does not model, so a write can succeed and the daemon can still be
+	// serving the previous config. Rather than making writes synchronous,
+	// the reload reports itself and the dashboard says whether the file and
+	// the running daemon agree.
+	applied atomic.Pointer[applyState]
+
 	// done is closed by Shutdown, before http.Server.Shutdown runs. It is
 	// how a long-lived handler learns the server wants to stop.
 	//
@@ -51,7 +81,12 @@ type Server struct {
 }
 
 func New(cfg *config.Config, version string) *Server {
-	s := &Server{version: version, done: make(chan struct{}), probes: newProber(probeTTL)}
+	s := &Server{
+		version: version,
+		csrf:    newCSRFToken(),
+		done:    make(chan struct{}),
+		probes:  newProber(probeTTL),
+	}
 	s.cfg.Store(cfg)
 	return s
 }
@@ -63,42 +98,101 @@ func (s *Server) SetConfig(cfg *config.Config) { s.cfg.Store(cfg) }
 // A nil recorder means the inspector is off and its endpoints answer 503.
 func (s *Server) SetInspector(r *inspect.Recorder) { s.insp.Store(r) }
 
+// paths is what SetPaths stores. A single pointer so the two values are
+// always swapped together and a handler can never read one from before a
+// reload and one from after.
+type paths struct{ configPath, dataDir string }
+
+// SetPaths tells the dashboard where the config file and data directory
+// live. Without them the diagnostic and write endpoints answer 503.
+func (s *Server) SetPaths(configPath, dataDir string) {
+	s.paths.Store(&paths{configPath: configPath, dataDir: dataDir})
+}
+
+type applyState struct {
+	version string
+	err     error
+}
+
+// SetApplied records the outcome of a config load. The daemon calls it after
+// every attempt, successful or not, including the one at startup.
+func (s *Server) SetApplied(version string, err error) {
+	s.applied.Store(&applyState{version: version, err: err})
+}
+
+// pathsOr503 is the paths counterpart to recorder(): it answers the request
+// itself when the dependency is absent, so callers stay a two-line guard.
+func (s *Server) pathsOr503(w http.ResponseWriter) (*paths, bool) {
+	p := s.paths.Load()
+	if p == nil {
+		http.Error(w, "this daemon was started without filesystem paths",
+			http.StatusServiceUnavailable)
+		return nil, false
+	}
+	return p, true
+}
+
 // Start begins serving on bind (e.g. "127.0.0.1:8484").
 func (s *Server) Start(bind string) error {
 	ln, err := net.Listen("tcp", bind)
 	if err != nil {
 		return err
 	}
+	// Read the port back off the listener rather than out of bind. A bind
+	// of "127.0.0.1:0" names a real port only once the kernel has picked
+	// one, and that is the port an origin will carry. Written before Serve
+	// starts, so no handler can observe it unset.
+	if _, port, splitErr := net.SplitHostPort(ln.Addr().String()); splitErr == nil {
+		s.boundPort, _ = strconv.Atoi(port)
+	}
 	s.httpSrv = &http.Server{Handler: s.mux(), ReadHeaderTimeout: 10 * time.Second}
 	go s.httpSrv.Serve(ln) //nolint:errcheck // exits on Shutdown
 	return nil
 }
 
-// routeEntry pairs a mux pattern with its handler and whether the handler
-// enforces the Host guard. mux() registers this table, and
-// TestEveryGuardedRouteRejectsAForeignHost walks the same table, so a route
-// that forgets the guard fails that test by construction. That is exactly
-// how /api/routes escaped the guard in the first place: it lived only in
-// mux()'s hand-written list, and the equivalent hand-written test list
-// never had a reason to know it existed.
+// routeEntry pairs a mux pattern with its handler and the protections the
+// handler is claiming. mux() registers this table, and the guard tests walk
+// the same table, so a route that forgets a protection fails those tests by
+// construction. That is exactly how /api/routes escaped the guard in the
+// first place: it lived only in mux()'s hand-written list, and the
+// equivalent hand-written test list never had a reason to know it existed.
 type routeEntry struct {
-	pattern string
-	handler http.HandlerFunc
-	guarded bool
+	// method is the HTTP method this entry serves. Empty means any method.
+	// Kept separate from pattern rather than folded into it as Go 1.22's
+	// "POST /path" syntax, because the guard tests need to build a request
+	// from these fields and splitting a string back apart to do it is a
+	// parser nobody should have to maintain.
+	method   string
+	pattern  string
+	handler  http.HandlerFunc
+	guarded  bool
+	mutating bool
 }
 
 func (s *Server) routes() []routeEntry {
 	return []routeEntry{
-		{"/api/routes", s.guard(s.handleAPIRoutes), true},
-		{"/api/inspect/requests", s.guard(s.handleInspectRequests), true},
-		{"/api/inspect/requests/", s.guard(s.handleInspectRecord), true},
-		{"/api/inspect/clear", s.guard(s.handleInspectClear), true},
-		{"/api/inspect/stream", s.guard(s.handleInspectStream), true},
-		{"/inspect", s.guardPage(s.handleInspectRedirect), true},
+		{pattern: "/api/routes", handler: s.guard(s.handleAPIRoutes), guarded: true},
+		{pattern: "/api/doctor", handler: s.guard(s.handleDoctor), guarded: true},
+		{pattern: "/api/service", handler: s.guard(s.handleService), guarded: true},
+		{pattern: "/api/config", handler: s.guard(s.handleConfig), guarded: true},
+		{method: "PATCH", pattern: "/api/config",
+			handler: s.guard(s.mutate(s.handleConfigPatch)), guarded: true, mutating: true},
+		{method: "POST", pattern: "/api/routes",
+			handler: s.guard(s.mutate(s.handleRouteCreate)), guarded: true, mutating: true},
+		{method: "PATCH", pattern: "/api/routes/",
+			handler: s.guard(s.mutate(s.handleRouteEdit)), guarded: true, mutating: true},
+		{method: "DELETE", pattern: "/api/routes/",
+			handler: s.guard(s.mutate(s.handleRouteDelete)), guarded: true, mutating: true},
+		{pattern: "/api/inspect/requests", handler: s.guard(s.handleInspectRequests), guarded: true},
+		{pattern: "/api/inspect/requests/", handler: s.guard(s.handleInspectRecord), guarded: true},
+		{pattern: "/api/inspect/clear", handler: s.guard(s.mutate(s.handleInspectClear)),
+			guarded: true, mutating: true},
+		{pattern: "/api/inspect/stream", handler: s.guard(s.handleInspectStream), guarded: true},
+		{pattern: "/inspect", handler: s.guardPage(s.handleInspectRedirect), guarded: true},
 		// handleRoot is its own guard: it needs the "/" vs any-other-path
 		// split alongside the host check, and it answers a foreign Host
 		// with the no-route page rather than delegating to guardPage.
-		{"/", s.handleRoot, false},
+		{pattern: "/", handler: s.handleRoot},
 	}
 }
 
@@ -107,7 +201,11 @@ func (s *Server) routes() []routeEntry {
 func (s *Server) mux() *http.ServeMux {
 	mux := http.NewServeMux()
 	for _, rt := range s.routes() {
-		mux.HandleFunc(rt.pattern, rt.handler)
+		pattern := rt.pattern
+		if rt.method != "" {
+			pattern = rt.method + " " + pattern
+		}
+		mux.HandleFunc(pattern, rt.handler)
 	}
 	return mux
 }
@@ -127,7 +225,7 @@ func (s *Server) hostAllowed(hostport string) bool {
 //
 // guard is necessary for a mutating route but not sufficient by itself —
 // see the note on isLoopbackHost below. A route that changes state must
-// also check sameOrigin (inspect.go), the way handleInspectClear does;
+// also be wrapped in mutate (origin.go), the way handleInspectClear is;
 // guard alone only proves the Host header matched, and a Host header is
 // something an attacker's page gets to send too.
 func (s *Server) guard(h http.HandlerFunc) http.HandlerFunc {
@@ -186,10 +284,13 @@ func hostOnly(hostport string) string {
 // its own domain name to 127.0.0.1 and point the browser there. Either way,
 // a POST from an attacker's page sails through a Host check by itself.
 //
-// That endpoint landed in inspect.go: handleInspectClear pairs guard with
-// sameOrigin, which requires an Origin header that is present and matches.
-// Any future mutating route must do the same — a Host check is necessary
-// for one but was never sufficient on its own.
+// A mutating route therefore pairs guard with mutate (origin.go), the way
+// handleInspectClear does. mutate wants an Origin naming the dashboard
+// itself, and a token only a page this server rendered can know. Loopback
+// at any port is not enough for a write: every dev server this proxy sits
+// in front of is on loopback too. Any future mutating route must do the
+// same. A Host check is necessary for one but was never sufficient on its
+// own.
 func isLoopbackHost(host string) bool {
 	if host == "localhost" {
 		return true
@@ -218,6 +319,12 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 		Version string
 		Suffix  string
 		Routes  []routeView
+		// CSRF is the per-process write token. It goes into a meta tag
+		// rather than the script, so there is one place in the page the
+		// value is written and the script reads it from there. The clear
+		// button is the only thing that sends it back today; every write
+		// the settings UI adds will need it too.
+		CSRF string
 		// Redacted is rendered into the page script, so inspect.Redacted is
 		// the only place the sentinel is written down. The script compares a
 		// header value against it to mark the value as redacted, and drops
@@ -229,6 +336,7 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 		Version:  s.version,
 		Suffix:   cfg.Suffix,
 		Routes:   s.routeViews(cfg),
+		CSRF:     s.csrf,
 		Redacted: inspect.Redacted,
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -246,11 +354,17 @@ func (s *Server) renderNoRoute(w http.ResponseWriter, cfg *config.Config, host s
 
 func (s *Server) handleAPIRoutes(w http.ResponseWriter, r *http.Request) {
 	cfg := s.cfg.Load()
+	// appVersion, not version. /api/config has a field called version and it
+	// is a hash of the config file bytes, the token every write has to echo
+	// back. This one is the build string. Two sibling endpoints in one
+	// package using the same name for two unrelated values is how a client
+	// ends up sending a build string as a write token and getting a 409 it
+	// can never clear.
 	out := struct {
-		Version string      `json:"version"`
-		Suffix  string      `json:"suffix"`
-		Routes  []routeView `json:"routes"`
-	}{Version: s.version, Suffix: cfg.Suffix, Routes: s.routeViews(cfg)}
+		AppVersion string      `json:"appVersion"`
+		Suffix     string      `json:"suffix"`
+		Routes     []routeView `json:"routes"`
+	}{AppVersion: s.version, Suffix: cfg.Suffix, Routes: s.routeViews(cfg)}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(out) //nolint:errcheck
 }

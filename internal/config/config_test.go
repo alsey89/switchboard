@@ -1,9 +1,11 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -116,6 +118,44 @@ func TestValidateRoutes(t *testing.T) {
 	}
 }
 
+// A port outside 1-65535 cannot be bound by anything, so it is caught at
+// load time rather than at net.Listen, where the daemon has already started
+// tearing itself down. Zero is the field unset and must stay valid.
+func TestValidateRejectsImpossiblePorts(t *testing.T) {
+	for name, c := range map[string]*Config{
+		"http too high":      {Suffix: "test", HTTPPort: 70000},
+		"https too high":     {Suffix: "test", HTTPSPort: 65536},
+		"dns negative":       {Suffix: "test", DNSPort: -1},
+		"dashboard too high": {Suffix: "test", DashboardPort: 99999},
+		"dashboard negative": {Suffix: "test", DashboardPort: -8484},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := c.Validate()
+			if err == nil {
+				t.Fatal("expected an error, got none")
+			}
+			if !strings.Contains(err.Error(), "out of range") {
+				t.Errorf("error should say the port is out of range, got: %v", err)
+			}
+		})
+	}
+
+	// Unset ports and a privileged one both load. The low port is the case
+	// worth pinning: the dashboard's PATCH endpoint refuses it, and moving
+	// that rule here would make an existing config unreadable.
+	for name, c := range map[string]*Config{
+		"all unset":          {Suffix: "test"},
+		"privileged is fine": {Suffix: "test", DashboardPort: 80, HTTPSPort: 443},
+		"top of the range":   {Suffix: "test", DashboardPort: 65535},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := c.Validate(); err != nil {
+				t.Errorf("valid config rejected: %v", err)
+			}
+		})
+	}
+}
+
 func TestSaveLoadRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
 	c := &Config{Suffix: "test", Routes: []Route{
@@ -131,6 +171,75 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	}
 	if len(got.Routes) != 2 || got.Routes[0].Domain != "app.test" || got.Routes[1].Upstream != "127.0.0.1:9999" {
 		t.Errorf("round trip mismatch: %+v", got)
+	}
+}
+
+// TestConcurrentSavesPublishOneWholeFile races writers of very different
+// lengths, which is the shape that used to tear. With one shared
+// config.toml.tmp both wrote from offset zero on separate descriptors, so
+// the long writer's tail outlived the short writer's content and the rename
+// published a file that was half of each. Every read here must parse and
+// must be one of the two configs, never a splice.
+func TestConcurrentSavesPublishOneWholeFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+
+	// A fresh Config per writer, because Validate normalizes route domains
+	// in place. Two goroutines sharing one *Config would race on the struct
+	// rather than on the file, which is not the thing under test. Separate
+	// processes each have their own anyway.
+	const shortRoutes, longRoutes = 1, 200
+	mk := func(n int) *Config {
+		c := &Config{Suffix: "test"}
+		for i := 0; i < n; i++ {
+			c.Routes = append(c.Routes, Route{
+				Domain: fmt.Sprintf("r%03d.test", i), Port: 4000 + i,
+			})
+		}
+		return c
+	}
+	if err := mk(longRoutes).Save(path); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		for _, n := range []int{shortRoutes, longRoutes} {
+			wg.Add(1)
+			go func(n int) {
+				defer wg.Done()
+				if err := mk(n).Save(path); err != nil {
+					t.Errorf("Save: %v", err)
+				}
+			}(n)
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			got, err := Load(path)
+			if err != nil {
+				t.Errorf("Load saw a file that does not parse: %v", err)
+				return
+			}
+			if len(got.Routes) != shortRoutes && len(got.Routes) != longRoutes {
+				t.Errorf("Load saw %d routes, want one of the two whole configs",
+					len(got.Routes))
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Nothing may be left over. A temp file per writer is only correct if
+	// each one is cleaned up, and a directory that fills with them is the
+	// obvious way for this fix to go wrong.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name() != "config.toml" {
+			t.Errorf("left behind %q", e.Name())
+		}
 	}
 }
 
@@ -298,5 +407,74 @@ func TestInspectRejectsBadSettings(t *testing.T) {
 				t.Fatal("expected an error, got none")
 			}
 		})
+	}
+}
+
+func TestVersionChangesWithContent(t *testing.T) {
+	a := Version([]byte("suffix = \"test\"\n"))
+	b := Version([]byte("suffix = \"test\"\n\n"))
+	if a == b {
+		t.Fatal("different bytes produced the same version")
+	}
+	if a != Version([]byte("suffix = \"test\"\n")) {
+		t.Fatal("the same bytes produced different versions")
+	}
+	if len(a) != 16 {
+		t.Fatalf("version is %d chars, want 16", len(a))
+	}
+}
+
+func TestLoadWithVersionMatchesLoad(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	body := "suffix = \"test\"\n\n[[routes]]\ndomain = \"app.test\"\nport = 3000\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, version, err := LoadWithVersion(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version != Version([]byte(body)) {
+		t.Fatalf("version %q does not match the file bytes", version)
+	}
+	if len(cfg.Routes) != 1 || cfg.Routes[0].Domain != "app.test" {
+		t.Fatalf("config did not load: %+v", cfg)
+	}
+
+	// Load must stay exactly equivalent. It is called from the daemon, the
+	// CLI and doctor, and this refactor must not change any of them.
+	plain, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plain.Routes) != len(cfg.Routes) || plain.Suffix != cfg.Suffix {
+		t.Fatalf("Load and LoadWithVersion disagree: %+v vs %+v", plain, cfg)
+	}
+}
+
+// A missing file is not an error. It yields defaults and an empty version,
+// so a first write from a fresh install sends "" and matches.
+func TestLoadWithVersionMissingFile(t *testing.T) {
+	cfg, version, err := LoadWithVersion(filepath.Join(t.TempDir(), "nope.toml"))
+	if err != nil {
+		t.Fatalf("a missing file should not error: %v", err)
+	}
+	if version != "" {
+		t.Fatalf("version %q, want empty for a missing file", version)
+	}
+	if cfg.Suffix != DefaultSuffix {
+		t.Fatalf("suffix %q, want the default", cfg.Suffix)
+	}
+}
+
+func TestLoadWithVersionRejectsBrokenToml(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("this is not toml {{{"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := LoadWithVersion(path); err == nil {
+		t.Fatal("expected a parse error")
 	}
 }

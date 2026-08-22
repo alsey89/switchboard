@@ -212,6 +212,32 @@ func (e *testEnv) client() *http.Client {
 	}
 }
 
+// configView is the part of GET /api/config these tests assert on: whether
+// the daemon says it is running the file that is on disk, and why not when
+// it is not.
+type configView struct {
+	Applied    bool   `json:"applied"`
+	ApplyError string `json:"applyError"`
+}
+
+func fetchConfigView(t *testing.T, client *http.Client, dashboardDomain string) configView {
+	t.Helper()
+	resp, err := client.Get(fmt.Sprintf("https://%s:%d/api/config", dashboardDomain, tHTTPSPort))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close() //nolint:errcheck
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status %d from /api/config: %s", resp.StatusCode, body)
+	}
+	var out configView
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
 func TestEndToEnd(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test")
@@ -309,6 +335,21 @@ func TestEndToEnd(t *testing.T) {
 		}
 		if len(api.Routes) != 1 || api.Routes[0].Domain != "app.test" || !api.Routes[0].Up {
 			t.Errorf("api routes = %+v", api.Routes)
+		}
+	})
+
+	// applied is the dashboard's claim that the running daemon is serving
+	// the file on disk. It is reported after proxy.Load returns, not before
+	// the dashboard starts, so this also pins that the move did not simply
+	// drop the call: with no report at all applied reads false, which is
+	// indistinguishable from a boot that never finished.
+	t.Run("a healthy boot reports itself applied", func(t *testing.T) {
+		got := fetchConfigView(t, client, "switchboard.test")
+		if !got.Applied {
+			t.Errorf("applied = false after a clean boot, applyError = %q", got.ApplyError)
+		}
+		if got.ApplyError != "" {
+			t.Errorf("applyError = %q, want empty", got.ApplyError)
 		}
 	})
 
@@ -546,6 +587,20 @@ func TestInspectorFailureNeverBlocksTheDaemon(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "inspector disabled") {
 		t.Errorf("expected a warning naming the inspector disabled, got log:\n%s", logs.String())
+	}
+
+	// The warning is not enough on its own. The inspector's settings are
+	// one of the things the dashboard can write, so a user who turns
+	// capture on and gets a silent failure would be told the config is
+	// applied while the inspector endpoints answer 503. That is the exact
+	// lie the applied flag exists to prevent, so the failure has to reach
+	// the dashboard and not just the log.
+	got := fetchConfigView(t, env.client(), "switchboard."+tSuffixInternal)
+	if got.Applied {
+		t.Error("applied should be false: the inspector is enabled in the file and is not running")
+	}
+	if !strings.Contains(got.ApplyError, "inspector") {
+		t.Errorf("applyError %q should name the inspector", got.ApplyError)
 	}
 }
 

@@ -31,6 +31,10 @@ func testServer(t *testing.T) (*Server, *inspect.Recorder) {
 
 	s := New(&config.Config{Suffix: "test"}, "test")
 	s.SetInspector(r)
+	// Start is what normally fills this in, and no test binds a port. The
+	// write checks compare an origin's port against it, so a server that
+	// never started would reject every loopback origin.
+	s.boundPort = config.DefaultDashboardPort
 	return s, r
 }
 
@@ -57,6 +61,18 @@ func do(s *Server, method, target string, hdr map[string]string) *httptest.Respo
 	w := httptest.NewRecorder()
 	s.mux().ServeHTTP(w, req)
 	return w
+}
+
+// withToken copies hdr and adds this server's write token. Tests that are
+// about something other than the token say so by using it: the token is
+// present, so whatever the case is really checking is what decided the
+// answer. Tests about the token itself set the header by hand.
+func withToken(s *Server, hdr map[string]string) map[string]string {
+	out := map[string]string{csrfHeader: s.csrf}
+	for k, v := range hdr {
+		out[k] = v
+	}
+	return out
 }
 
 func TestInspectRequestsListsNewestFirst(t *testing.T) {
@@ -131,6 +147,15 @@ func TestInspectRecordUnknownIDIs404(t *testing.T) {
 	}
 }
 
+// TestClearRequiresPostAndOrigin covers what clear itself still decides
+// (POST only) and how it behaves at the write boundary it now sits behind.
+// The origin rules themselves are origin_test.go's subject; these cases are
+// here because clear is the endpoint they were first written against.
+//
+// Every case carries the token, because the token is not what any of them
+// is testing. Only clear's own port is loopback-allowed now, so the "any
+// loopback port" case that used to pass here moved to origin_test.go as a
+// rejection.
 func TestClearRequiresPostAndOrigin(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -142,13 +167,13 @@ func TestClearRequiresPostAndOrigin(t *testing.T) {
 		{"no origin is refused", "POST", nil, http.StatusForbidden},
 		{"foreign origin is refused", "POST", map[string]string{"Origin": "https://evil.example"}, http.StatusForbidden},
 		{"same origin is allowed", "POST", map[string]string{"Origin": "https://switchboard.test"}, http.StatusNoContent},
-		{"loopback origin is allowed", "POST", map[string]string{"Origin": "http://127.0.0.1:8484"}, http.StatusNoContent},
+		{"loopback at the dashboard port is allowed", "POST", map[string]string{"Origin": "http://127.0.0.1:8484"}, http.StatusNoContent},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			s, r := testServer(t)
 			seed(t, r, "/x")
-			if w := do(s, c.method, "/api/inspect/clear", c.origin); w.Code != c.want {
+			if w := do(s, c.method, "/api/inspect/clear", withToken(s, c.origin)); w.Code != c.want {
 				t.Fatalf("status %d, want %d", w.Code, c.want)
 			}
 		})
@@ -160,7 +185,7 @@ func TestClearEmptiesTheBuffer(t *testing.T) {
 	seed(t, r, "/x")
 
 	if w := do(s, "POST", "/api/inspect/clear",
-		map[string]string{"Origin": "https://switchboard.test"}); w.Code != http.StatusNoContent {
+		withToken(s, map[string]string{"Origin": "https://switchboard.test"})); w.Code != http.StatusNoContent {
 		t.Fatalf("status %d", w.Code)
 	}
 	got, err := r.Store().List(inspect.Query{Limit: 10})
@@ -193,22 +218,47 @@ func TestInspectEndpointsRefuseForeignHosts(t *testing.T) {
 // earlier version of this file — mux()'s route list and this test's route
 // list were two separate hand-maintained things, and only one of them got
 // updated.
+//
+// Each row is driven with its own method. Firing GET at every row looked
+// equivalent while every row served any method, and stopped being so the
+// moment method-scoped rows arrived: a GET to "POST /api/routes" is served
+// by the sibling read row, so the row under test was never entered and its
+// guard could have been deleted with this test still green.
 func TestEveryGuardedRouteRejectsAForeignHost(t *testing.T) {
 	s, r := testServer(t)
 	seed(t, r, "/x")
 
 	for _, rt := range s.routes() {
+		// Any row that serves something other than GET changes state, and a
+		// state-changing row has to carry the mutate wrapper. routes()
+		// records that as the mutating flag, and it is the flag rather than
+		// the wrapper that TestEveryMutatingRouteRejectsABadWrite walks. So
+		// an unmarked write row is invisible to that test, and this is the
+		// check that makes the flag itself impossible to forget.
+		if rt.method != "" && rt.method != http.MethodGet && !rt.mutating {
+			t.Errorf("%s %s serves a state-changing method but is not marked mutating",
+				rt.method, rt.pattern)
+		}
 		if !rt.guarded {
 			continue
 		}
-		t.Run(rt.pattern, func(t *testing.T) {
+		method := rt.method
+		if method == "" {
+			method = http.MethodGet // an entry with no method serves them all
+		}
+		t.Run(method+" "+rt.pattern, func(t *testing.T) {
 			target := rt.pattern
 			if strings.HasSuffix(target, "/") {
 				target += "1" // land inside the subtree, not just on its root
 			}
-			req := httptest.NewRequest("GET", target, nil)
+			req := httptest.NewRequest(method, target, nil)
 			req.Host = "evil.example"
+			// guard is the outermost wrapper, so a foreign Host is refused
+			// before mutate ever runs. These two headers are what a request
+			// that would otherwise pass the write checks carries, and the
+			// answer must still be 404.
 			req.Header.Set("Origin", "https://evil.example")
+			req.Header.Set(csrfHeader, s.csrf)
 			w := httptest.NewRecorder()
 			s.mux().ServeHTTP(w, req)
 
@@ -250,7 +300,7 @@ func TestInspectEndpointsAre503WithNoRecorder(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			s := New(&config.Config{Suffix: "test"}, "test")
-			if w := do(s, c.method, c.path, c.origin); w.Code != http.StatusServiceUnavailable {
+			if w := do(s, c.method, c.path, withToken(s, c.origin)); w.Code != http.StatusServiceUnavailable {
 				t.Fatalf("status %d, want 503", w.Code)
 			}
 		})
@@ -604,7 +654,7 @@ func TestInspectEndpointsSurviveAClosedStore(t *testing.T) {
 
 	t.Run("clear", func(t *testing.T) {
 		w := do(s, "POST", "/api/inspect/clear",
-			map[string]string{"Origin": "https://switchboard.test"})
+			withToken(s, map[string]string{"Origin": "https://switchboard.test"}))
 		if w.Code != http.StatusServiceUnavailable {
 			t.Fatalf("status %d, want 503", w.Code)
 		}

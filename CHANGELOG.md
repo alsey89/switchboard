@@ -2,6 +2,52 @@
 
 What changed in each release, and anything you need to do about it.
 
+## Unreleased
+
+### Added
+
+- The dashboard has an HTTP API. `GET /api/doctor` returns what `switchboard
+  doctor` prints. `GET /api/service` says whether launchd knows about the
+  daemon. `GET /api/config` returns your config twice over: as the file
+  writes it, and as the daemon resolves it once defaults are filled in.
+
+  Routes, `dashboard_port` and the `inspect` settings can be changed through
+  it too. Nothing uses any of this yet. The web UI that will comes next.
+
+- The dashboard tells you when a saved change is not the running one. A
+  config edit, by hand or through the API, can produce a file the daemon
+  then refuses to load. Until now that only reached the log. `GET
+  /api/config` now says whether the daemon is serving what the file
+  describes, and why not when it is not.
+
+- Changing `dashboard_port` says a restart is needed, and says why. The
+  daemon cannot rebind the socket it is answering you on.
+
+### Changed
+
+- Writes to the dashboard need an `Origin` naming the dashboard, plus a
+  token the page carries. This tightens `POST /api/inspect/clear`, which
+  previously accepted any loopback origin at any port. Your own dev servers
+  are on loopback too, so that was wider than it looked. The console sends
+  the token; nothing you do changes.
+
+- `GET /api/routes` renames its `version` field to `appVersion`. It was the
+  build string, while `GET /api/config` uses `version` for the config file's
+  hash, which is the token that gates writes. Two meanings, one name, on
+  neighbouring endpoints.
+
+- The suffix and the `dns_port`, `http_port` and `https_port` settings are
+  refused by the API rather than silently ignored. Each refusal names the
+  command to run instead. They need sudo, or a resolver rewrite, or both.
+
+- Ports in the config are checked. A port outside 1 to 65535 is rejected on
+  load rather than at bind time.
+
+### Fixed
+
+- Two processes saving the config at once could publish a torn file. Every
+  save now writes its own temp file instead of sharing `config.toml.tmp`.
+
 ## 0.4.0 — 2026-08-18
 
 ### Changed
